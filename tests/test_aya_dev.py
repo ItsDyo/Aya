@@ -862,6 +862,21 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertFalse(Path(proposal.workspace_path).exists())
         self.assertIn("ja integrada", self.service.integrar(proposal.id))
 
+    def test_integrar_falha_pos_fast_forward_registra_parcial(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        validation = [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
+        timeout = subprocess.TimeoutExpired(("python", "-m", "pytest"), 300)
+        with (
+            patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=validation),
+            patch.object(self.service, "_post_integration_validation", side_effect=timeout),
+        ):
+            response = self.service.integrar(proposal.id)
+        self.assertIn("Integracao parcial", response)
+        self.assertNotIn("Main permaneceu intacta", response)
+        self.assertEqual("INTEGRACAO_BLOQUEADA", proposal.state)
+        self.assertTrue(proposal.integration_partial)
+        self.assertEqual(proposal.proposal_commit, self._git_head(self.root))
+
     def test_integracao_id_nao_chama_modelo(self):
         proposal = self.proposal()
         before = len(self.client.calls)

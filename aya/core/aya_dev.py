@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import re
+import subprocess
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -700,6 +701,19 @@ class AyaDevService:
                 "- Estado final: INTEGRADA",
             ])
         except Exception as exc:
+            if proposal.previous_main_head and self.workspace.head() != proposal.previous_main_head:
+                proposal.integration_partial = True
+                proposal.state = "INTEGRACAO_BLOQUEADA"
+                proposal.resulting_main_head = self.workspace.head()
+                proposal.integrated_commit = proposal.proposal_commit if proposal.resulting_main_head == proposal.proposal_commit else ""
+                proposal.integration_block_reason = self.workspace.sanitize(str(exc))
+                proposal.failure_stage = "integracao"
+                proposal.failure_reason = proposal.integration_block_reason
+                proposal.failure_message = proposal.integration_block_reason
+                proposal.failure_at = datetime.now().isoformat(timespec="seconds")
+                self._event(proposal, "integracao parcial bloqueada", previous, "INTEGRACAO_BLOQUEADA")
+                self._save()
+                return "Integracao parcial registrada: a main avancou, mas a validacao posterior falhou. Revisao humana necessaria."
             proposal.state = "INTEGRACAO_BLOQUEADA"
             proposal.integration_block_reason = self.workspace.sanitize(str(exc))
             proposal.failure_stage = proposal.failure_stage or "integracao"
@@ -1284,7 +1298,7 @@ class AyaDevService:
         ]
         related = self._related_tests(proposal)
         if related:
-            results.append(self._check_command("testes relacionados", ("python", "-m", "pytest", *related), 300, self.root))
+            results.append(self._check_command("testes relacionados", ("python", "-m", "pytest", *related), 600, self.root))
         current = self.workspace.head()
         parents = self._git(("show", "-s", "--format=%P", "HEAD"), cwd=self.root, timeout=30).stdout.split()
         checks = [
@@ -1328,9 +1342,12 @@ class AyaDevService:
         return self._git(("diff-tree", "--no-commit-id", "--name-only", "-r", commit), cwd=self.root, timeout=30).stdout.splitlines()
 
     def _check_command(self, name: str, command: tuple[str, ...], timeout: int, cwd: Path) -> CheckResult:
-        result = self.workspace._run(command, cwd, timeout)
-        output = self.workspace.sanitize("\n".join(value for value in (result.stdout, result.stderr) if value))
-        return CheckResult(name, " ".join(command), result.returncode, 0, output)
+        try:
+            result = self.workspace._run(command, cwd, timeout)
+            output = self.workspace.sanitize("\n".join(value for value in (result.stdout, result.stderr) if value))
+            return CheckResult(name, " ".join(command), result.returncode, 0, output)
+        except subprocess.TimeoutExpired:
+            return CheckResult(name, " ".join(command), 124, 0, "Tempo limite excedido.")
 
     def _checks_status(self, checks: list[dict]) -> str:
         """Summarize persisted validation checks for display."""
