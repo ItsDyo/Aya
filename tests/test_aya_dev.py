@@ -917,7 +917,7 @@ class AyaDevTestCase(unittest.TestCase):
         self._request_reversal_ready_for_approval(proposal)
         proposal.reversal_reason = "motivo alterado"
         response = self.service.aprovar_reversao(proposal.id)
-        self.assertIn("invalid", response.lower())
+        self.assertIn("previsao", response.lower())
 
     def test_reverter_bloqueia_main_suja(self):
         proposal = self._prepare_reversal_approved()
@@ -955,16 +955,67 @@ class AyaDevTestCase(unittest.TestCase):
         ):
             self.service.reverter(proposal.id)
         proposal.state = "INTEGRADA"
-        response = self.service.solicitar_reversao(f"{proposal.id} outro motivo")
+        self.service.solicitar_reversao(f"{proposal.id} outro motivo")
+        response = self.service.prever_reversao(proposal.id)
         self.assertIn("COMMIT_JA_REVERTIDO", response)
 
-    def test_solicitar_reversao_bloqueia_validacao_previa_falhando(self):
+    def test_prever_reversao_bloqueia_validacao_previa_falhando(self):
         proposal = self._prepare_integrated_for_reversal()
-        failed = CheckResult("git revert --no-commit", "git revert --no-commit", 1, 0, "conflito")
-        with patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=[failed.__dict__ | {"passed": False}]):
-            response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        preview = self._fake_preview(proposal, valid=False, reason="VALIDACAO_REVERSAO_REPROVADA")
+        with patch.object(self.service, "_build_reversal_preview", return_value=preview):
+            response = self.service.prever_reversao(proposal.id)
         self.assertIn("VALIDACAO_REVERSAO", response)
-        self.assertEqual("REVERSAO_BLOQUEADA", proposal.state)
+        self.assertEqual("PREVISAO_REVERSAO_BLOQUEADA", proposal.state)
+
+    def test_prever_reversao_persiste_diff_arquivos_linhas_e_hash(self):
+        proposal = self._prepare_integrated_for_reversal()
+        main_before = self._git_head(self.root)
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        with patch.object(self.service, "_build_reversal_preview", return_value=self._fake_preview(proposal)):
+            response = self.service.prever_reversao(proposal.id)
+        self.assertIn("Previsao de reversao pronta", response)
+        self.assertEqual(main_before, self._git_head(self.root))
+        self.assertTrue(proposal.reversal_preview_diff)
+        self.assertEqual(["aya/core/sample.py"], proposal.reversal_preview_files)
+        self.assertEqual(0, proposal.reversal_preview_added_lines)
+        self.assertEqual(1, proposal.reversal_preview_removed_lines)
+        self.assertTrue(proposal.reversal_preview_sha256)
+        self.assertTrue(proposal.reversal_preview_main_unchanged)
+        self.assertTrue(proposal.reversal_preview_workspace_cleaned)
+
+    def test_prever_reversao_mesma_previsao_mantem_hash(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        preview = self._fake_preview(proposal)
+        with patch.object(self.service, "_build_reversal_preview", return_value=preview):
+            self.service.prever_reversao(proposal.id)
+            first_hash = proposal.reversal_preview_sha256
+            self.service.prever_reversao(proposal.id)
+        self.assertEqual(first_hash, proposal.reversal_preview_sha256)
+
+    def test_aprovar_reversao_sem_previsao_e_bloqueada(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        response = self.service.aprovar_reversao(proposal.id)
+        self.assertIn("previsao", response.lower())
+
+    def test_prever_reversao_head_diferente_invalida_previsao_anterior(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        with patch.object(self.service, "_build_reversal_preview", return_value=self._fake_preview(proposal)):
+            self.service.prever_reversao(proposal.id)
+        subprocess.run(("git", "commit", "--allow-empty", "-m", "avanca main"), cwd=self.root, capture_output=True, check=True)
+        response = self.service.aprovar_reversao(proposal.id)
+        self.assertIn("HEAD", response)
+
+    def test_diff_reversao_nao_chama_modelo(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self._request_reversal_ready_for_approval(proposal)
+        before = len(self.client.calls)
+        response = self.service.execute(f"diff-reversao {proposal.id}")
+        self.assertIn("diff --git", response)
+        self.assertEqual(before, len(self.client.calls))
 
     def test_reverter_trata_conflito_do_git_revert(self):
         proposal = self._prepare_reversal_approved()
@@ -1161,9 +1212,11 @@ class AyaDevTestCase(unittest.TestCase):
         return proposal
 
     def _request_reversal_ready_for_approval(self, proposal):
-        with patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()):
-            response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
         self.assertIn("Reversao solicitada", response)
+        with patch.object(self.service, "_build_reversal_preview", return_value=self._fake_preview(proposal)):
+            response = self.service.prever_reversao(proposal.id)
+        self.assertIn("Previsao de reversao pronta", response)
         self.assertEqual("AGUARDANDO_APROVACAO_REVERSAO", proposal.state)
         return response
 
@@ -1174,6 +1227,34 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Aprovacao de reversao registrada", response)
         self.assertEqual("REVERSAO_APROVADA", proposal.state)
         return proposal
+
+    def _fake_preview(self, proposal, *, valid: bool = True, reason: str = ""):
+        diff = (
+            "diff --git a/aya/core/sample.py b/aya/core/sample.py\n"
+            "--- a/aya/core/sample.py\n"
+            "+++ b/aya/core/sample.py\n"
+            "@@ -1,6 +1,5 @@\n"
+            " import json\n"
+            " \n"
+            " class Sample:\n"
+            "     def run(self, value: str) -> str:\n"
+            "-        \"\"\"Executa sample.\"\"\"\n"
+            "         return json.dumps(value)\n"
+        )
+        validation = self._passed_validation() if valid else [CheckResult("pytest", "python -m pytest", 1, 0, "falhou").__dict__ | {"passed": False}]
+        return {
+            "base_head": self._git_head(self.root),
+            "target_commit": proposal.reversal_target_commit or proposal.integrated_commit or proposal.proposal_commit,
+            "diff": diff if valid else "",
+            "files": ["aya/core/sample.py"] if valid else [],
+            "added": 0,
+            "removed": 1 if valid else 0,
+            "validation": validation,
+            "conflicts": "" if valid else reason,
+            "workspace_cleaned": True,
+            "valid": valid,
+            "invalidated_reason": reason,
+        }
 
     def _git_head(self, path: Path) -> str:
         return subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, capture_output=True, text=True, check=True).stdout.strip()
