@@ -1333,6 +1333,7 @@ class AyaDevService:
         return CheckResult(name, " ".join(command), result.returncode, 0, output)
 
     def _checks_status(self, checks: list[dict]) -> str:
+        """Summarize persisted validation checks for display."""
         if not checks:
             return "Informacao nao registrada."
         failed = [item.get("name", "?") for item in checks if not item.get("passed")]
