@@ -20,7 +20,8 @@ from aya.core.structured_patch import PATCH_DECISION_SCHEMA, StructuredPatchAppl
 PROPOSAL_STATES = {
     "DETECTADA", "PROPOSTA", "PLANEJADA", "PREPARANDO", "EM_TESTE",
     "AGUARDANDO_APROVACAO", "APROVADA", "REJEITADA", "FALHOU",
-    "PREPARANDO_COMMIT", "COMMIT_PRONTO", "APLICADA", "REVERTIDA",
+    "PREPARANDO_COMMIT", "COMMIT_PRONTO", "VALIDANDO_INTEGRACAO",
+    "INTEGRANDO", "INTEGRADA", "INTEGRACAO_BLOQUEADA", "APLICADA", "REVERTIDA",
 }
 RISK_ORDER = {"baixo": 0, "medio": 1, "alto": 2}
 HIGH_RISK_TERMS = {
@@ -91,6 +92,23 @@ class EngineeringProposal:
     main_head_at_commit: str = ""
     main_unchanged: bool = False
     ready_for_integration: bool = False
+    integration_started_at: str = ""
+    integrated_at: str = ""
+    integration_method: str = ""
+    integrated_commit: str = ""
+    previous_main_head: str = ""
+    resulting_main_head: str = ""
+    main_branch: str = ""
+    integration_validation: list[dict] = field(default_factory=list)
+    post_integration_validation: list[dict] = field(default_factory=list)
+    merge_commit_created: bool = False
+    pushed: bool = False
+    remote_used: bool = False
+    worktree_cleanup_pending: bool = False
+    integration_success: bool = False
+    integration_block_reason: str = ""
+    integration_partial: bool = False
+    integration_cleanup_result: str = ""
 
 
 class AyaDevService:
@@ -143,7 +161,7 @@ class AyaDevService:
         if action in handlers:
             return handlers[action]()
         if action in {
-            "mostrar", "falha", "commit", "planejar", "preparar", "revisar", "testar", "diff",
+            "mostrar", "falha", "commit", "integracao", "planejar", "preparar", "revisar", "testar", "diff",
             "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "reverter", "pacote-codex",
         }:
             if not argument.strip():
@@ -297,6 +315,9 @@ class AyaDevService:
             "",
             "Commit isolado:",
             self.commit(proposal.id),
+            "",
+            "Integracao:",
+            self.integracao(proposal.id),
         ]
         return "\n".join(lines)
 
@@ -616,8 +637,99 @@ class AyaDevService:
             return f"Aplicacao bloqueada: {message}"
 
     def integrar(self, proposal_id: str) -> str:
-        self._get(proposal_id)
-        return "Integracao bloqueada: ciclo de integracao ainda nao habilitado."
+        proposal = self._get(proposal_id)
+        if proposal.state == "INTEGRADA":
+            return self._integrated_idempotent_response(proposal)
+        previous = proposal.state
+        proposal.state = "VALIDANDO_INTEGRACAO"
+        proposal.integration_started_at = datetime.now().isoformat(timespec="seconds")
+        proposal.integration_method = "fast-forward"
+        proposal.pushed = False
+        proposal.remote_used = False
+        proposal.merge_commit_created = False
+        self._event(proposal, "validando integracao explicita", previous, proposal.state)
+        try:
+            self._validate_integration_preconditions(proposal)
+            validation = self._validate_commit_in_clean_worktree(proposal)
+            proposal.integration_validation = validation
+            if not all(item.get("passed") for item in validation):
+                raise RuntimeError("VALIDACAO_LIMPA_REPROVADA")
+            proposal.previous_main_head = self.workspace.head()
+            proposal.main_branch = self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip()
+            proposal.state = "INTEGRANDO"
+            self._event(proposal, "iniciando fast-forward estrito", "VALIDANDO_INTEGRACAO", proposal.state)
+            self._validate_main_ready_for_fast_forward(proposal)
+            merge = self._git(("merge", "--ff-only", proposal.proposal_branch), cwd=self.root, timeout=90)
+            if merge.returncode != 0:
+                raise RuntimeError("FAST_FORWARD_INDISPONIVEL")
+            proposal.resulting_main_head = self.workspace.head()
+            proposal.integrated_commit = proposal.proposal_commit
+            proposal.integrated_at = datetime.now().isoformat(timespec="seconds")
+            post = self._post_integration_validation(proposal)
+            proposal.post_integration_validation = post
+            if not all(item.get("passed") for item in post):
+                proposal.integration_partial = True
+                proposal.state = "INTEGRACAO_BLOQUEADA"
+                proposal.integration_block_reason = "VALIDACAO_POS_INTEGRACAO_REPROVADA"
+                self._event(proposal, "validacao pos-integracao reprovada", "INTEGRANDO", proposal.state)
+                self._save()
+                return "Integracao parcial registrada: a main avancou, mas a validacao posterior falhou. Revisao humana necessaria."
+            cleanup = self._cleanup_integrated_worktree(proposal)
+            proposal.integration_cleanup_result = cleanup
+            proposal.workspace_cleaned = "removido" in cleanup.lower()
+            if proposal.workspace_cleaned:
+                proposal.workspace = ""
+                proposal.worktree_cleanup_pending = False
+            else:
+                proposal.worktree_cleanup_pending = True
+            proposal.integration_success = True
+            proposal.state = "INTEGRADA"
+            self._event(proposal, "commit integrado por fast-forward", "INTEGRANDO", proposal.state)
+            self._save()
+            return "\n".join([
+                "Integracao concluida por fast-forward estrito.",
+                f"- Commit integrado: {proposal.integrated_commit}",
+                f"- Main antes: {proposal.previous_main_head}",
+                f"- Main depois: {proposal.resulting_main_head}",
+                "- Merge commit criado: nao",
+                "- Push executado: nao",
+                "- Remoto usado: nao",
+                f"- Validacao previa: {self._checks_status(proposal.integration_validation)}",
+                f"- Validacao posterior: {self._checks_status(proposal.post_integration_validation)}",
+                f"- Limpeza do worktree: {proposal.integration_cleanup_result}",
+                "- Estado final: INTEGRADA",
+            ])
+        except Exception as exc:
+            proposal.state = "INTEGRACAO_BLOQUEADA"
+            proposal.integration_block_reason = self.workspace.sanitize(str(exc))
+            proposal.failure_stage = proposal.failure_stage or "integracao"
+            proposal.failure_reason = proposal.integration_block_reason
+            proposal.failure_message = proposal.integration_block_reason
+            proposal.failure_at = datetime.now().isoformat(timespec="seconds")
+            self._event(proposal, "integracao bloqueada", previous, proposal.state)
+            self._save()
+            return f"Integracao bloqueada: {proposal.integration_block_reason}. Main permaneceu intacta."
+
+    def integracao(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        eligible, reason = self._integration_eligibility(proposal)
+        return "\n".join([
+            f"Integracao {proposal.id}:",
+            f"- Elegivel agora: {'sim' if eligible else 'nao'}",
+            f"- Motivo do bloqueio: {reason or proposal.integration_block_reason or 'nenhum'}",
+            f"- Inicio: {proposal.integration_started_at or 'Informacao nao registrada.'}",
+            f"- Metodo: {proposal.integration_method or 'Informacao nao registrada.'}",
+            f"- Main antes: {proposal.previous_main_head or 'Informacao nao registrada.'}",
+            f"- Main depois: {proposal.resulting_main_head or 'Informacao nao registrada.'}",
+            f"- Commit integrado: {proposal.integrated_commit or proposal.proposal_commit or 'Informacao nao registrada.'}",
+            f"- Validacao previa: {self._checks_status(proposal.integration_validation)}",
+            f"- Validacao posterior: {self._checks_status(proposal.post_integration_validation)}",
+            f"- Merge commit criado: {'sim' if proposal.merge_commit_created else 'nao'}",
+            f"- Push executado: {'sim' if proposal.pushed else 'nao'}",
+            f"- Remoto usado: {'sim' if proposal.remote_used else 'nao'}",
+            f"- Limpeza do worktree: {proposal.integration_cleanup_result or 'Informacao nao registrada.'}",
+            f"- Estado final: {proposal.state}",
+        ])
 
     def reverter(self, proposal_id: str) -> str:
         self._get(proposal_id)
@@ -1055,6 +1167,178 @@ class AyaDevService:
             raise RuntimeError("CHECKS_REPROVADOS")
         if self._review_blocks(proposal.review_result):
             raise RuntimeError("REVISAO_BLOQUEADORA")
+
+    def _integration_eligibility(self, proposal: EngineeringProposal) -> tuple[bool, str]:
+        if proposal.state not in {"COMMIT_PRONTO", "VALIDANDO_INTEGRACAO", "INTEGRANDO"}:
+            return False, "estado nao elegivel"
+        if proposal.state == "COMMIT_PRONTO" and not proposal.ready_for_integration:
+            return False, "ready_for_integration falso"
+        valid, reason = self._approval_currently_valid(proposal)
+        if not valid:
+            return False, reason
+        if proposal.risk not in {"baixo", "medio"}:
+            return False, "risco nao permitido"
+        return True, ""
+
+    def _validate_integration_preconditions(self, proposal: EngineeringProposal) -> None:
+        eligible, reason = self._integration_eligibility(proposal)
+        if not eligible:
+            raise RuntimeError(reason.upper().replace(" ", "_"))
+        if not proposal.proposal_branch or not proposal.proposal_commit or not proposal.commit_parent:
+            raise RuntimeError("COMMIT_ISOLADO_INCOMPLETO")
+        if not self._branch_exists(proposal.proposal_branch):
+            raise RuntimeError("BRANCH_AUSENTE")
+        branch_head = self._git(("rev-parse", proposal.proposal_branch), cwd=self.root, timeout=30).stdout.strip()
+        if branch_head != proposal.proposal_commit:
+            raise RuntimeError("BRANCH_MUDOU")
+        commit = self._git(("rev-parse", f"{proposal.proposal_commit}^{{commit}}"), cwd=self.root, timeout=30).stdout.strip()
+        if commit != proposal.proposal_commit:
+            raise RuntimeError("COMMIT_MUDOU")
+        parents = self._git(("show", "-s", "--format=%P", proposal.proposal_commit), cwd=self.root, timeout=30).stdout.split()
+        if len(parents) != 1:
+            raise RuntimeError("COMMIT_COM_MULTIPLOS_PAIS")
+        if parents[0] != proposal.commit_parent:
+            raise RuntimeError("PAI_DO_COMMIT_DIVERGENTE")
+        ancestor = self.workspace._run(("git", "merge-base", "--is-ancestor", proposal.commit_parent, proposal.proposal_commit), self.root, 30)
+        if ancestor.returncode != 0:
+            raise RuntimeError("COMMIT_NAO_DESCENDE_DA_BASE")
+        changed_files = self._commit_files(proposal.proposal_commit)
+        approved_files = self._approved_files(proposal)
+        if sorted(changed_files) != sorted(approved_files) or sorted(changed_files) != sorted(proposal.committed_files):
+            raise RuntimeError("ARQUIVO_INESPERADO")
+        for rel in changed_files:
+            error = self.workspace._path_error(rel)
+            if error:
+                raise RuntimeError(error)
+        commit_diff = self._git(("diff", "--no-ext-diff", proposal.commit_parent, proposal.proposal_commit, "--"), cwd=self.root, timeout=30).stdout
+        if self._sha_text(commit_diff) != proposal.approved_diff_sha256:
+            raise RuntimeError("DIFF_DIVERGENTE")
+        if proposal.committed_diff_sha256 and self._sha_text(commit_diff) != proposal.committed_diff_sha256:
+            raise RuntimeError("DIFF_COMMIT_DIVERGENTE")
+        if self._sha_json(proposal.patch_manifest) != proposal.approved_manifest_sha256:
+            raise RuntimeError("MANIFESTO_DIVERGENTE")
+        if self._sha_json(proposal.validation) != proposal.approved_validation_sha256:
+            raise RuntimeError("VALIDACAO_DIVERGENTE")
+        if self._sha_text(proposal.review_result) != proposal.approved_review_sha256:
+            raise RuntimeError("REVISAO_DIVERGENTE")
+        if not self._required_checks_passed(proposal):
+            raise RuntimeError("CHECKS_INCOMPLETOS")
+        if not proposal.review_result:
+            raise RuntimeError("REVISAO_AUSENTE")
+        if self._review_blocks(proposal.review_result):
+            raise RuntimeError("REVISAO_BLOQUEADORA")
+        if self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip() != "main":
+            raise RuntimeError("MAIN_BRANCH_DIVERGENTE")
+        if self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip():
+            raise RuntimeError("MAIN_SUJA")
+        if self.workspace.head() != proposal.commit_parent:
+            raise RuntimeError("BASE_DIVERGENTE")
+        if proposal.workspace_path:
+            workspace_path = Path(proposal.workspace_path)
+            if not workspace_path.exists():
+                raise RuntimeError("WORKTREE_AUSENTE")
+            if self._git(("branch", "--show-current"), cwd=workspace_path, timeout=30).stdout.strip() != proposal.proposal_branch:
+                raise RuntimeError("WORKTREE_BRANCH_DIVERGENTE")
+            if self._git(("rev-parse", "HEAD"), cwd=workspace_path, timeout=30).stdout.strip() != proposal.proposal_commit:
+                raise RuntimeError("WORKTREE_COMMIT_DIVERGENTE")
+            if self._git(("status", "--porcelain"), cwd=workspace_path, timeout=30).stdout.strip():
+                raise RuntimeError("WORKTREE_SUJO")
+
+    def _validate_main_ready_for_fast_forward(self, proposal: EngineeringProposal) -> None:
+        if self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip() != "main":
+            raise RuntimeError("MAIN_BRANCH_DIVERGENTE")
+        if self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip():
+            raise RuntimeError("MAIN_SUJA")
+        if self.workspace.head() != proposal.commit_parent:
+            raise RuntimeError("BASE_DIVERGENTE")
+        branch_head = self._git(("rev-parse", proposal.proposal_branch), cwd=self.root, timeout=30).stdout.strip()
+        if branch_head != proposal.proposal_commit:
+            raise RuntimeError("BRANCH_MUDOU")
+
+    def _validate_commit_in_clean_worktree(self, proposal: EngineeringProposal) -> list[dict]:
+        target = self.workspace.workspace_root / f"integration-{proposal.id}-{uuid.uuid4().hex[:8]}"
+        results: list[CheckResult] = []
+        try:
+            self._git(("worktree", "add", "--detach", str(target), proposal.proposal_commit), cwd=self.root, timeout=90)
+            results.extend(self.workspace.validate(target))
+            for name, command, timeout in (
+                ("git diff-tree", ("git", "diff-tree", "--no-commit-id", "--name-only", "-r", proposal.proposal_commit), 30),
+                ("git show --check", ("git", "show", "--check", proposal.proposal_commit), 30),
+                ("git status --porcelain", ("git", "status", "--porcelain"), 30),
+            ):
+                results.append(self._check_command(name, command, timeout, target))
+        finally:
+            if target.exists():
+                remove = self.workspace._run(("git", "worktree", "remove", str(target)), self.root, 90)
+                prune = self.workspace._run(("git", "worktree", "prune"), self.root, 90)
+                if remove.returncode != 0:
+                    results.append(CheckResult("limpeza worktree validacao", "git worktree remove", remove.returncode, 0, self.workspace.sanitize(remove.stderr or remove.stdout)))
+                if prune.returncode != 0:
+                    results.append(CheckResult("git worktree prune", "git worktree prune", prune.returncode, 0, self.workspace.sanitize(prune.stderr or prune.stdout)))
+        return [asdict(result) | {"passed": result.passed, "phase": "integration_validation"} for result in results]
+
+    def _post_integration_validation(self, proposal: EngineeringProposal) -> list[dict]:
+        results = [
+            self._check_command("git diff --check HEAD^ HEAD", ("git", "diff", "--check", "HEAD^", "HEAD"), 30, self.root),
+            self._check_command("smoke", ("python", "scripts/smoke_test.py"), 180, self.root),
+        ]
+        related = self._related_tests(proposal)
+        if related:
+            results.append(self._check_command("testes relacionados", ("python", "-m", "pytest", *related), 300, self.root))
+        current = self.workspace.head()
+        parents = self._git(("show", "-s", "--format=%P", "HEAD"), cwd=self.root, timeout=30).stdout.split()
+        checks = [
+            ("main head integrado", current == proposal.proposal_commit, current),
+            ("pai esperado", parents == [proposal.commit_parent], " ".join(parents)),
+            ("sem merge commit", len(parents) == 1, "pais=" + str(len(parents))),
+            ("status limpo", not self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip(), ""),
+        ]
+        for name, passed, output in checks:
+            results.append(CheckResult(name, name, 0 if passed else 1, 0, output))
+        return [asdict(result) | {"passed": result.passed, "phase": "post_integration"} for result in results]
+
+    def _cleanup_integrated_worktree(self, proposal: EngineeringProposal) -> str:
+        if not proposal.workspace_path:
+            return "Worktree nao registrado."
+        path = Path(proposal.workspace_path)
+        if not path.exists():
+            return "Worktree ja estava ausente."
+        status = self._git(("status", "--porcelain"), cwd=path, timeout=30).stdout.strip()
+        if status:
+            return "Worktree nao removido: status nao esta limpo."
+        remove = self.workspace._run(("git", "worktree", "remove", str(path)), self.root, 90)
+        prune = self.workspace._run(("git", "worktree", "prune"), self.root, 90)
+        if remove.returncode != 0:
+            return f"Worktree nao removido: {self.workspace.sanitize(remove.stderr or remove.stdout)}"
+        return f"Worktree removido; prune codigo={prune.returncode}."
+
+    def _integrated_idempotent_response(self, proposal: EngineeringProposal) -> str:
+        head = self.workspace.head()
+        ancestor = self.workspace._run(("git", "merge-base", "--is-ancestor", proposal.integrated_commit or proposal.proposal_commit, "main"), self.root, 30)
+        still_integrated = ancestor.returncode == 0
+        return "\n".join([
+            "Proposta ja integrada.",
+            f"- Commit: {proposal.integrated_commit or proposal.proposal_commit}",
+            f"- Main atual: {head}",
+            f"- Commit alcancavel pela main: {'sim' if still_integrated else 'nao'}",
+            "- Novo merge executado: nao",
+        ])
+
+    def _commit_files(self, commit: str) -> list[str]:
+        return self._git(("diff-tree", "--no-commit-id", "--name-only", "-r", commit), cwd=self.root, timeout=30).stdout.splitlines()
+
+    def _check_command(self, name: str, command: tuple[str, ...], timeout: int, cwd: Path) -> CheckResult:
+        result = self.workspace._run(command, cwd, timeout)
+        output = self.workspace.sanitize("\n".join(value for value in (result.stdout, result.stderr) if value))
+        return CheckResult(name, " ".join(command), result.returncode, 0, output)
+
+    def _checks_status(self, checks: list[dict]) -> str:
+        if not checks:
+            return "Informacao nao registrada."
+        failed = [item.get("name", "?") for item in checks if not item.get("passed")]
+        if failed:
+            return "REPROVADO: " + ", ".join(failed[:4])
+        return f"APROVADO ({len(checks)} checks)"
 
     def _required_checks_passed(self, proposal: EngineeringProposal) -> bool:
         required = {"pytest", "ruff", "compileall", "pip check", "smoke"}

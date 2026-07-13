@@ -763,6 +763,111 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Informacao nao registrada", self.service.execute(f"commit {proposal.id}"))
         self.assertEqual(before, len(self.client.calls))
 
+    def test_integrar_bloqueia_sem_commit_pronto(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.service.aprovar(proposal.id)
+        response = self.service.integrar(proposal.id)
+        self.assertIn("Integracao bloqueada", response)
+        self.assertEqual("INTEGRACAO_BLOQUEADA", proposal.state)
+
+    def test_integrar_bloqueia_sem_aprovacao_valida(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        proposal.approval_valid = False
+        response = self.service.integrar(proposal.id)
+        self.assertIn("APROVACAO", response.upper())
+        self.assertEqual("INTEGRACAO_BLOQUEADA", proposal.state)
+
+    def test_integrar_bloqueia_com_main_suja(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        (self.root / "notes.txt").write_text("sujo\n", encoding="utf-8")
+        response = self.service.integrar(proposal.id)
+        self.assertIn("MAIN_SUJA", response)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+
+    def test_integrar_bloqueia_com_untracked(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        (self.root / "novo.txt").write_text("untracked\n", encoding="utf-8")
+        response = self.service.integrar(proposal.id)
+        self.assertIn("MAIN_SUJA", response)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+
+    def test_integrar_bloqueia_em_branch_diferente(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        subprocess.run(("git", "branch", "outra"), cwd=self.root, capture_output=True, check=True)
+        subprocess.run(("git", "switch", "outra"), cwd=self.root, capture_output=True, check=True)
+        response = self.service.integrar(proposal.id)
+        self.assertIn("MAIN_BRANCH", response)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+
+    def test_integrar_bloqueia_quando_main_avancou(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        subprocess.run(("git", "commit", "--allow-empty", "-m", "avanca main"), cwd=self.root, capture_output=True, check=True)
+        response = self.service.integrar(proposal.id)
+        self.assertIn("BASE_DIVERGENTE", response)
+
+    def test_integrar_bloqueia_quando_branch_mudou(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        subprocess.run(("git", "commit", "--allow-empty", "-m", "avanca branch"), cwd=proposal.workspace_path, capture_output=True, check=True)
+        response = self.service.integrar(proposal.id)
+        self.assertIn("BRANCH_MUDOU", response)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+
+    def test_integrar_bloqueia_quando_manifesto_mudou(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        proposal.patch_manifest["tests"] = []
+        response = self.service.integrar(proposal.id)
+        self.assertIn("manifest", response.lower())
+
+    def test_integrar_bloqueia_sem_revisao(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        proposal.review_result = ""
+        response = self.service.integrar(proposal.id)
+        self.assertIn("REVIEW", response)
+
+    def test_integrar_bloqueia_com_testes_incompletos(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        proposal.validation = [item for item in proposal.validation if item.get("name") != "smoke"]
+        response = self.service.integrar(proposal.id)
+        self.assertIn("validation", response.lower())
+
+    def test_integrar_bloqueia_risco_alto(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        proposal.risk = "alto"
+        response = self.service.integrar(proposal.id)
+        self.assertIn("RISCO", response)
+
+    def test_integrar_bloqueia_validacao_limpa_falhando(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        failed = CheckResult("pytest", "python -m pytest", 1, 0, "falhou")
+        with patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=[failed.__dict__ | {"passed": False}]):
+            response = self.service.integrar(proposal.id)
+        self.assertIn("VALIDACAO_LIMPA", response)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+
+    def test_integrar_fast_forward_bem_sucedido_e_idempotente(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        main_before = self._git_head(self.root)
+        validation = [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
+        with patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=validation):
+            response = self.service.integrar(proposal.id)
+        self.assertIn("Integracao concluida", response)
+        self.assertEqual("INTEGRADA", proposal.state)
+        self.assertEqual(main_before, proposal.previous_main_head)
+        self.assertEqual(proposal.proposal_commit, self._git_head(self.root))
+        self.assertEqual(proposal.proposal_commit, proposal.resulting_main_head)
+        self.assertFalse(proposal.merge_commit_created)
+        self.assertFalse(proposal.pushed)
+        self.assertFalse(proposal.remote_used)
+        self.assertFalse(Path(proposal.workspace_path).exists())
+        self.assertIn("ja integrada", self.service.integrar(proposal.id))
+
+    def test_integracao_id_nao_chama_modelo(self):
+        proposal = self.proposal()
+        before = len(self.client.calls)
+        self.assertIn("Integracao", self.service.execute(f"integracao {proposal.id}"))
+        self.assertEqual(before, len(self.client.calls))
+
     def test_validacao_nao_executa_comando_arbitrario_do_modelo(self):
         workspace = self.workspaces / "safe"
         workspace.mkdir(parents=True)
@@ -864,6 +969,16 @@ class AyaDevTestCase(unittest.TestCase):
         self.service.revisar(proposal.id)
         self.service.testar(proposal.id)
         self.assertEqual("AGUARDANDO_APROVACAO", proposal.state)
+        return proposal
+
+    def _prepare_commit_ready_for_integration(self):
+        proposal = self._prepare_real_patch_for_commit()
+        subprocess.run(("git", "branch", "-M", "main"), cwd=self.root, capture_output=True, check=True)
+        self.service.aprovar(proposal.id)
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("Commit isolado criado", response)
+        self.assertEqual("COMMIT_PRONTO", proposal.state)
+        self.assertEqual(proposal.commit_parent, self._git_head(self.root))
         return proposal
 
     def _git_head(self, path: Path) -> str:
