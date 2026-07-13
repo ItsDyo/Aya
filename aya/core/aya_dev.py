@@ -20,7 +20,7 @@ from aya.core.structured_patch import PATCH_DECISION_SCHEMA, StructuredPatchAppl
 PROPOSAL_STATES = {
     "DETECTADA", "PROPOSTA", "PLANEJADA", "PREPARANDO", "EM_TESTE",
     "AGUARDANDO_APROVACAO", "APROVADA", "REJEITADA", "FALHOU",
-    "APLICADA", "REVERTIDA",
+    "PREPARANDO_COMMIT", "COMMIT_PRONTO", "APLICADA", "REVERTIDA",
 }
 RISK_ORDER = {"baixo": 0, "medio": 1, "alto": 2}
 HIGH_RISK_TERMS = {
@@ -72,6 +72,25 @@ class EngineeringProposal:
     project_unchanged: bool = True
     base_commit: str = ""
     patch_manifest: dict = field(default_factory=dict)
+    approved_at: str = ""
+    approved_by: str = ""
+    approved_diff_sha256: str = ""
+    approved_manifest_sha256: str = ""
+    approved_base_commit: str = ""
+    approved_validation_sha256: str = ""
+    approved_review_sha256: str = ""
+    approval_valid: bool = False
+    approval_invalid_reason: str = ""
+    proposal_branch: str = ""
+    proposal_commit: str = ""
+    commit_parent: str = ""
+    committed_at: str = ""
+    committed_files: list[str] = field(default_factory=list)
+    committed_diff_sha256: str = ""
+    commit_message: str = ""
+    main_head_at_commit: str = ""
+    main_unchanged: bool = False
+    ready_for_integration: bool = False
 
 
 class AyaDevService:
@@ -124,7 +143,7 @@ class AyaDevService:
         if action in handlers:
             return handlers[action]()
         if action in {
-            "mostrar", "falha", "planejar", "preparar", "revisar", "testar", "diff",
+            "mostrar", "falha", "commit", "planejar", "preparar", "revisar", "testar", "diff",
             "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "reverter", "pacote-codex",
         }:
             if not argument.strip():
@@ -272,6 +291,12 @@ class AyaDevService:
             "",
             "Decisao humana:",
             self._decision_summary(proposal),
+            "",
+            "Aprovacao:",
+            self._approval_summary(proposal),
+            "",
+            "Commit isolado:",
+            self.commit(proposal.id),
         ]
         return "\n".join(lines)
 
@@ -510,8 +535,23 @@ class AyaDevService:
         proposal = self._get(proposal_id)
         if proposal.state != "AGUARDANDO_APROVACAO":
             return "Aprovacao recusada: a validacao obrigatoria ainda nao foi aprovada."
+        valid, reason = self._approval_snapshot_valid(proposal)
+        if not valid:
+            proposal.approval_valid = False
+            proposal.approval_invalid_reason = reason
+            self._save()
+            return f"Aprovacao recusada: {reason}"
         previous = proposal.state
         proposal.state = "APROVADA"
+        proposal.approved_at = datetime.now().isoformat(timespec="seconds")
+        proposal.approved_by = "local_user"
+        proposal.approved_diff_sha256 = self._sha_text(proposal.patch)
+        proposal.approved_manifest_sha256 = self._sha_json(proposal.patch_manifest)
+        proposal.approved_base_commit = proposal.base_commit
+        proposal.approved_validation_sha256 = self._sha_json(proposal.validation)
+        proposal.approved_review_sha256 = self._sha_text(proposal.review_result)
+        proposal.approval_valid = True
+        proposal.approval_invalid_reason = ""
         self._event(proposal, "aprovacao humana registrada; patch nao aplicado", previous, proposal.state)
         self._save()
         return "Aprovacao registrada. Nenhum patch foi aplicado ao projeto principal."
@@ -520,7 +560,60 @@ class AyaDevService:
         proposal = self._get(proposal_id)
         if proposal.state != "APROVADA":
             return "Aplicacao bloqueada: aprove explicitamente antes com /aya-dev aprovar ID."
-        return "Aplicacao supervisionada ainda nao habilitada neste ciclo."
+        previous = proposal.state
+        proposal.state = "PREPARANDO_COMMIT"
+        self._event(proposal, "preparando commit isolado", previous, proposal.state)
+        try:
+            self._validate_apply_preconditions(proposal)
+            branch = self._proposal_branch(proposal.id)
+            self._ensure_git_identity()
+            if self._branch_exists(branch):
+                raise RuntimeError("BRANCH_EXISTENTE")
+            self._git(("switch", "-c", branch), cwd=Path(proposal.workspace), timeout=60)
+            changed_files = self._approved_files(proposal)
+            self._git(("add", "--", *changed_files), cwd=Path(proposal.workspace), timeout=60)
+            staged_names = self._git(("diff", "--cached", "--name-only"), cwd=Path(proposal.workspace), timeout=30).stdout.splitlines()
+            if sorted(staged_names) != sorted(changed_files):
+                raise RuntimeError("STAGING_FORA_DO_ESCOPO")
+            cached_check = self._git(("diff", "--cached", "--check"), cwd=Path(proposal.workspace), timeout=30)
+            if cached_check.returncode != 0:
+                raise RuntimeError(f"STAGED_DIFF_CHECK: {self.workspace.sanitize(cached_check.stderr or cached_check.stdout)}")
+            cached_diff = self._git(("diff", "--cached", "--no-ext-diff", "--"), cwd=Path(proposal.workspace), timeout=30).stdout
+            if self._sha_text(cached_diff) != proposal.approved_diff_sha256:
+                raise RuntimeError("STAGED_DIFF_DIVERGENTE")
+            message = f"aya-dev: {self._short_title(proposal.title)} [{proposal.id}]"
+            commit = self._git(("commit", "-m", message), cwd=Path(proposal.workspace), timeout=90)
+            if commit.returncode != 0:
+                raise RuntimeError(f"COMMIT_FALHOU: {self.workspace.sanitize(commit.stderr or commit.stdout)}")
+            commit_hash = self._git(("rev-parse", "HEAD"), cwd=Path(proposal.workspace), timeout=30).stdout.strip()
+            parent = self._git(("rev-parse", "HEAD^"), cwd=Path(proposal.workspace), timeout=30).stdout.strip()
+            proposal.proposal_branch = branch
+            proposal.proposal_commit = commit_hash
+            proposal.commit_parent = parent
+            proposal.committed_at = datetime.now().isoformat(timespec="seconds")
+            proposal.committed_files = changed_files
+            proposal.committed_diff_sha256 = self._sha_text(cached_diff)
+            proposal.commit_message = message
+            proposal.main_head_at_commit = self.workspace.head()
+            proposal.main_unchanged = proposal.main_head_at_commit == proposal.approved_base_commit
+            proposal.ready_for_integration = True
+            proposal.state = "COMMIT_PRONTO"
+            self._event(proposal, "commit isolado criado no worktree", "PREPARANDO_COMMIT", proposal.state)
+            self._save()
+            return "\n".join([
+                f"Commit isolado criado: {commit_hash}",
+                f"- Branch: {branch}",
+                "- Main nao foi alterada.",
+                "- Integracao ainda nao ocorreu.",
+                "- Push nao ocorreu.",
+            ])
+        except Exception as exc:
+            proposal.state = "FALHOU"
+            message = self.workspace.sanitize(str(exc))
+            self._record_failure(proposal, "commit", "commit isolado falhou", message)
+            self._event(proposal, "commit isolado falhou", "PREPARANDO_COMMIT", proposal.state)
+            self._save()
+            return f"Aplicacao bloqueada: {message}"
 
     def integrar(self, proposal_id: str) -> str:
         self._get(proposal_id)
@@ -531,12 +624,38 @@ class AyaDevService:
         return "Reversao bloqueada: nenhum commit aplicado por Aya Dev neste ciclo."
 
     def rejeitar(self, proposal_id: str) -> str:
-        proposal = self._get(proposal_id)
+        raw_id, _, reason = proposal_id.partition("|")
+        proposal = self._get(raw_id.strip())
         previous = proposal.state
         proposal.state = "REJEITADA"
+        proposal.approval_valid = False
+        proposal.approval_invalid_reason = reason.strip() or "rejeitada pelo usuario"
+        if proposal.workspace:
+            try:
+                proposal.cleanup_result = self.workspace.discard(proposal.workspace)
+                proposal.workspace_cleaned = True
+                proposal.workspace = ""
+            except (OSError, RuntimeError, ValueError) as exc:
+                proposal.cleanup_result = self.workspace.sanitize(str(exc))
         self._event(proposal, "rejeicao humana registrada", previous, proposal.state)
         self._save()
         return f"Proposta {proposal.id} rejeitada."
+
+    def commit(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        if not proposal.proposal_commit:
+            return "Commit isolado: Informacao nao registrada."
+        return "\n".join([
+            "Commit isolado:",
+            f"- Branch: {proposal.proposal_branch}",
+            f"- Hash: {proposal.proposal_commit}",
+            f"- Pai: {proposal.commit_parent}",
+            f"- Arquivos: {', '.join(proposal.committed_files)}",
+            f"- Mensagem: {proposal.commit_message}",
+            f"- Worktree: {proposal.workspace_path or proposal.workspace}",
+            f"- Main intacta: {'sim' if proposal.main_unchanged else 'nao'}",
+            f"- Pronto para integracao: {'sim' if proposal.ready_for_integration else 'nao'}",
+        ])
 
     def descartar(self, proposal_id: str) -> str:
         proposal = self._get(proposal_id)
@@ -847,3 +966,146 @@ class AyaDevService:
             text or "",
         )
         return cleaned.strip()
+
+    def _approval_summary(self, proposal: EngineeringProposal) -> str:
+        if not proposal.approved_at:
+            return "Aprovacao: Informacao nao registrada."
+        valid, reason = self._approval_currently_valid(proposal)
+        return "\n".join([
+            f"- Aprovada: {'sim' if proposal.approval_valid else 'nao'}",
+            f"- Data: {proposal.approved_at}",
+            f"- Valida agora: {'sim' if valid else 'nao'}",
+            f"- Diff aprovado: {proposal.approved_diff_sha256 or 'Informacao nao registrada.'}",
+            f"- Manifesto aprovado: {proposal.approved_manifest_sha256 or 'Informacao nao registrada.'}",
+            f"- Motivo de invalidacao: {'' if valid else reason}",
+        ])
+
+    def _approval_snapshot_valid(self, proposal: EngineeringProposal) -> tuple[bool, str]:
+        if not proposal.patch:
+            return False, "diff ausente"
+        if not proposal.patch_manifest:
+            return False, "manifesto ausente"
+        if not proposal.base_commit:
+            return False, "base_commit ausente"
+        if not proposal.review_result:
+            return False, "revisao ausente"
+        if not self._required_checks_passed(proposal):
+            return False, "checks obrigatorios nao aprovados"
+        return True, ""
+
+    def _approval_currently_valid(self, proposal: EngineeringProposal) -> tuple[bool, str]:
+        if not proposal.approval_valid:
+            return False, proposal.approval_invalid_reason or "aprovacao nao registrada"
+        expected = {
+            "diff": self._sha_text(proposal.patch),
+            "manifest": self._sha_json(proposal.patch_manifest),
+            "base": proposal.base_commit,
+            "validation": self._sha_json(proposal.validation),
+            "review": self._sha_text(proposal.review_result),
+        }
+        actual = {
+            "diff": proposal.approved_diff_sha256,
+            "manifest": proposal.approved_manifest_sha256,
+            "base": proposal.approved_base_commit,
+            "validation": proposal.approved_validation_sha256,
+            "review": proposal.approved_review_sha256,
+        }
+        for key, value in expected.items():
+            if value != actual[key]:
+                return False, f"aprovacao invalidada por mudanca em {key}"
+        return True, ""
+
+    def _validate_apply_preconditions(self, proposal: EngineeringProposal) -> None:
+        valid, reason = self._approval_currently_valid(proposal)
+        if not valid:
+            proposal.approval_valid = False
+            proposal.approval_invalid_reason = reason
+            raise RuntimeError(reason)
+        if proposal.risk not in {"baixo", "medio"}:
+            raise RuntimeError("RISCO_NAO_PERMITIDO")
+        if not proposal.workspace or not Path(proposal.workspace).exists():
+            raise RuntimeError("WORKTREE_AUSENTE")
+        if self.workspace.head() != proposal.approved_base_commit:
+            raise RuntimeError("BASE_DESATUALIZADA")
+        if self._git(("rev-parse", "HEAD"), cwd=Path(proposal.workspace), timeout=30).stdout.strip() != proposal.approved_base_commit:
+            raise RuntimeError("WORKTREE_HEAD_DIVERGENTE")
+        git_state = self.workspace.git_state()
+        if not git_state.safe:
+            raise RuntimeError("MAIN_SUJA")
+        current_diff = self.workspace.diff(proposal.workspace)
+        if self._sha_text(current_diff) != proposal.approved_diff_sha256:
+            raise RuntimeError("DIFF_DIVERGENTE")
+        if self._sha_json(proposal.patch_manifest) != proposal.approved_manifest_sha256:
+            raise RuntimeError("MANIFESTO_DIVERGENTE")
+        inspection = self.workspace.inspect_patch(current_diff, self.max_files, self.max_changed_lines, self._approved_files(proposal))
+        if not inspection.valid:
+            raise RuntimeError(inspection.message)
+        status = self._git(("status", "--porcelain"), cwd=Path(proposal.workspace), timeout=30).stdout.splitlines()
+        expected = set(self._approved_files(proposal))
+        for line in status:
+            path = line[3:] if len(line) >= 4 else ""
+            if line.startswith("??"):
+                raise RuntimeError("ARQUIVO_NAO_RASTREADO")
+            if path not in expected:
+                raise RuntimeError(f"ARQUIVO_INESPERADO: {path}")
+        diff_check = self.workspace.diff_check(proposal.workspace)
+        if not diff_check.passed:
+            raise RuntimeError("DIFF_CHECK_REPROVADO")
+        if not self._required_checks_passed(proposal):
+            raise RuntimeError("CHECKS_REPROVADOS")
+        if self._review_blocks(proposal.review_result):
+            raise RuntimeError("REVISAO_BLOQUEADORA")
+
+    def _required_checks_passed(self, proposal: EngineeringProposal) -> bool:
+        required = {"pytest", "ruff", "compileall", "pip check", "smoke"}
+        passed = {
+            item.get("name")
+            for item in proposal.validation
+            if item.get("phase") == "patch" and item.get("passed")
+        }
+        return required.issubset(passed)
+
+    def _review_blocks(self, review: str) -> bool:
+        lowered = (review or "").lower()
+        return any(term in lowered for term in ("bloquear", "risco alto", "credencial exposta", "segredo exposto"))
+
+    def _approved_files(self, proposal: EngineeringProposal) -> list[str]:
+        files: list[str] = []
+        for operation in proposal.patch_manifest.get("operations", []):
+            rel = operation.get("file", "")
+            if rel and rel not in files:
+                files.append(rel)
+        return files
+
+    def _proposal_branch(self, proposal_id: str) -> str:
+        if not re.fullmatch(r"DEV-\d{8}-[A-F0-9]{6}", proposal_id):
+            raise RuntimeError("ID_DE_PROPOSTA_INVALIDO")
+        return f"aya-dev/{proposal_id}"
+
+    def _branch_exists(self, branch: str) -> bool:
+        result = self._git(("branch", "--list", branch), cwd=self.root, timeout=30)
+        return bool(result.stdout.strip())
+
+    def _ensure_git_identity(self) -> None:
+        name = self._git(("config", "user.name"), cwd=self.root, timeout=15)
+        email = self._git(("config", "user.email"), cwd=self.root, timeout=15)
+        if name.returncode != 0 or not name.stdout.strip() or email.returncode != 0 or not email.stdout.strip():
+            raise RuntimeError("IDENTIDADE_GIT_AUSENTE")
+
+    def _git(self, args: tuple[str, ...], cwd: Path, timeout: int):
+        result = self.workspace._run(("git", *args), cwd, timeout)
+        if result.returncode != 0 and args[:2] not in {("branch", "--list"), ("config", "user.name"), ("config", "user.email")}:
+            raise RuntimeError(self.workspace.sanitize(result.stderr or result.stdout))
+        return result
+
+    def _sha_text(self, text: str) -> str:
+        return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+    def _sha_json(self, value) -> str:
+        payload = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        return self._sha_text(payload)
+
+    def _short_title(self, title: str) -> str:
+        cleaned = re.sub(r"[^A-Za-z0-9 _.-]+", "", title).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned[:72] or "patch supervisionado"

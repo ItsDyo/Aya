@@ -51,6 +51,7 @@ class AyaDevTestCase(unittest.TestCase):
         (self.root / "aya" / "core").mkdir(parents=True)
         (self.root / "tests").mkdir()
         (self.root / "scripts").mkdir()
+        (self.root / ".gitignore").write_text("__pycache__/\n.pytest_cache/\n*.pyc\n", encoding="utf-8")
         (self.root / "aya" / "core" / "sample.py").write_text(
             "import json\n\nclass Sample:\n    def run(self, value: str) -> str:\n        return json.dumps(value)\n",
             encoding="utf-8",
@@ -60,8 +61,8 @@ class AyaDevTestCase(unittest.TestCase):
             encoding="utf-8",
         )
         (self.root / "scripts" / "smoke_test.py").write_text("print('ok')\n", encoding="utf-8")
-        self.storage = self.root / "state" / "history.json"
-        self.cache = self.root / "state" / "index.json"
+        self.storage = self.root.parent / "state" / "history.json"
+        self.cache = self.root.parent / "state" / "index.json"
         self.workspaces = self.root.parent / "workspaces"
         self.client = StaticClient("Plano pequeno e verificavel.")
         self.service = AyaDevService(
@@ -620,8 +621,6 @@ class AyaDevTestCase(unittest.TestCase):
         self.service.preparar(proposal.id)
         self.assertEqual("FALHOU", proposal.state)
         self.assertEqual("manifesto recusado", proposal.failure_reason)
-        subprocess.run(("git", "add", "."), cwd=self.root, capture_output=True, check=True)
-        subprocess.run(("git", "commit", "-m", "state after failed attempt"), cwd=self.root, capture_output=True, check=True)
         self.service.llm = DynamicStructuredClient("review ok")
         response = self.service.preparar(proposal.id)
         self.assertIn("Patch preparado", response)
@@ -647,12 +646,122 @@ class AyaDevTestCase(unittest.TestCase):
 
     def test_aprovacao_nao_aplica_patch(self):
         proposal = self.proposal()
-        proposal.state = "AGUARDANDO_APROVACAO"
+        self._mark_ready_for_approval(proposal)
         before = (self.root / "aya/core/sample.py").read_text(encoding="utf-8")
         self.service.aprovar(proposal.id)
         after = (self.root / "aya/core/sample.py").read_text(encoding="utf-8")
         self.assertEqual(before, after)
-        self.assertIn("nao habilitada", self.service.aplicar(proposal.id).lower())
+        self.assertEqual("APROVADA", proposal.state)
+
+    def test_aprovacao_guarda_hashes_do_diff_e_manifesto(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.service.aprovar(proposal.id)
+        self.assertTrue(proposal.approved_diff_sha256)
+        self.assertTrue(proposal.approved_manifest_sha256)
+        self.assertTrue(proposal.approved_validation_sha256)
+        self.assertTrue(proposal.approval_valid)
+
+    def test_aplicar_bloqueia_sem_aprovacao(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("aprove explicitamente", response)
+
+    def test_aplicar_bloqueia_aprovacao_invalida_por_diff(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.service.aprovar(proposal.id)
+        proposal.patch += "\n"
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("diff", response.lower())
+
+    def test_aplicar_bloqueia_aprovacao_invalida_por_manifesto(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.service.aprovar(proposal.id)
+        proposal.patch_manifest["tests"] = []
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("manifest", response.lower())
+
+    def test_aplicar_bloqueia_risco_alto(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.service.aprovar(proposal.id)
+        proposal.risk = "alto"
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("RISCO", response)
+
+    def test_aplicar_bloqueia_sem_revisao(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        proposal.review_result = ""
+        response = self.service.aprovar(proposal.id)
+        self.assertIn("revisao", response)
+
+    def test_aplicar_bloqueia_com_teste_reprovado(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        proposal.validation[0]["passed"] = False
+        response = self.service.aprovar(proposal.id)
+        self.assertIn("checks", response)
+
+    def test_aplicar_bloqueia_worktree_head_alterado(self):
+        proposal = self._prepare_real_patch_for_commit()
+        self.service.aprovar(proposal.id)
+        subprocess.run(("git", "commit", "--allow-empty", "-m", "diverge"), cwd=proposal.workspace, capture_output=True, check=True)
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("WORKTREE_HEAD", response)
+
+    def test_aplicar_bloqueia_main_suja(self):
+        proposal = self._prepare_real_patch_for_commit()
+        self.service.aprovar(proposal.id)
+        (self.root / "notes.txt").write_text("sujo\n", encoding="utf-8")
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("MAIN_SUJA", response)
+
+    def test_aplicar_bloqueia_arquivo_nao_rastreado_no_worktree(self):
+        proposal = self._prepare_real_patch_for_commit()
+        self.service.aprovar(proposal.id)
+        (Path(proposal.workspace) / "novo.txt").write_text("x\n", encoding="utf-8")
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("ARQUIVO_NAO_RASTREADO", response)
+
+    def test_aplicar_cria_branch_e_commit_isolado(self):
+        proposal = self._prepare_real_patch_for_commit()
+        main_before = self._git_head(self.root)
+        self.service.aprovar(proposal.id)
+        response = self.service.aplicar(proposal.id)
+        main_after = self._git_head(self.root)
+        self.assertIn("Commit isolado criado", response)
+        self.assertEqual("COMMIT_PRONTO", proposal.state)
+        self.assertEqual(main_before, main_after)
+        self.assertEqual(main_before, proposal.commit_parent)
+        self.assertTrue(proposal.proposal_branch.startswith("aya-dev/"))
+        self.assertEqual(["aya/core/sample.py"], proposal.committed_files)
+        self.assertIn(proposal.id, proposal.commit_message)
+        self.assertIn("Branch", self.service.commit(proposal.id))
+
+    def test_aplicar_bloqueia_branch_existente(self):
+        proposal = self._prepare_real_patch_for_commit()
+        self.service.aprovar(proposal.id)
+        subprocess.run(("git", "branch", f"aya-dev/{proposal.id}"), cwd=self.root, capture_output=True, check=True)
+        response = self.service.aplicar(proposal.id)
+        self.assertIn("BRANCH_EXISTENTE", response)
+
+    def test_rejeitar_invalida_aprovacao_e_preserva_proposta(self):
+        proposal = self._prepare_real_patch_for_commit()
+        self.service.aprovar(proposal.id)
+        response = self.service.rejeitar(f"{proposal.id} | nao quero")
+        self.assertIn("rejeitada", response)
+        self.assertFalse(proposal.approval_valid)
+        self.assertEqual("REJEITADA", proposal.state)
+
+    def test_commit_id_nao_chama_modelo(self):
+        proposal = self.proposal()
+        before = len(self.client.calls)
+        self.assertIn("Informacao nao registrada", self.service.execute(f"commit {proposal.id}"))
+        self.assertEqual(before, len(self.client.calls))
 
     def test_validacao_nao_executa_comando_arbitrario_do_modelo(self):
         workspace = self.workspaces / "safe"
@@ -667,7 +776,7 @@ class AyaDevTestCase(unittest.TestCase):
 
     def test_comandos_basicos_e_aprovacao_apenas_registram(self):
         proposal = self.proposal()
-        proposal.state = "AGUARDANDO_APROVACAO"
+        self._mark_ready_for_approval(proposal)
         self.assertIn("Aya Dev", self.service.execute("status"))
         self.assertIn("Arquivos Python", self.service.execute("mapear"))
         self.assertIn(proposal.id, self.service.execute("propostas"))
@@ -720,6 +829,45 @@ class AyaDevTestCase(unittest.TestCase):
             "operations": [operation],
             "tests": ["tests/test_sample.py"],
         }
+
+    def _mark_ready_for_approval(self, proposal):
+        proposal.state = "AGUARDANDO_APROVACAO"
+        proposal.base_commit = "abc1234"
+        proposal.patch = (
+            "diff --git a/aya/core/sample.py b/aya/core/sample.py\n"
+            "--- a/aya/core/sample.py\n"
+            "+++ b/aya/core/sample.py\n"
+            "@@ -1 +1 @@\n"
+            "-import json\n"
+            "+import json\n"
+        )
+        proposal.patch_manifest = self._manifest(expected_sha256=self._sha("aya/core/sample.py"))
+        proposal.review_result = "review ok"
+        proposal.validation = [
+            {"phase": "patch", "name": "pytest", "passed": True},
+            {"phase": "patch", "name": "ruff", "passed": True},
+            {"phase": "patch", "name": "compileall", "passed": True},
+            {"phase": "patch", "name": "pip check", "passed": True},
+            {"phase": "patch", "name": "smoke", "passed": True},
+        ]
+
+    def _prepare_real_patch_for_commit(self):
+        proposal = self.proposal(
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample", "Sample.run"],
+            suggested_change="Adicionar docstring curta em Sample.run.",
+        )
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.service.llm = DynamicStructuredClient("review ok")
+        self.service.preparar(proposal.id)
+        self.service.revisar(proposal.id)
+        self.service.testar(proposal.id)
+        self.assertEqual("AGUARDANDO_APROVACAO", proposal.state)
+        return proposal
+
+    def _git_head(self, path: Path) -> str:
+        return subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, capture_output=True, text=True, check=True).stdout.strip()
 
 
 class AssistantAyaDevInitializationTest(unittest.TestCase):
