@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 import tempfile
 import unittest
@@ -11,11 +12,48 @@ from aya.core.aya_dev import AyaDevService
 from aya.core.dev_workspace import CheckResult, GitState
 from aya.core.llm import StaticClient
 from aya.core.project_tools import ProjectTools
+from aya.core.structured_patch import PATCH_MANIFEST_SCHEMA, StructuredPatchError
 
 
 class FailingClient:
     def chat(self, **kwargs):
         raise RuntimeError("ollama offline token=segredo")
+
+
+class StructuredClient(StaticClient):
+    def __init__(self, payload):
+        super().__init__(json.dumps(payload) if not isinstance(payload, str) else payload)
+        self.payload = payload
+
+    def chat_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.payload, Exception):
+            raise self.payload
+        if isinstance(self.payload, str):
+            return json.loads(self.payload)
+        return self.payload
+
+
+class DynamicStructuredClient(StaticClient):
+    def chat_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        text = kwargs["messages"][-1]["content"]
+        proposal_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("proposal_id:"))
+        base_commit = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("base_commit:"))
+        sha = next(line.split("sha256=", 1)[1].split(",", 1)[0] for line in text.splitlines() if line.startswith("- aya/core/sample.py:"))
+        return {
+            "version": 1,
+            "proposal_id": proposal_id,
+            "base_commit": base_commit,
+            "operations": [{
+                "type": "insert_docstring",
+                "file": "aya/core/sample.py",
+                "symbol": "Sample.run",
+                "expected_sha256": sha,
+                "content": "Executa sample.",
+            }],
+            "tests": ["tests/test_sample.py"],
+        }
 
 
 class AyaDevTestCase(unittest.TestCase):
@@ -134,6 +172,31 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertTrue(result.valid)
         self.assertEqual(("aya/core/sample.py",), result.files)
 
+    def test_patch_manifest_schema_basico(self):
+        self.assertEqual(1, PATCH_MANIFEST_SCHEMA["properties"]["version"]["const"])
+        operations = PATCH_MANIFEST_SCHEMA["properties"]["operations"]
+        self.assertEqual(4, operations["maxItems"])
+        self.assertEqual(["insert_docstring", "replace_exact"], operations["items"]["properties"]["type"]["enum"])
+
+    def test_patch_manifest_json_invalido(self):
+        with self.assertRaisesRegex(StructuredPatchError, "JSON invalido"):
+            self.service.structured_patch.parse("{")
+
+    def test_patch_manifest_markdown_recusado(self):
+        with self.assertRaisesRegex(StructuredPatchError, "Markdown"):
+            self.service.structured_patch.parse("```json\n{}\n```")
+
+    def test_patch_manifest_operacao_desconhecida(self):
+        manifest = self._manifest("desconhecida")
+        with self.assertRaisesRegex(StructuredPatchError, "Operacao desconhecida"):
+            self.service.structured_patch.parse(manifest)
+
+    def test_patch_manifest_excesso_de_operacoes(self):
+        manifest = self._manifest()
+        manifest["operations"] = [manifest["operations"][0] for _ in range(5)]
+        with self.assertRaisesRegex(StructuredPatchError, "limite"):
+            self.service.structured_patch.parse(manifest)
+
     def test_texto_explicativo_e_recusado(self):
         result = self.service.workspace.inspect_patch(
             "Claro, aqui esta o patch:\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-a\n+b\n"
@@ -208,6 +271,7 @@ class AyaDevTestCase(unittest.TestCase):
         fake_workspace = self.workspaces / proposal.id
         fake_workspace.mkdir(parents=True)
         self.service.workspace.git_state = Mock(return_value=GitState(True, True, "ok"))
+        self.service.workspace.head = Mock(return_value="abc1234")
         self.service.workspace.create = Mock(return_value=fake_workspace)
         self.service.workspace.baseline = Mock(return_value=[CheckResult("pytest", "python -m pytest", 1, 1, "falhou")])
         calls_before = len(self.client.calls)
@@ -226,6 +290,67 @@ class AyaDevTestCase(unittest.TestCase):
         result = self.service.workspace.inspect_patch("--- a/.env\n+++ b/.env\n@@ -1 +1 @@\n-A=x\n+A=y\n")
         self.assertFalse(result.valid)
         self.assertIn("protegido", result.message)
+
+    def test_patch_manifest_arquivo_fora_da_proposta(self):
+        workspace = self.root
+        manifest = self._manifest(file="aya/core/sample.py")
+        with self.assertRaisesRegex(StructuredPatchError, "fora da proposta"):
+            self.service.structured_patch.apply(workspace, manifest, "DEV-20260713-ABCDEF", "abc1234", ["tests/test_sample.py"], ["Sample.run"])
+
+    def test_patch_manifest_arquivo_protegido(self):
+        manifest = self._manifest(file=".env")
+        with self.assertRaisesRegex(StructuredPatchError, "protegido"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", [".env"], ["Sample.run"])
+
+    def test_patch_manifest_hash_diferente(self):
+        manifest = self._manifest(expected_sha256="0" * 64)
+        with self.assertRaisesRegex(StructuredPatchError, "Hash diferente"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+
+    def test_patch_manifest_simbolo_inexistente(self):
+        manifest = self._manifest(symbol="Sample.inexistente")
+        with self.assertRaisesRegex(StructuredPatchError, "Simbolo inexistente"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.inexistente"])
+
+    def test_patch_manifest_simbolo_ambiguo(self):
+        path = self.root / "aya/core/sample.py"
+        path.write_text(path.read_text(encoding="utf-8") + "\ndef run():\n    return 'x'\n", encoding="utf-8")
+        manifest = self._manifest(symbol="run", expected_sha256=self._sha("aya/core/sample.py"))
+        with self.assertRaisesRegex(StructuredPatchError, "ambiguo"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["run"])
+
+    def test_patch_manifest_docstring_ja_existente(self):
+        manifest = self._manifest(content="Executa sample.")
+        self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+        manifest = self._manifest(expected_sha256=self._sha("aya/core/sample.py"), content="Executa sample.")
+        with self.assertRaisesRegex(StructuredPatchError, "equivalente"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+
+    def test_patch_manifest_insert_docstring_valido_e_indentado(self):
+        manifest = self._manifest(content="Executa sample.")
+        result = self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+        text = (self.root / "aya/core/sample.py").read_text(encoding="utf-8")
+        self.assertTrue(result.ok)
+        self.assertIn('        """Executa sample."""', text)
+
+    def test_patch_manifest_replace_exact_valido(self):
+        old = "return json.dumps(value)"
+        new = "return json.dumps(value, ensure_ascii=False)"
+        manifest = self._manifest("replace_exact", old=old, new=new)
+        self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+        self.assertIn(new, (self.root / "aya/core/sample.py").read_text(encoding="utf-8"))
+
+    def test_patch_manifest_replace_exact_ausente(self):
+        manifest = self._manifest("replace_exact", old="nao existe", new="x")
+        with self.assertRaisesRegex(StructuredPatchError, "nao encontrado"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
+
+    def test_patch_manifest_replace_exact_duplicado(self):
+        path = self.root / "aya/core/sample.py"
+        path.write_text(path.read_text(encoding="utf-8") + "\n# dup\n# dup\n", encoding="utf-8")
+        manifest = self._manifest("replace_exact", expected_sha256=self._sha("aya/core/sample.py"), old="# dup", new="# novo")
+        with self.assertRaisesRegex(StructuredPatchError, "mais de uma vez"):
+            self.service.structured_patch.apply(self.root, manifest, "DEV-20260713-ABCDEF", "abc1234", ["aya/core/sample.py"], ["Sample.run"])
 
     def test_extrator_preserva_quebra_final_exigida_pelo_git(self):
         patch_text = self.service._extract_patch(
@@ -356,9 +481,10 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertEqual(original, (self.root / "aya/core/sample.py").read_bytes())
 
     def test_git_apply_check_falhando_registra_falha_e_limpa_worktree(self):
-        proposal = self.proposal(related_files=["aya/core/sample.py"])
+        proposal = self.proposal(related_files=["aya/core/sample.py", "tests/test_sample.py"])
         self.init_git()
         proposal.state = "PLANEJADA"
+        proposal.risk = "medio"
         self.client.resposta = (
             "--- a/aya/core/sample.py\n"
             "+++ b/aya/core/sample.py\n"
@@ -373,10 +499,75 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertTrue(proposal.workspace_cleaned)
         self.assertFalse(Path(proposal.workspace_path).exists())
 
-    def test_patch_markdown_falha_com_motivo_persistido_e_worktree_removido(self):
-        proposal = self.proposal(related_files=["aya/core/sample.py"])
+    def test_preparar_structured_patch_gera_diff_real_e_aguarda_teste(self):
+        proposal = self.proposal(
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample", "Sample.run"],
+            suggested_change="Adicionar docstring curta em Sample.run.",
+        )
         self.init_git()
         proposal.state = "PLANEJADA"
+        self.service.llm = DynamicStructuredClient("review ok")
+        response = self.service.preparar(proposal.id)
+        self.assertIn("Patch preparado", response)
+        self.assertEqual("EM_TESTE", proposal.state)
+        self.assertIn('"""Executa sample."""', proposal.patch)
+        self.assertTrue(proposal.patch_manifest)
+        self.assertTrue((Path(proposal.workspace) / "aya/core/sample.py").exists())
+
+    def test_preparar_structured_patch_head_alterado_bloqueia_manifesto(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"], related_symbols=["Sample.run"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        manifest = self._manifest(expected_sha256=self._sha("aya/core/sample.py"))
+        manifest["proposal_id"] = proposal.id
+        manifest["base_commit"] = "HEAD-ANTIGO"
+        self.service.llm = StructuredClient(manifest)
+        response = self.service.preparar(proposal.id)
+        self.assertIn("base_commit", response)
+        self.assertEqual("FALHOU", proposal.state)
+        self.assertTrue(proposal.workspace_cleaned)
+
+    def test_preparar_structured_patch_validado_chega_a_aguardando_aprovacao(self):
+        proposal = self.proposal(
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample", "Sample.run"],
+            suggested_change="Adicionar docstring curta em Sample.run.",
+        )
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.service.llm = DynamicStructuredClient("review ok")
+        self.service.preparar(proposal.id)
+        review = self.service.revisar(proposal.id)
+        result = self.service.testar(proposal.id)
+        self.assertIn("review", review.lower())
+        self.assertIn("AGUARDANDO_APROVACAO", result)
+        self.assertEqual("AGUARDANDO_APROVACAO", proposal.state)
+        self.assertTrue(any(call.get("messages") for call in self.service.llm.calls))
+        self.assertEqual("", (self.root / "aya/core/sample.py").read_text(encoding="utf-8").splitlines()[0].replace("import json", ""))
+
+    def test_preparar_structured_patch_segunda_tentativa_usa_erros_reais(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"], related_symbols=["Sample.run"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.service.llm = StructuredClient("```json\n{}\n```")
+        self.service.preparar(proposal.id)
+        self.assertEqual("FALHOU", proposal.state)
+        self.assertEqual("manifesto recusado", proposal.failure_reason)
+        subprocess.run(("git", "add", "."), cwd=self.root, capture_output=True, check=True)
+        subprocess.run(("git", "commit", "-m", "state after failed attempt"), cwd=self.root, capture_output=True, check=True)
+        self.service.llm = DynamicStructuredClient("review ok")
+        response = self.service.preparar(proposal.id)
+        self.assertIn("Patch preparado", response)
+        context = self.service.llm.calls[-1]["messages"][-1]["content"]
+        self.assertIn("manifesto recusado", context)
+        self.assertEqual(2, proposal.attempts)
+
+    def test_patch_markdown_falha_com_motivo_persistido_e_worktree_removido(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py", "tests/test_sample.py"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        proposal.risk = "medio"
         self.client.resposta = (
             "```diff\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n"
             "@@ -1 +1 @@\n-import json\n+import re\n```"
@@ -430,6 +621,37 @@ class AyaDevTestCase(unittest.TestCase):
             "difficulty": "baixa",
             "required_tests": ["tests/test_sample.py"],
             "done_criteria": ["testes passam"],
+        }
+
+    def _sha(self, rel: str) -> str:
+        return hashlib.sha256((self.root / rel).read_bytes()).hexdigest()
+
+    def _manifest(
+        self,
+        operation_type: str = "insert_docstring",
+        *,
+        file: str = "aya/core/sample.py",
+        symbol: str = "Sample.run",
+        expected_sha256: str | None = None,
+        content: str = "Executa sample.",
+        old: str = "return json.dumps(value)",
+        new: str = "return json.dumps(value, ensure_ascii=False)",
+    ) -> dict:
+        operation = {
+            "type": operation_type,
+            "file": file,
+            "expected_sha256": expected_sha256 or self._sha(file) if (self.root / file).exists() else "0" * 64,
+        }
+        if operation_type == "insert_docstring":
+            operation.update({"symbol": symbol, "content": content})
+        elif operation_type == "replace_exact":
+            operation.update({"old": old, "new": new})
+        return {
+            "version": 1,
+            "proposal_id": "DEV-20260713-ABCDEF",
+            "base_commit": "abc1234",
+            "operations": [operation],
+            "tests": ["tests/test_sample.py"],
         }
 
 

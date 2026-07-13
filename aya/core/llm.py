@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -38,6 +39,30 @@ class OllamaClient:
         )
         return response.choices[0].message.content.strip()
 
+    def chat_structured(
+        self,
+        model: str,
+        messages: list[dict],
+        response_schema: dict,
+        temperature: float = 0.0,
+        max_tokens: int = MODEL_CONFIG.default_max_tokens,
+    ) -> dict:
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "aya_patch_manifest",
+                    "schema": response_schema,
+                    "strict": True,
+                },
+            },
+        )
+        return json.loads(response.choices[0].message.content or "")
+
     def healthcheck(self, model: str) -> LLMHealth:
         try:
             resposta = self.chat(
@@ -72,3 +97,20 @@ class StaticClient:
             "max_tokens": max_tokens,
         })
         return self.resposta
+
+    def chat_structured(
+        self,
+        model: str,
+        messages: list[dict],
+        response_schema: dict,
+        temperature: float = 0.0,
+        max_tokens: int = MODEL_CONFIG.default_max_tokens,
+    ) -> dict:
+        self.calls.append({
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "response_schema": response_schema,
+        })
+        return json.loads(self.resposta)

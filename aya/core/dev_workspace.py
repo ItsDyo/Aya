@@ -82,6 +82,12 @@ class DevWorkspace:
             return GitState(True, False, f"Repositorio possui {len(changed)} alteracao(oes) nao salvas.", changed)
         return GitState(True, True, "Repositorio Git valido e limpo.")
 
+    def head(self) -> str:
+        result = self._run(("git", "rev-parse", "HEAD"), self.root, 15)
+        if result.returncode != 0:
+            raise RuntimeError("Nao foi possivel consultar HEAD.")
+        return result.stdout.strip()
+
     def create(self, proposal_id: str) -> Path:
         state = self.git_state()
         if not state.safe:
@@ -174,6 +180,10 @@ class DevWorkspace:
         path = self._workspace_path(workspace)
         result = self._run(("git", "diff", "--no-ext-diff", "--"), path, 30)
         return self.sanitize(result.stdout) if result.returncode == 0 else "Diff indisponivel."
+
+    def diff_check(self, workspace: str | Path) -> CheckResult:
+        path = self._workspace_path(workspace)
+        return self._check("git diff --check", ("git", "diff", "--check"), 30, path)
 
     def validate(self, workspace: str | Path, related_tests: list[str] | None = None) -> list[CheckResult]:
         path = self._workspace_path(workspace)

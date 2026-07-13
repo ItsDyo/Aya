@@ -12,6 +12,7 @@ from aya.core.dev_index import TechnicalFile, TechnicalIndex
 from aya.core.dev_workspace import CheckResult, DevWorkspace
 from aya.core.llm import ChatClient
 from aya.core.project_tools import ProjectTools
+from aya.core.structured_patch import PATCH_MANIFEST_SCHEMA, StructuredPatchApplier, StructuredPatchError
 
 
 PROPOSAL_STATES = {
@@ -67,6 +68,8 @@ class EngineeringProposal:
     diff_preserved: bool = False
     tests_executed: bool = False
     project_unchanged: bool = True
+    base_commit: str = ""
+    patch_manifest: dict = field(default_factory=dict)
 
 
 class AyaDevService:
@@ -91,6 +94,12 @@ class AyaDevService:
         self.storage_path = Path(storage_path or data_dir / "aya_dev_history.json")
         self.index = TechnicalIndex(self.root, index_path or data_dir / "aya_dev_index.json")
         self.workspace = DevWorkspace(self.root, workspace_root)
+        self.structured_patch = StructuredPatchApplier(
+            self.root,
+            self.workspace,
+            max_files=max_files,
+            max_changed_lines=max_changed_lines,
+        )
         self.llm = llm
         self.project_tools = project_tools
         self.primary_model = primary_model
@@ -325,6 +334,7 @@ class AyaDevService:
         proposal.attempts += 1
         self._event(proposal, f"tentativa {proposal.attempts}", previous, proposal.state)
         try:
+            proposal.base_commit = git_head = self.workspace.head()
             worktree = self.workspace.create(proposal.id)
             proposal.workspace = str(worktree)
             proposal.workspace_path = str(worktree)
@@ -340,36 +350,80 @@ class AyaDevService:
                 self._event(proposal, "baseline reprovado", "PREPARANDO", "FALHOU")
                 self._save()
                 return proposal.review_result
-            response = self.llm.chat(
-                model=self.primary_model,
-                messages=[
-                    {"role": "system", "content": self._patch_rules()},
-                    {"role": "user", "content": self._context(proposal, include_content=True)},
-                ],
-                temperature=0.0,
-                max_tokens=1800,
-            )
-            proposal.raw_response = self.workspace.sanitize(response, 50000)
-            proposal.raw_response_saved = True
-            patch = self._extract_patch(response)
-            proposal.diff_created = bool(self.workspace.inspect_patch(patch, self.max_files, self.max_changed_lines, proposal.related_files).diff_created)
-            inspection = self.workspace.apply_patch(worktree, patch, self.max_files, self.max_changed_lines, proposal.related_files)
+            if self._use_structured_patch(proposal):
+                raw_manifest = self._request_patch_manifest(proposal, git_head)
+                proposal.raw_response = self.workspace.sanitize(json.dumps(raw_manifest, ensure_ascii=True), 50000)
+                proposal.raw_response_saved = True
+                manifest = self.structured_patch.parse(raw_manifest)
+                proposal.patch_manifest = manifest
+                result = self.structured_patch.apply(
+                    worktree,
+                    manifest,
+                    proposal.id,
+                    git_head,
+                    proposal.related_files,
+                    proposal.related_symbols,
+                )
+                proposal.diff_created = result.ok
+            else:
+                response = self.llm.chat(
+                    model=self.primary_model,
+                    messages=[
+                        {"role": "system", "content": self._patch_rules()},
+                        {"role": "user", "content": self._context(proposal, include_content=True)},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1800,
+                )
+                proposal.raw_response = self.workspace.sanitize(response, 50000)
+                proposal.raw_response_saved = True
+                patch = self._extract_patch(response)
+                proposal.diff_created = bool(self.workspace.inspect_patch(patch, self.max_files, self.max_changed_lines, proposal.related_files).diff_created)
+                inspection = self.workspace.apply_patch(worktree, patch, self.max_files, self.max_changed_lines, proposal.related_files)
+                if not inspection.valid:
+                    proposal.state = "FALHOU"
+                    proposal.review_result = inspection.message
+                    proposal.patch = patch if inspection.diff_created else ""
+                    proposal.diff_preserved = bool(proposal.patch)
+                    self._record_failure(proposal, "patch", "diff recusado", inspection.message)
+                    self._cleanup_failed_workspace(proposal)
+                    self._event(proposal, "patch recusado", "PREPARANDO", "FALHOU")
+                    self._save()
+                    return inspection.message
+            proposal.patch = self.workspace.diff(worktree)
+            proposal.diff_created = bool(proposal.patch.strip())
+            inspection = self.workspace.inspect_patch(proposal.patch, self.max_files, self.max_changed_lines, proposal.related_files)
             if not inspection.valid:
                 proposal.state = "FALHOU"
                 proposal.review_result = inspection.message
-                proposal.patch = patch if inspection.diff_created else ""
                 proposal.diff_preserved = bool(proposal.patch)
-                self._record_failure(proposal, "patch", "diff recusado", inspection.message)
+                self._record_failure(proposal, "patch", "diff real fora dos limites", inspection.message)
                 self._cleanup_failed_workspace(proposal)
                 self._event(proposal, "patch recusado", "PREPARANDO", "FALHOU")
                 self._save()
                 return inspection.message
-            proposal.patch = self.workspace.diff(worktree)
-            proposal.diff_created = bool(proposal.patch.strip())
+            diff_check = self.workspace.diff_check(worktree)
+            proposal.validation.append(asdict(diff_check) | {"passed": diff_check.passed, "phase": "patch"})
+            if not diff_check.passed:
+                proposal.state = "FALHOU"
+                proposal.review_result = "git diff --check reprovou o diff real."
+                self._record_failure(proposal, "patch", "git diff --check reprovou", diff_check.output)
+                self._cleanup_failed_workspace(proposal)
+                self._event(proposal, "patch recusado", "PREPARANDO", "FALHOU")
+                self._save()
+                return proposal.review_result
             proposal.state = "EM_TESTE"
             self._event(proposal, "patch preparado somente no worktree", "PREPARANDO", proposal.state)
             self._save()
             return f"Patch preparado no ambiente isolado ({inspection.changed_lines} linhas, {len(inspection.files)} arquivo(s))."
+        except StructuredPatchError as exc:
+            proposal.state = "FALHOU"
+            proposal.review_result = self.workspace.sanitize(str(exc))
+            self._record_failure(proposal, "patch", "manifesto recusado", proposal.review_result)
+            self._cleanup_failed_workspace(proposal)
+            self._event(proposal, "manifesto recusado", "PREPARANDO", "FALHOU")
+            self._save()
+            return f"Preparacao falhou com seguranca: {proposal.review_result}"
         except Exception as exc:
             proposal.state = "FALHOU"
             proposal.review_result = self.workspace.sanitize(str(exc))
@@ -562,6 +616,63 @@ class AyaDevService:
         if "```" in patch:
             raise ValueError("Resposta em Markdown recusada; envie somente diff unificado puro.")
         return patch.rstrip() + "\n"
+
+    def _use_structured_patch(self, proposal: EngineeringProposal) -> bool:
+        return proposal.risk == "baixo" and len(proposal.related_files) <= self.max_files
+
+    def _request_patch_manifest(self, proposal: EngineeringProposal, base_commit: str) -> dict:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Voce deve retornar somente JSON valido conforme o schema. "
+                    "Nao use Markdown. Nao invente arquivos, simbolos ou operacoes."
+                ),
+            },
+            {"role": "user", "content": self._manifest_context(proposal, base_commit)},
+        ]
+        if hasattr(self.llm, "chat_structured"):
+            try:
+                raw = self.llm.chat_structured(
+                    model=self.primary_model,
+                    messages=messages,
+                    response_schema=PATCH_MANIFEST_SCHEMA,
+                    temperature=0.0,
+                    max_tokens=1200,
+                )
+            except json.JSONDecodeError as exc:
+                raise StructuredPatchError(f"JSON invalido: {exc.msg}.") from exc
+        else:
+            raw = self.llm.chat(
+                model=self.primary_model,
+                messages=messages,
+                temperature=0.0,
+                max_tokens=1200,
+            )
+        return raw
+
+    def _manifest_context(self, proposal: EngineeringProposal, base_commit: str) -> str:
+        entries = {item.path: item for item in self.index.build()}
+        file_facts = []
+        for rel in proposal.related_files:
+            entry = entries.get(rel)
+            if entry:
+                file_facts.append(f"- {rel}: sha256={entry.sha256}, simbolos={(entry.classes + entry.functions + entry.methods)[:20]}")
+        return "\n".join([
+            f"proposal_id: {proposal.id}",
+            f"base_commit: {base_commit}",
+            f"problema: {proposal.problem}",
+            f"mudanca_solicitada: {proposal.suggested_change}",
+            f"arquivos_permitidos: {proposal.related_files}",
+            f"simbolos_permitidos: {proposal.related_symbols}",
+            "operacoes_permitidas: insert_docstring, replace_exact",
+            "arquivos:",
+            *file_facts,
+            "erro_anterior:",
+            proposal.failure_message or "nenhum",
+            "motivo_anterior:",
+            proposal.failure_reason or "nenhum",
+        ])
 
     def _related_tests(self, proposal: EngineeringProposal) -> list[str]:
         indexed = {item.path: item for item in self.index.build()}
