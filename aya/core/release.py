@@ -4,8 +4,13 @@ import subprocess
 import sys
 import time
 import re
-from dataclasses import dataclass
-from datetime import datetime
+import hashlib
+import json
+import os
+import platform
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
@@ -36,6 +41,11 @@ class ReleaseCheck:
     output: str
     executed_at: str
     state: str = "NAO_EXECUTADO"
+    timeout_seconds: int | None = None
+    timeout_source: str = "nao_aplicavel"
+    result_origin: str = "executado"
+    validation_id: str = ""
+    interpretation: str = ""
 
     @property
     def passed(self) -> bool:
@@ -66,6 +76,71 @@ class SavedRelease:
         return required.issubset(set(self.checks))
 
 
+CHECK_STATES = {
+    "APROVADO",
+    "REPROVADO",
+    "TIMEOUT",
+    "INDISPONIVEL",
+    "NAO_EXECUTADO",
+    "CANCELADO",
+    "ERRO_INTERNO",
+}
+
+
+@dataclass(frozen=True)
+class ReleaseTimeoutConfig:
+    pytest_related: int = 600
+    pytest_complete: int = 2400
+    tool: int = 300
+    adaptive_factor: float = 1.5
+    adaptive_minimum: int = 900
+    adaptive_maximum: int = 2400
+    reuse_window_seconds: int = 7200
+
+    @classmethod
+    def from_env(cls) -> "ReleaseTimeoutConfig":
+        base = cls()
+        return cls(
+            pytest_related=_bounded_env_int("AYA_RELEASE_RELATED_PYTEST_TIMEOUT", base.pytest_related, 60, 2400),
+            pytest_complete=_bounded_env_int("AYA_RELEASE_PYTEST_TIMEOUT", base.pytest_complete, 60, 2400),
+            tool=_bounded_env_int("AYA_RELEASE_TOOL_TIMEOUT", base.tool, 30, 1200),
+            adaptive_factor=float(os.getenv("AYA_RELEASE_ADAPTIVE_FACTOR", str(base.adaptive_factor))),
+            adaptive_minimum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MINIMUM", base.adaptive_minimum, 60, 2400),
+            adaptive_maximum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MAXIMUM", base.adaptive_maximum, 60, 3600),
+            reuse_window_seconds=_bounded_env_int(
+                "AYA_RELEASE_REUSE_WINDOW_SECONDS",
+                base.reuse_window_seconds,
+                60,
+                24 * 3600,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ReleaseEvidence:
+    validation_id: str
+    mode: str
+    check_name: str
+    command: str
+    exit_code: int | None
+    status: str
+    started_at: str
+    finished_at: str
+    duration_ms: int
+    project_head: str
+    working_tree_clean: bool
+    python_version: str
+    executable_path: str
+    environment_fingerprint: str
+    test_scope: str
+    output_sha256: str
+    result_sha256: str
+    created_by: str
+    reused: bool = False
+    timeout_seconds: int | None = None
+    timeout_source: str = ""
+
+
 class CommandRunner(Protocol):
     def __call__(self, command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
         ...
@@ -82,16 +157,23 @@ def default_runner(command: list[str], timeout: int) -> subprocess.CompletedProc
     )
 
 
+def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return minimum
+    if value > maximum:
+        return maximum
+    return value
+
+
 class ReleaseReportService:
     """Gera um relatorio honesto de release sem inventar testes nao executados."""
-
-    REQUIRED_CHECKS = [
-        ("pytest", [sys.executable, "-m", "pytest"], 600),
-        ("ruff", [sys.executable, "-m", "ruff", "check", "."], 180),
-        ("compileall", [sys.executable, "-m", "compileall", "."], 180),
-        ("pip check", [sys.executable, "-m", "pip", "check"], 180),
-        ("smoke_test.py", [sys.executable, "scripts\\smoke_test.py"], 180),
-    ]
 
     def __init__(
         self,
@@ -100,12 +182,15 @@ class ReleaseReportService:
         diagnostics_provider,
         releases_dir: Path | None = None,
         runner: CommandRunner = default_runner,
+        timeout_config: ReleaseTimeoutConfig | None = None,
     ):
         self.db = db
         self.rag_status_provider = rag_status_provider
         self.diagnostics_provider = diagnostics_provider
         self.releases_dir = releases_dir or LOGS_DIR / "releases"
+        self.evidence_dir = LOGS_DIR / "release_evidence"
         self.runner = runner
+        self.timeout_config = timeout_config or ReleaseTimeoutConfig.from_env()
 
     def build(self, salvar: bool = False) -> str:
         snapshot = self._snapshot()
@@ -115,15 +200,16 @@ class ReleaseReportService:
             report += f"\n\nRelatorio salvo em: {path}"
         return report
 
-    def execute(self) -> str:
+    def execute(self, mode: str = "completo", reuse: bool = False) -> str:
+        mode = self._normalize_mode(mode)
         snapshot = self._snapshot()
-        checks = self._run_checks()
-        report = self._format(snapshot, checks)
+        checks = self._run_checks(mode, reuse=reuse)
+        report = self._format(snapshot, checks, mode=mode)
         path = self._save(report, snapshot.created_at)
         return report + f"\n\nRelatorio salvo em: {path}"
 
-    def validar(self) -> str:
-        return self.execute()
+    def validar(self, mode: str = "completo", reuse: bool = False) -> str:
+        return self.execute(mode=mode, reuse=reuse)
 
     def status(self) -> str:
         releases = self._saved_releases()
@@ -224,16 +310,27 @@ class ReleaseReportService:
             diagnostics=self.diagnostics_provider(),
         )
 
-    def _format(self, snapshot: ReleaseSnapshot, checks: list[ReleaseCheck] | None = None) -> str:
-        checks = checks or self._not_executed_checks()
-        complete = self._is_complete(checks)
+    def _format(
+        self,
+        snapshot: ReleaseSnapshot,
+        checks: list[ReleaseCheck] | None = None,
+        mode: str = "completo",
+    ) -> str:
+        mode = self._normalize_mode(mode)
+        checks = checks or self._not_executed_checks(mode)
+        complete = self._is_complete(checks, mode)
+        overall = self._overall_status(checks)
         return "\n".join([
             "Relatorio tecnico de release da Aya",
             f"Gerado em: {snapshot.created_at}",
             f"Python: {sys.version.split()[0]}",
             f"Ambiente: {sys.prefix}",
+            f"Modo: {mode}",
+            f"HEAD: {self._project_head()}",
+            f"Working tree limpo: {'sim' if self._working_tree_clean() else 'nao'}",
             f"Release completo: {'sim' if complete else 'nao'}",
             f"Release tipo: {'COMPLETO' if complete else 'PARCIAL'}",
+            f"Status geral: {overall}",
             "",
             "Estado verificado agora:",
             f"- Banco SQLite: quick_check={snapshot.quick_check}",
@@ -263,10 +360,17 @@ class ReleaseReportService:
             "python scripts\\smoke_test.py",
         ])
 
-    def _run_checks(self) -> list[ReleaseCheck]:
+    def _run_checks(self, mode: str, reuse: bool = False) -> list[ReleaseCheck]:
         checks: list[ReleaseCheck] = []
-        for name, command, timeout in self.REQUIRED_CHECKS:
+        for name, command, scope in self._checks_for_mode(mode):
+            timeout, timeout_source = self._timeout_for_check(name, mode)
+            if reuse:
+                reused = self._find_reusable_evidence(name, command, mode, scope)
+                if reused:
+                    checks.append(self._check_from_evidence(reused))
+                    continue
             started = time.perf_counter()
+            started_at = datetime.now()
             executed_at = datetime.now().isoformat(timespec="seconds")
             try:
                 result = self.runner(command, timeout)
@@ -274,21 +378,55 @@ class ReleaseReportService:
                 returncode = result.returncode
                 state = self._classify_check(returncode, output)
             except subprocess.TimeoutExpired as exc:
-                output = f"Tempo esgotado apos {timeout}s.\n{exc.stdout or ''}\n{exc.stderr or ''}".strip()
-                returncode = 124
-                state = "REPROVADO"
-            except Exception as exc:
+                partial = self._decode_timeout_output(exc)
+                output = (
+                    f"O {name} excedeu o limite de {timeout} segundos. "
+                    "A execucao ficou incompleta; isso nao comprova reprovacao da suite.\n"
+                    "O processo foi encerrado.\n"
+                    f"{partial}"
+                ).strip()
+                returncode = None
+                state = "TIMEOUT"
+            except (FileNotFoundError, ModuleNotFoundError) as exc:
                 output = f"Falha ao executar comando: {exc}"
                 returncode = None
                 state = "INDISPONIVEL"
+            except KeyboardInterrupt:
+                output = "Execucao cancelada de forma controlada."
+                returncode = None
+                state = "CANCELADO"
+            except Exception as exc:
+                output = f"Falha interna do mecanismo de release: {exc}"
+                returncode = None
+                state = "ERRO_INTERNO"
+            duration = time.perf_counter() - started
+            sanitized_output = self._sanitize_output(output)
+            evidence = self._save_evidence(
+                name=name,
+                command=command,
+                mode=mode,
+                scope=scope,
+                returncode=returncode,
+                state=state,
+                started_at=started_at,
+                duration_seconds=duration,
+                output=sanitized_output,
+                timeout_seconds=timeout,
+                timeout_source=timeout_source,
+            )
             checks.append(ReleaseCheck(
                 name=name,
                 command=command,
                 returncode=returncode,
-                duration_seconds=time.perf_counter() - started,
-                output=self._sanitize_output(output),
+                duration_seconds=duration,
+                output=sanitized_output,
                 executed_at=executed_at,
                 state=state,
+                timeout_seconds=timeout,
+                timeout_source=timeout_source,
+                result_origin="executado",
+                validation_id=evidence.validation_id,
+                interpretation=self._interpretation(state, name, timeout),
             ))
         return checks
 
@@ -301,12 +439,18 @@ class ReleaseReportService:
             lines.append(f"  codigo_saida: {check.returncode if check.returncode is not None else 'indisponivel'}")
             lines.append(f"  executado_em: {check.executed_at if check.state != 'NAO_EXECUTADO' else 'nao executado'}")
             lines.append(f"  duracao_ms: {int(check.duration_seconds * 1000)}")
+            lines.append(f"  timeout_s: {check.timeout_seconds if check.timeout_seconds is not None else 'nao registrado'}")
+            lines.append(f"  origem_timeout: {check.timeout_source}")
+            lines.append(f"  origem_resultado: {check.result_origin}")
+            lines.append(f"  evidencia_id: {check.validation_id or 'nao registrada'}")
+            if check.interpretation:
+                lines.append(f"  interpretacao: {check.interpretation}")
             if check.output:
                 lines.append("  saida:")
                 lines.extend(f"    {line}" for line in self._trim_output(check.output).splitlines())
         return lines
 
-    def _not_executed_checks(self) -> list[ReleaseCheck]:
+    def _not_executed_checks(self, mode: str = "completo") -> list[ReleaseCheck]:
         return [
             ReleaseCheck(
                 name=name,
@@ -316,8 +460,10 @@ class ReleaseReportService:
                 output="",
                 executed_at="",
                 state="NAO_EXECUTADO",
+                timeout_seconds=self._timeout_for_check(name, mode)[0],
+                timeout_source=self._timeout_for_check(name, mode)[1],
             )
-            for name, command, _timeout in self.REQUIRED_CHECKS
+            for name, command, _scope in self._checks_for_mode(mode)
         ]
 
     def _classify_check(self, returncode: int, output: str) -> str:
@@ -333,10 +479,261 @@ class ReleaseReportService:
             return "INDISPONIVEL"
         return "APROVADO" if returncode == 0 else "REPROVADO"
 
-    def _is_complete(self, checks: list[ReleaseCheck]) -> bool:
+    def _is_complete(self, checks: list[ReleaseCheck], mode: str = "completo") -> bool:
         states = {check.name: check.state for check in checks}
-        required = {name for name, _command, _timeout in self.REQUIRED_CHECKS}
+        required = {name for name, _command, _scope in self._checks_for_mode(mode)}
         return required.issubset(states) and all(states[name] == "APROVADO" for name in required)
+
+    def _overall_status(self, checks: list[ReleaseCheck]) -> str:
+        states = {check.state for check in checks}
+        if all(state == "APROVADO" for state in states):
+            return "APROVADO"
+        if "ERRO_INTERNO" in states:
+            return "ERRO"
+        if "REPROVADO" in states:
+            return "REPROVADO"
+        if states & {"TIMEOUT", "INDISPONIVEL", "CANCELADO", "NAO_EXECUTADO"}:
+            return "PARCIAL"
+        return "PARCIAL"
+
+    def _checks_for_mode(self, mode: str) -> list[tuple[str, list[str], str]]:
+        pytest_command = [sys.executable, "-m", "pytest"]
+        if self._normalize_mode(mode) == "rapido":
+            pytest_command = [sys.executable, "-m", "pytest", "tests/test_aya.py", "-k", "release"]
+        return [
+            ("pytest", pytest_command, "suite_completa" if mode == "completo" else "release_curto"),
+            ("ruff", [sys.executable, "-m", "ruff", "check", "."], "codigo_estatico"),
+            ("compileall", [sys.executable, "-m", "compileall", "."], "sintaxe"),
+            ("pip check", [sys.executable, "-m", "pip", "check"], "dependencias"),
+            ("smoke_test.py", [sys.executable, "scripts\\smoke_test.py"], "smoke"),
+        ]
+
+    def _timeout_for_check(self, name: str, mode: str) -> tuple[int, str]:
+        if name == "pytest" and self._normalize_mode(mode) == "completo":
+            adaptive = self._adaptive_pytest_timeout()
+            if adaptive:
+                return adaptive, "adaptativo"
+            return self.timeout_config.pytest_complete, "configuracao"
+        if name == "pytest":
+            return self.timeout_config.pytest_related, "configuracao"
+        return self.timeout_config.tool, "configuracao"
+
+    def _adaptive_pytest_timeout(self) -> int | None:
+        evidence = self._latest_approved_evidence("pytest", mode="completo")
+        if not evidence:
+            return None
+        observed = max(1, evidence.duration_ms / 1000)
+        budget = int(observed * self.timeout_config.adaptive_factor)
+        budget = max(self.timeout_config.adaptive_minimum, budget)
+        return min(self.timeout_config.adaptive_maximum, budget)
+
+    def _normalize_mode(self, mode: str) -> str:
+        value = (mode or "").strip().lower()
+        if value in {"rapido", "rápido", "quick"}:
+            return "rapido"
+        return "completo"
+
+    def _decode_timeout_output(self, exc: subprocess.TimeoutExpired) -> str:
+        parts: list[str] = []
+        for value in (exc.stdout, exc.stderr):
+            if not value:
+                continue
+            if isinstance(value, bytes):
+                parts.append(value.decode("utf-8", errors="replace"))
+            else:
+                parts.append(str(value))
+        return "\n".join(parts).strip()
+
+    def _interpretation(self, state: str, name: str, timeout: int) -> str:
+        if state == "TIMEOUT":
+            return (
+                f"O {name} excedeu o limite de {timeout} segundos. "
+                "A execucao ficou incompleta; isso nao comprova reprovacao da suite."
+            )
+        if state == "INDISPONIVEL":
+            return "Comando, modulo ou dependencia indisponivel no ambiente atual."
+        if state == "NAO_EXECUTADO":
+            return "Check registrado como nao executado."
+        if state == "ERRO_INTERNO":
+            return "Falha da infraestrutura de release, separada da suite do projeto."
+        return ""
+
+    def _project_head(self) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=PROJECT_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            return result.stdout.strip() if result.returncode == 0 else "indisponivel"
+        except Exception:
+            return "indisponivel"
+
+    def _working_tree_clean(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=PROJECT_ROOT,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            return result.returncode == 0 and not result.stdout.strip()
+        except Exception:
+            return False
+
+    def _environment_fingerprint(self) -> str:
+        payload = {
+            "python": platform.python_version(),
+            "executable": sys.executable,
+            "prefix": sys.prefix,
+            "platform": platform.platform(),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _output_hash(self, output: str) -> str:
+        return hashlib.sha256((output or "").encode("utf-8", errors="replace")).hexdigest()
+
+    def _result_hash(self, evidence: dict) -> str:
+        relevant = {key: value for key, value in evidence.items() if key != "result_sha256"}
+        return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _save_evidence(
+        self,
+        *,
+        name: str,
+        command: list[str],
+        mode: str,
+        scope: str,
+        returncode: int | None,
+        state: str,
+        started_at: datetime,
+        duration_seconds: float,
+        output: str,
+        timeout_seconds: int,
+        timeout_source: str,
+    ) -> ReleaseEvidence:
+        finished_at = datetime.now()
+        validation_id = f"VAL-{finished_at.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}"
+        evidence = ReleaseEvidence(
+            validation_id=validation_id,
+            mode=mode,
+            check_name=name,
+            command=" ".join(command),
+            exit_code=returncode,
+            status=state,
+            started_at=started_at.isoformat(timespec="seconds"),
+            finished_at=finished_at.isoformat(timespec="seconds"),
+            duration_ms=int(duration_seconds * 1000),
+            project_head=self._project_head(),
+            working_tree_clean=self._working_tree_clean(),
+            python_version=platform.python_version(),
+            executable_path=sys.executable,
+            environment_fingerprint=self._environment_fingerprint(),
+            test_scope=scope,
+            output_sha256=self._output_hash(output),
+            result_sha256="",
+            created_by="release_service",
+            reused=False,
+            timeout_seconds=timeout_seconds,
+            timeout_source=timeout_source,
+        )
+        payload = asdict(evidence)
+        payload["result_sha256"] = self._result_hash(payload)
+        evidence = ReleaseEvidence(**payload)
+        self.evidence_dir.mkdir(parents=True, exist_ok=True)
+        (self.evidence_dir / f"{validation_id}.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return evidence
+
+    def _evidence_items(self) -> list[ReleaseEvidence]:
+        if not self.evidence_dir.exists():
+            return []
+        items: list[ReleaseEvidence] = []
+        for path in sorted(self.evidence_dir.glob("VAL-*.json"), key=lambda item: item.name, reverse=True):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                recorded_hash = payload.get("result_sha256", "")
+                if recorded_hash != self._result_hash(payload):
+                    continue
+                items.append(ReleaseEvidence(**payload))
+            except (OSError, TypeError, ValueError):
+                continue
+        return items
+
+    def _latest_approved_evidence(self, check_name: str, mode: str) -> ReleaseEvidence | None:
+        expected_command = ""
+        for name, command, _scope in self._checks_for_mode(mode):
+            if name == check_name:
+                expected_command = " ".join(command)
+                break
+        current_head = self._project_head()
+        for evidence in self._evidence_items():
+            if (
+                evidence.check_name == check_name
+                and evidence.mode == mode
+                and evidence.status == "APROVADO"
+                and evidence.command == expected_command
+                and evidence.project_head == current_head
+                and evidence.working_tree_clean
+                and (check_name != "pytest" or mode != "completo" or evidence.duration_ms >= 60_000)
+            ):
+                return evidence
+        return None
+
+    def _find_reusable_evidence(
+        self,
+        name: str,
+        command: list[str],
+        mode: str,
+        scope: str,
+    ) -> ReleaseEvidence | None:
+        now = datetime.now()
+        command_text = " ".join(command)
+        if not self._working_tree_clean():
+            return None
+        for evidence in self._evidence_items():
+            created = self._parse_created_at(evidence.finished_at)
+            if not created or now - created > timedelta(seconds=self.timeout_config.reuse_window_seconds):
+                continue
+            if (
+                evidence.check_name == name
+                and evidence.mode == mode
+                and evidence.command == command_text
+                and evidence.status == "APROVADO"
+                and evidence.project_head == self._project_head()
+                and evidence.working_tree_clean
+                and evidence.python_version == platform.python_version()
+                and evidence.executable_path == sys.executable
+                and evidence.environment_fingerprint == self._environment_fingerprint()
+                and evidence.test_scope == scope
+            ):
+                return evidence
+        return None
+
+    def _check_from_evidence(self, evidence: ReleaseEvidence) -> ReleaseCheck:
+        return ReleaseCheck(
+            name=evidence.check_name,
+            command=evidence.command.split(),
+            returncode=evidence.exit_code,
+            duration_seconds=evidence.duration_ms / 1000,
+            output=(
+                f"Resultado reutilizado de evidencia aprovada {evidence.validation_id}; "
+                "os testes nao foram executados novamente neste release."
+            ),
+            executed_at=evidence.finished_at,
+            state=evidence.status,
+            timeout_seconds=evidence.timeout_seconds,
+            timeout_source=evidence.timeout_source or "evidencia",
+            result_origin="reutilizado",
+            validation_id=evidence.validation_id,
+        )
 
     def _risks(self, snapshot: ReleaseSnapshot) -> list[str]:
         risks: list[str] = []
@@ -400,7 +797,8 @@ class ReleaseReportService:
         text = path.read_text(encoding="utf-8", errors="replace")
         created = self._match_text(text, r"Gerado em:\s*(.+)") or "desconhecido"
         quick = self._match_text(text, r"Banco SQLite:\s*quick_check=([^\n]+)") or "desconhecido"
-        checks = dict(re.findall(r"^- ([\w ._]+):\s*(APROVADO|REPROVADO|INDISPONIVEL|NAO_EXECUTADO)\b", text, flags=re.MULTILINE))
+        states = "|".join(sorted(CHECK_STATES))
+        checks = dict(re.findall(rf"^- ([\w ._]+):\s*({states})\b", text, flags=re.MULTILINE))
         complete_text = self._match_text(text, r"Release completo:\s*(sim|nao)")
         complete = complete_text == "sim"
         return SavedRelease(
@@ -433,8 +831,11 @@ class ReleaseReportService:
         states = {
             "APROVADO": [],
             "REPROVADO": [],
+            "TIMEOUT": [],
             "INDISPONIVEL": [],
             "NAO_EXECUTADO": [],
+            "CANCELADO": [],
+            "ERRO_INTERNO": [],
         }
         for name, state in release.checks.items():
             states.setdefault(state, []).append(name)
@@ -443,12 +844,15 @@ class ReleaseReportService:
         return [
             f"- Checks aprovados: {', '.join(states['APROVADO']) or 'nenhum'}",
             f"- Checks reprovados: {', '.join(states['REPROVADO']) or 'nenhum'}",
+            f"- Checks com timeout: {', '.join(states['TIMEOUT']) or 'nenhum'}",
             f"- Checks indisponiveis: {', '.join(states['INDISPONIVEL']) or 'nenhum'}",
             f"- Checks nao executados: {', '.join(states['NAO_EXECUTADO']) or 'nenhum'}",
+            f"- Checks cancelados: {', '.join(states['CANCELADO']) or 'nenhum'}",
+            f"- Erros internos: {', '.join(states['ERRO_INTERNO']) or 'nenhum'}",
         ]
 
     def _missing_checks(self, release: SavedRelease) -> list[str]:
-        required = [name for name, _command, _timeout in self.REQUIRED_CHECKS]
+        required = [name for name, _command, _scope in self._checks_for_mode("completo")]
         return [name for name in required if name not in release.checks]
 
     def _age_text(self, created_at: str) -> str:

@@ -603,7 +603,9 @@ Sistema:
     def _comando_release(self, resto: str = "") -> str:
         acao = (resto or "").lower()
         if "executar" in acao or "validar" in acao or "rodar" in acao:
-            return self.release.validar()
+            mode = "rapido" if "rapido" in acao or "rápido" in acao else "completo"
+            reuse = "reutilizar" in acao or "reusar" in acao
+            return self.release.validar(mode=mode, reuse=reuse)
         if "status" in acao:
             return self.release.status()
         if "listar" in acao or "historico" in acao or "releases" in acao:
