@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import json
 import re
 import uuid
@@ -12,7 +14,7 @@ from aya.core.dev_index import TechnicalFile, TechnicalIndex
 from aya.core.dev_workspace import CheckResult, DevWorkspace
 from aya.core.llm import ChatClient
 from aya.core.project_tools import ProjectTools
-from aya.core.structured_patch import PATCH_MANIFEST_SCHEMA, StructuredPatchApplier, StructuredPatchError
+from aya.core.structured_patch import PATCH_DECISION_SCHEMA, StructuredPatchApplier, StructuredPatchError
 
 
 PROPOSAL_STATES = {
@@ -335,6 +337,28 @@ class AyaDevService:
         self._event(proposal, f"tentativa {proposal.attempts}", previous, proposal.state)
         try:
             proposal.base_commit = git_head = self.workspace.head()
+            manifest: dict | None = None
+            if self._use_structured_patch(proposal):
+                raw_decision = self._request_patch_decision(proposal, git_head)
+                proposal.raw_response = self.workspace.sanitize(
+                    json.dumps(raw_decision, ensure_ascii=True) if not isinstance(raw_decision, str) else raw_decision,
+                    50000,
+                )
+                proposal.raw_response_saved = True
+                decision = self.structured_patch.parse_decision(raw_decision)
+                proposal.raw_response = self.workspace.sanitize(json.dumps(decision, ensure_ascii=True), 50000)
+                proposal.raw_response_saved = True
+                target_file = self._structured_target_file(proposal)
+                expected_sha256 = self._file_sha256(target_file)
+                manifest = self.structured_patch.build_manifest(
+                    decision,
+                    proposal.id,
+                    git_head,
+                    target_file,
+                    expected_sha256,
+                    self._related_tests(proposal),
+                )
+                proposal.patch_manifest = manifest
             worktree = self.workspace.create(proposal.id)
             proposal.workspace = str(worktree)
             proposal.workspace_path = str(worktree)
@@ -351,11 +375,8 @@ class AyaDevService:
                 self._save()
                 return proposal.review_result
             if self._use_structured_patch(proposal):
-                raw_manifest = self._request_patch_manifest(proposal, git_head)
-                proposal.raw_response = self.workspace.sanitize(json.dumps(raw_manifest, ensure_ascii=True), 50000)
-                proposal.raw_response_saved = True
-                manifest = self.structured_patch.parse(raw_manifest)
-                proposal.patch_manifest = manifest
+                if manifest is None:
+                    raise StructuredPatchError("Manifesto estruturado nao foi preparado.")
                 result = self.structured_patch.apply(
                     worktree,
                     manifest,
@@ -419,7 +440,8 @@ class AyaDevService:
         except StructuredPatchError as exc:
             proposal.state = "FALHOU"
             proposal.review_result = self.workspace.sanitize(str(exc))
-            self._record_failure(proposal, "patch", "manifesto recusado", proposal.review_result)
+            stage = "manifest_generation" if not proposal.workspace else "patch"
+            self._record_failure(proposal, stage, "manifesto recusado", proposal.review_result)
             self._cleanup_failed_workspace(proposal)
             self._event(proposal, "manifesto recusado", "PREPARANDO", "FALHOU")
             self._save()
@@ -620,13 +642,13 @@ class AyaDevService:
     def _use_structured_patch(self, proposal: EngineeringProposal) -> bool:
         return proposal.risk == "baixo" and len(proposal.related_files) <= self.max_files
 
-    def _request_patch_manifest(self, proposal: EngineeringProposal, base_commit: str) -> dict:
+    def _request_patch_decision(self, proposal: EngineeringProposal, base_commit: str) -> dict:
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Voce deve retornar somente JSON valido conforme o schema. "
-                    "Nao use Markdown. Nao invente arquivos, simbolos ou operacoes."
+                    "Retorne exatamente um objeto JSON compativel com o schema. "
+                    "Nao use Markdown, explicacoes, campos extras ou texto de sucesso."
                 ),
             },
             {"role": "user", "content": self._manifest_context(proposal, base_commit)},
@@ -636,7 +658,7 @@ class AyaDevService:
                 raw = self.llm.chat_structured(
                     model=self.primary_model,
                     messages=messages,
-                    response_schema=PATCH_MANIFEST_SCHEMA,
+                    response_schema=PATCH_DECISION_SCHEMA,
                     temperature=0.0,
                     max_tokens=1200,
                 )
@@ -652,36 +674,72 @@ class AyaDevService:
         return raw
 
     def _manifest_context(self, proposal: EngineeringProposal, base_commit: str) -> str:
-        entries = {item.path: item for item in self.index.build()}
-        file_facts = []
-        for rel in proposal.related_files:
-            entry = entries.get(rel)
-            if entry:
-                file_facts.append(f"- {rel}: sha256={entry.sha256}, simbolos={(entry.classes + entry.functions + entry.methods)[:20]}")
+        target_file = self._structured_target_file(proposal)
+        symbol = proposal.related_symbols[-1] if proposal.related_symbols else ""
+        symbol_context = self._symbol_context(target_file, symbol)
         return "\n".join([
-            f"proposal_id: {proposal.id}",
-            f"base_commit: {base_commit}",
-            f"problema: {proposal.problem}",
-            f"mudanca_solicitada: {proposal.suggested_change}",
-            f"arquivos_permitidos: {proposal.related_files}",
+            f"titulo: {proposal.title}",
+            f"objetivo: {proposal.suggested_change}",
+            f"arquivo_definido_pela_aya: {target_file}",
+            f"base_commit_definido_pela_aya: {base_commit}",
             f"simbolos_permitidos: {proposal.related_symbols}",
-            "operacoes_permitidas: insert_docstring, replace_exact",
-            "arquivos:",
-            *file_facts,
+            f"simbolo_foco: {symbol}",
+            f"comportamento_a_preservar: {proposal.preserve}",
+            "schema_esperado: insert_docstring => {\"type\":\"insert_docstring\",\"symbol\":\"Classe.metodo\",\"content\":\"texto interno\"}; replace_exact => {\"type\":\"replace_exact\",\"old_text\":\"texto exato\",\"new_text\":\"texto novo\"}",
+            "exemplo_valido: {\"type\":\"insert_docstring\",\"symbol\":\"Example.run\",\"content\":\"Return the normalized example value.\"}",
+            "regras: sem Markdown; sem explicacoes; sem campos extras; nao diga que a alteracao foi feita; nao inclua file, proposal_id, base_commit, expected_sha256 ou tests.",
+            "contexto_do_simbolo:",
+            symbol_context,
             "erro_anterior:",
             proposal.failure_message or "nenhum",
             "motivo_anterior:",
             proposal.failure_reason or "nenhum",
         ])
 
+    def _structured_target_file(self, proposal: EngineeringProposal) -> str:
+        code_files = [path for path in proposal.related_files if path.endswith(".py") and not path.startswith("tests/")]
+        if len(code_files) != 1:
+            raise StructuredPatchError("Structured Patch exige exatamente um arquivo de codigo autorizado.")
+        return code_files[0]
+
+    def _file_sha256(self, rel: str) -> str:
+        path = (self.root / rel).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError as exc:
+            raise StructuredPatchError("Arquivo fora da raiz.") from exc
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def _symbol_context(self, rel: str, symbol: str) -> str:
+        path = self.root / rel
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        lines = text.splitlines()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return "simbolo indisponivel por erro de sintaxe."
+        matches = self.structured_patch._find_symbol(tree, symbol)
+        if len(matches) != 1:
+            return "simbolo indisponivel ou ambiguo."
+        node = matches[0]
+        start = max(node.lineno - 1, 0)
+        end = min(getattr(node, "end_lineno", node.lineno), len(lines))
+        body = "\n".join(lines[start:end])
+        return f"assinatura_linha={lines[start].strip()}\ncorpo:\n{body[:4000]}"
+
     def _related_tests(self, proposal: EngineeringProposal) -> list[str]:
         indexed = {item.path: item for item in self.index.build()}
-        tests = [path for path in proposal.related_files if path.startswith("tests/")]
+        indexed_paths = set(indexed)
+        tests = [path for path in proposal.related_files if self._is_valid_test_path(path, indexed_paths)]
         for path in proposal.related_files:
             entry = indexed.get(path)
             if entry:
-                tests.extend(entry.related_tests)
+                tests.extend(test for test in entry.related_tests if self._is_valid_test_path(test, indexed_paths))
         return list(dict.fromkeys(tests))[:4]
+
+    def _is_valid_test_path(self, path: str, indexed_paths: set[str]) -> bool:
+        name = Path(path).name
+        return path in indexed_paths and path.startswith("tests/") and name.startswith("test_") and path.endswith(".py")
 
     def _format_checks(self, results: list[CheckResult], state: str) -> str:
         lines = [f"Validacao Aya Dev: {state}"]

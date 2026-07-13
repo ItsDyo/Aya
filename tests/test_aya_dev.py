@@ -30,29 +30,17 @@ class StructuredClient(StaticClient):
         if isinstance(self.payload, Exception):
             raise self.payload
         if isinstance(self.payload, str):
-            return json.loads(self.payload)
+            return self.payload
         return self.payload
 
 
 class DynamicStructuredClient(StaticClient):
     def chat_structured(self, **kwargs):
         self.calls.append(kwargs)
-        text = kwargs["messages"][-1]["content"]
-        proposal_id = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("proposal_id:"))
-        base_commit = next(line.split(": ", 1)[1] for line in text.splitlines() if line.startswith("base_commit:"))
-        sha = next(line.split("sha256=", 1)[1].split(",", 1)[0] for line in text.splitlines() if line.startswith("- aya/core/sample.py:"))
         return {
-            "version": 1,
-            "proposal_id": proposal_id,
-            "base_commit": base_commit,
-            "operations": [{
-                "type": "insert_docstring",
-                "file": "aya/core/sample.py",
-                "symbol": "Sample.run",
-                "expected_sha256": sha,
-                "content": "Executa sample.",
-            }],
-            "tests": ["tests/test_sample.py"],
+            "type": "insert_docstring",
+            "symbol": "Sample.run",
+            "content": "Executa sample.",
         }
 
 
@@ -178,6 +166,52 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertEqual(4, operations["maxItems"])
         self.assertEqual(["insert_docstring", "replace_exact"], operations["items"]["properties"]["type"]["enum"])
 
+    def test_patch_decision_insert_docstring_completo(self):
+        decision = self.service.structured_patch.parse_decision({
+            "type": "insert_docstring",
+            "symbol": "Sample.run",
+            "content": "Executa sample.",
+        })
+        self.assertEqual("insert_docstring", decision["type"])
+
+    def test_patch_decision_insert_docstring_sem_symbol(self):
+        with self.assertRaisesRegex(StructuredPatchError, "symbol"):
+            self.service.structured_patch.parse_decision({"type": "insert_docstring", "content": "x"})
+
+    def test_patch_decision_insert_docstring_sem_content(self):
+        with self.assertRaisesRegex(StructuredPatchError, "content"):
+            self.service.structured_patch.parse_decision({"type": "insert_docstring", "symbol": "Sample.run"})
+
+    def test_patch_decision_insert_docstring_campo_extra(self):
+        with self.assertRaisesRegex(StructuredPatchError, "Campo extra"):
+            self.service.structured_patch.parse_decision({
+                "type": "insert_docstring",
+                "symbol": "Sample.run",
+                "content": "x",
+                "file": "aya/core/sample.py",
+            })
+
+    def test_patch_decision_replace_exact_completo(self):
+        decision = self.service.structured_patch.parse_decision({
+            "type": "replace_exact",
+            "old_text": "a",
+            "new_text": "b",
+        })
+        self.assertEqual("replace_exact", decision["type"])
+
+    def test_patch_decision_replace_exact_sem_old_text(self):
+        with self.assertRaisesRegex(StructuredPatchError, "old_text"):
+            self.service.structured_patch.parse_decision({"type": "replace_exact", "new_text": "b"})
+
+    def test_patch_decision_mistura_campos_recusada(self):
+        with self.assertRaisesRegex(StructuredPatchError, "Campo extra"):
+            self.service.structured_patch.parse_decision({
+                "type": "replace_exact",
+                "old_text": "a",
+                "new_text": "b",
+                "symbol": "Sample.run",
+            })
+
     def test_patch_manifest_json_invalido(self):
         with self.assertRaisesRegex(StructuredPatchError, "JSON invalido"):
             self.service.structured_patch.parse("{")
@@ -268,6 +302,7 @@ class AyaDevTestCase(unittest.TestCase):
     def test_baseline_falhando_impede_chamada_ao_modelo(self):
         proposal = self.proposal()
         proposal.state = "PLANEJADA"
+        proposal.risk = "medio"
         fake_workspace = self.workspaces / proposal.id
         fake_workspace.mkdir(parents=True)
         self.service.workspace.git_state = Mock(return_value=GitState(True, True, "ok"))
@@ -519,14 +554,45 @@ class AyaDevTestCase(unittest.TestCase):
         proposal = self.proposal(related_files=["aya/core/sample.py"], related_symbols=["Sample.run"])
         self.init_git()
         proposal.state = "PLANEJADA"
-        manifest = self._manifest(expected_sha256=self._sha("aya/core/sample.py"))
-        manifest["proposal_id"] = proposal.id
-        manifest["base_commit"] = "HEAD-ANTIGO"
-        self.service.llm = StructuredClient(manifest)
+        self.service.llm = StructuredClient({
+            "type": "insert_docstring",
+            "symbol": "Sample.run",
+            "content": "Executa sample.",
+            "base_commit": "HEAD-ANTIGO",
+        })
         response = self.service.preparar(proposal.id)
-        self.assertIn("base_commit", response)
+        self.assertIn("Campo extra", response)
         self.assertEqual("FALHOU", proposal.state)
-        self.assertTrue(proposal.workspace_cleaned)
+        self.assertFalse(proposal.workspace_created)
+
+    def test_modelo_nao_pode_alterar_proposal_id_no_modo_estruturado(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"], related_symbols=["Sample.run"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.service.llm = StructuredClient({
+            "type": "insert_docstring",
+            "symbol": "Sample.run",
+            "content": "Executa sample.",
+            "proposal_id": "DEV-20990101-ABCDEF",
+        })
+        response = self.service.preparar(proposal.id)
+        self.assertIn("Campo extra", response)
+        self.assertEqual("manifest_generation", proposal.failure_stage)
+        self.assertFalse(proposal.workspace_created)
+
+    def test_testes_relacionados_derivados_do_indice(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"], required_tests=[])
+        self.assertEqual(["tests/test_sample.py"], self.service._related_tests(proposal))
+
+    def test_arquivo_de_codigo_recusado_como_teste_relacionado(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"], required_tests=["aya/core/sample.py"])
+        self.assertNotIn("aya/core/sample.py", self.service._related_tests(proposal))
+
+    def test_sem_teste_relacionado_nao_inventa_caminho(self):
+        (self.root / "tests" / "test_sample.py").unlink()
+        self.service.index = type(self.service.index)(self.root, self.cache)
+        proposal = self.proposal(related_files=["aya/core/sample.py"], required_tests=[])
+        self.assertEqual([], self.service._related_tests(proposal))
 
     def test_preparar_structured_patch_validado_chega_a_aguardando_aprovacao(self):
         proposal = self.proposal(
@@ -561,6 +627,7 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Patch preparado", response)
         context = self.service.llm.calls[-1]["messages"][-1]["content"]
         self.assertIn("manifesto recusado", context)
+        self.assertIn("Decisao em Markdown recusada", context)
         self.assertEqual(2, proposal.attempts)
 
     def test_patch_markdown_falha_com_motivo_persistido_e_worktree_removido(self):
@@ -645,7 +712,7 @@ class AyaDevTestCase(unittest.TestCase):
         if operation_type == "insert_docstring":
             operation.update({"symbol": symbol, "content": content})
         elif operation_type == "replace_exact":
-            operation.update({"old": old, "new": new})
+            operation.update({"old_text": old, "new_text": new})
         return {
             "version": 1,
             "proposal_id": "DEV-20260713-ABCDEF",

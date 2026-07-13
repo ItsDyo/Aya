@@ -31,13 +31,39 @@ PATCH_MANIFEST_SCHEMA = {
                     "symbol": {"type": "string"},
                     "expected_sha256": {"type": "string", "minLength": 64, "maxLength": 64},
                     "content": {"type": "string"},
-                    "old": {"type": "string"},
-                    "new": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
                 },
             },
         },
         "tests": {"type": "array", "items": {"type": "string"}, "maxItems": 6},
     },
+}
+
+PATCH_DECISION_SCHEMA = {
+    "type": "object",
+    "oneOf": [
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "symbol", "content"],
+            "properties": {
+                "type": {"const": "insert_docstring"},
+                "symbol": {"type": "string", "minLength": 1},
+                "content": {"type": "string", "minLength": 1},
+            },
+        },
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["type", "old_text", "new_text"],
+            "properties": {
+                "type": {"const": "replace_exact"},
+                "old_text": {"type": "string", "minLength": 1},
+                "new_text": {"type": "string"},
+            },
+        },
+    ],
 }
 
 
@@ -83,6 +109,46 @@ class StructuredPatchApplier:
             raise StructuredPatchError("Manifesto deve ser um objeto JSON.")
         self._validate_shape(raw)
         return raw
+
+    def parse_decision(self, raw: object) -> dict:
+        if isinstance(raw, str):
+            text = raw.strip()
+            if text.startswith("```") or "```" in text:
+                raise StructuredPatchError("Decisao em Markdown recusada.")
+            try:
+                raw = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise StructuredPatchError(f"JSON invalido: {exc.msg}.") from exc
+        if not isinstance(raw, dict):
+            raise StructuredPatchError("Decisao deve ser um objeto JSON.")
+        self._validate_decision(raw)
+        return raw
+
+    def build_manifest(
+        self,
+        decision: dict,
+        proposal_id: str,
+        base_commit: str,
+        file: str,
+        expected_sha256: str,
+        tests: list[str],
+    ) -> dict:
+        operation = {
+            "type": decision["type"],
+            "file": file,
+            "expected_sha256": expected_sha256,
+        }
+        if decision["type"] == "insert_docstring":
+            operation.update({"symbol": decision["symbol"], "content": decision["content"]})
+        elif decision["type"] == "replace_exact":
+            operation.update({"old_text": decision["old_text"], "new_text": decision["new_text"]})
+        return {
+            "version": 1,
+            "proposal_id": proposal_id,
+            "base_commit": base_commit,
+            "operations": [operation],
+            "tests": tests,
+        }
 
     def apply(
         self,
@@ -132,7 +198,7 @@ class StructuredPatchApplier:
                     raise StructuredPatchError(f"Simbolo fora da proposta: {symbol}.")
                 after = self._insert_docstring(before, symbol, operation.get("content", ""))
             elif operation["type"] == "replace_exact":
-                after = self._replace_exact(before, operation.get("old", ""), operation.get("new", ""))
+                after = self._replace_exact(before, operation.get("old_text", ""), operation.get("new_text", ""))
             else:
                 raise StructuredPatchError(f"Operacao desconhecida: {operation['type']}.")
 
@@ -165,8 +231,32 @@ class StructuredPatchApplier:
                 raise StructuredPatchError("Operacao sem arquivo ou hash esperado.")
             if operation["type"] == "insert_docstring" and not all(operation.get(key) for key in ("symbol", "content")):
                 raise StructuredPatchError("insert_docstring exige symbol e content.")
-            if operation["type"] == "replace_exact" and not all(key in operation for key in ("old", "new")):
-                raise StructuredPatchError("replace_exact exige old e new.")
+            if operation["type"] == "replace_exact" and not all(key in operation for key in ("old_text", "new_text")):
+                raise StructuredPatchError("replace_exact exige old_text e new_text.")
+
+    def _validate_decision(self, decision: dict) -> None:
+        operation_type = decision.get("type")
+        if operation_type not in {"insert_docstring", "replace_exact"}:
+            raise StructuredPatchError(f"Operacao desconhecida: {operation_type}.")
+        allowed = {"type", "symbol", "content"} if operation_type == "insert_docstring" else {"type", "old_text", "new_text"}
+        extra = sorted(set(decision) - allowed)
+        if extra:
+            raise StructuredPatchError(f"Campo extra recusado: {', '.join(extra)}.")
+        if operation_type == "insert_docstring":
+            missing = [name for name in ("symbol", "content") if not decision.get(name)]
+            if missing:
+                raise StructuredPatchError("Campo obrigatorio ausente: " + ", ".join(missing) + ".")
+            content = decision["content"]
+            if "```" in content or content.strip().startswith(("#", "-", "*")):
+                raise StructuredPatchError("Conteudo de docstring nao pode conter Markdown.")
+            if '"""' in content or "'''" in content:
+                raise StructuredPatchError("Conteudo deve ser apenas o texto interno da docstring.")
+        else:
+            missing = [name for name in ("old_text", "new_text") if name not in decision or (name == "old_text" and not decision[name])]
+            if missing:
+                raise StructuredPatchError("Campo obrigatorio ausente: " + ", ".join(missing) + ".")
+            if any(key in decision for key in ("file", "path", "line", "line_number", "regex")):
+                raise StructuredPatchError("replace_exact nao aceita caminho, linha ou regex.")
 
     def _insert_docstring(self, text: str, symbol: str, content: str) -> str:
         tree = ast.parse(text)
