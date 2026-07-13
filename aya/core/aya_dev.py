@@ -53,6 +53,20 @@ class EngineeringProposal:
     attempts: int = 0
     validation: list[dict] = field(default_factory=list)
     history: list[dict] = field(default_factory=list)
+    failure_stage: str = ""
+    failure_reason: str = ""
+    failure_message: str = ""
+    failure_at: str = ""
+    workspace_created: bool = False
+    workspace_path: str = ""
+    workspace_cleaned: bool = False
+    cleanup_result: str = ""
+    raw_response_saved: bool = False
+    raw_response: str = ""
+    diff_created: bool = False
+    diff_preserved: bool = False
+    tests_executed: bool = False
+    project_unchanged: bool = True
 
 
 class AyaDevService:
@@ -98,7 +112,10 @@ class AyaDevService:
         }
         if action in handlers:
             return handlers[action]()
-        if action in {"mostrar", "planejar", "preparar", "revisar", "testar", "diff", "aprovar", "rejeitar", "descartar", "pacote-codex"}:
+        if action in {
+            "mostrar", "falha", "planejar", "preparar", "revisar", "testar", "diff",
+            "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "reverter", "pacote-codex",
+        }:
             if not argument.strip():
                 return f"Informe o ID: /aya-dev {action} id"
             return getattr(self, action.replace("-", "_"))(argument.strip())
@@ -118,7 +135,7 @@ class AyaDevService:
             f"- Modelo principal: {self.primary_model}",
             f"- Modelo revisor: {self.reviewer_model}",
             f"- Limites: {self.max_files} arquivos, {self.max_changed_lines} linhas, {self.max_attempts} tentativas",
-            "- Aplicacao no projeto principal: desabilitada neste ciclo",
+            "- Aplicacao no projeto principal: exige comando separado e validacao completa",
         ])
 
     def map_project(self) -> str:
@@ -207,19 +224,65 @@ class AyaDevService:
 
     def mostrar(self, proposal_id: str) -> str:
         proposal = self._get(proposal_id)
-        return "\n".join([
+        checks = self._validation_summary(proposal)
+        lines = [
             f"Proposta {proposal.id}:",
+            "",
+            "Estado tecnico:",
             f"- Estado: {proposal.state}",
+            f"- Risco: {proposal.risk}",
+            f"- Tentativas: {proposal.attempts}/{self.max_attempts}",
+            "",
+            "Proposta original:",
             f"- Titulo: {proposal.title}",
             f"- Problema: {proposal.problem}",
             f"- Evidencias: {' | '.join(proposal.evidence) or 'nenhuma'}",
             f"- Arquivos: {', '.join(proposal.related_files)}",
             f"- Simbolos: {', '.join(proposal.related_symbols) or 'nao identificados'}",
-            f"- Risco: {proposal.risk}",
-            f"- Mudanca sugerida: {proposal.suggested_change}",
-            f"- Preservar: {', '.join(proposal.preserve)}",
-            f"- Testes: {', '.join(proposal.required_tests)}",
-            f"- Reversao: {proposal.rollback_plan}",
+            "",
+            "Plano sugerido - ainda nao executado:",
+            self._neutralize_success_text(proposal.suggested_change) or "Informacao nao registrada.",
+            "",
+            "Resultado da preparacao:",
+            f"- Diff criado: {'sim' if proposal.diff_created else 'nao'}",
+            f"- Workspace: {proposal.workspace or proposal.workspace_path or 'Informacao nao registrada.'}",
+            "",
+            "Resultado dos testes:",
+            checks,
+            "",
+            "Revisao:",
+            proposal.review_result or "Informacao nao registrada.",
+            "",
+            "Falha:",
+            self.falha(proposal.id),
+            "",
+            "Diff:",
+            proposal.patch[:4000] if proposal.patch else "Informacao nao registrada.",
+            "",
+            "Decisao humana:",
+            self._decision_summary(proposal),
+        ]
+        return "\n".join(lines)
+
+    def falha(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        if not any((proposal.failure_stage, proposal.failure_reason, proposal.failure_message, proposal.failure_at)):
+            return f"Falha {proposal.id}: Informacao nao registrada."
+        return "\n".join([
+            f"Falha {proposal.id}:",
+            f"- Etapa: {proposal.failure_stage or 'Informacao nao registrada.'}",
+            f"- Motivo: {proposal.failure_reason or 'Informacao nao registrada.'}",
+            f"- Mensagem: {proposal.failure_message or 'Informacao nao registrada.'}",
+            f"- Quando: {proposal.failure_at or 'Informacao nao registrada.'}",
+            f"- Worktree criado: {'sim' if proposal.workspace_created else 'nao'}",
+            f"- Worktree: {proposal.workspace_path or 'Informacao nao registrada.'}",
+            f"- Worktree limpo: {'sim' if proposal.workspace_cleaned else 'nao'}",
+            f"- Resultado da limpeza: {proposal.cleanup_result or 'Informacao nao registrada.'}",
+            f"- Resposta bruta salva: {'sim' if proposal.raw_response_saved else 'nao'}",
+            f"- Diff criado: {'sim' if proposal.diff_created else 'nao'}",
+            f"- Diff preservado: {'sim' if proposal.diff_preserved else 'nao'}",
+            f"- Testes executados: {'sim' if proposal.tests_executed else 'nao'}",
+            f"- Projeto principal intacto: {'sim' if proposal.project_unchanged else 'nao'}",
         ])
 
     def planejar(self, proposal_id: str) -> str:
@@ -235,6 +298,7 @@ class AyaDevService:
         except Exception as exc:
             proposal.state = "FALHOU"
             proposal.review_result = f"Modelo principal indisponivel: {self.workspace.sanitize(str(exc))}"
+            self._record_failure(proposal, "planejamento", "modelo indisponivel", proposal.review_result)
             self._event(proposal, "planejamento falhou", "PROPOSTA", "FALHOU")
             self._save()
             return proposal.review_result
@@ -263,11 +327,16 @@ class AyaDevService:
         try:
             worktree = self.workspace.create(proposal.id)
             proposal.workspace = str(worktree)
+            proposal.workspace_path = str(worktree)
+            proposal.workspace_created = True
             baseline = self.workspace.baseline(worktree, self._related_tests(proposal))
             proposal.validation = [asdict(result) | {"passed": result.passed, "phase": "baseline"} for result in baseline]
+            proposal.tests_executed = True
             if not all(result.passed for result in baseline):
                 proposal.state = "FALHOU"
                 proposal.review_result = "Baseline falhou; nenhum patch foi solicitado ao modelo."
+                self._record_failure(proposal, "baseline", "testes baseline reprovaram", proposal.review_result)
+                self._cleanup_failed_workspace(proposal)
                 self._event(proposal, "baseline reprovado", "PREPARANDO", "FALHOU")
                 self._save()
                 return proposal.review_result
@@ -280,15 +349,23 @@ class AyaDevService:
                 temperature=0.0,
                 max_tokens=1800,
             )
+            proposal.raw_response = self.workspace.sanitize(response, 50000)
+            proposal.raw_response_saved = True
             patch = self._extract_patch(response)
-            inspection = self.workspace.apply_patch(worktree, patch, self.max_files, self.max_changed_lines)
+            proposal.diff_created = bool(self.workspace.inspect_patch(patch, self.max_files, self.max_changed_lines, proposal.related_files).diff_created)
+            inspection = self.workspace.apply_patch(worktree, patch, self.max_files, self.max_changed_lines, proposal.related_files)
             if not inspection.valid:
                 proposal.state = "FALHOU"
                 proposal.review_result = inspection.message
+                proposal.patch = patch if inspection.diff_created else ""
+                proposal.diff_preserved = bool(proposal.patch)
+                self._record_failure(proposal, "patch", "diff recusado", inspection.message)
+                self._cleanup_failed_workspace(proposal)
                 self._event(proposal, "patch recusado", "PREPARANDO", "FALHOU")
                 self._save()
                 return inspection.message
             proposal.patch = self.workspace.diff(worktree)
+            proposal.diff_created = bool(proposal.patch.strip())
             proposal.state = "EM_TESTE"
             self._event(proposal, "patch preparado somente no worktree", "PREPARANDO", proposal.state)
             self._save()
@@ -296,6 +373,8 @@ class AyaDevService:
         except Exception as exc:
             proposal.state = "FALHOU"
             proposal.review_result = self.workspace.sanitize(str(exc))
+            self._record_failure(proposal, "preparacao", "excecao controlada", proposal.review_result)
+            self._cleanup_failed_workspace(proposal)
             self._event(proposal, "preparacao falhou", "PREPARANDO", "FALHOU")
             self._save()
             return f"Preparacao falhou com seguranca: {proposal.review_result}"
@@ -333,8 +412,13 @@ class AyaDevService:
         proposal.state = "EM_TESTE"
         results = self.workspace.validate(proposal.workspace, self._related_tests(proposal))
         proposal.validation.extend(asdict(result) | {"passed": result.passed, "phase": "patch"} for result in results)
+        proposal.tests_executed = True
         passed = all(result.passed for result in results)
         proposal.state = "AGUARDANDO_APROVACAO" if passed else "FALHOU"
+        if not passed:
+            proposal.review_result = "Validacao do patch reprovada."
+            self._record_failure(proposal, "testes", "validacao reprovada", self._format_checks(results, proposal.state))
+            self._cleanup_failed_workspace(proposal)
         self._event(proposal, "validacao concluida", previous, proposal.state)
         self._save()
         return self._format_checks(results, proposal.state)
@@ -355,6 +439,20 @@ class AyaDevService:
         self._save()
         return "Aprovacao registrada. Nenhum patch foi aplicado ao projeto principal."
 
+    def aplicar(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        if proposal.state != "APROVADA":
+            return "Aplicacao bloqueada: aprove explicitamente antes com /aya-dev aprovar ID."
+        return "Aplicacao supervisionada ainda nao habilitada neste ciclo."
+
+    def integrar(self, proposal_id: str) -> str:
+        self._get(proposal_id)
+        return "Integracao bloqueada: ciclo de integracao ainda nao habilitado."
+
+    def reverter(self, proposal_id: str) -> str:
+        self._get(proposal_id)
+        return "Reversao bloqueada: nenhum commit aplicado por Aya Dev neste ciclo."
+
     def rejeitar(self, proposal_id: str) -> str:
         proposal = self._get(proposal_id)
         previous = proposal.state
@@ -367,7 +465,8 @@ class AyaDevService:
         proposal = self._get(proposal_id)
         if proposal.workspace:
             try:
-                self.workspace.discard(proposal.workspace)
+                proposal.cleanup_result = self.workspace.discard(proposal.workspace)
+                proposal.workspace_cleaned = True
             except (OSError, RuntimeError, ValueError) as exc:
                 return f"Nao foi possivel descartar o workspace: {self.workspace.sanitize(str(exc))}"
             proposal.workspace = ""
@@ -413,6 +512,7 @@ class AyaDevService:
             f"Evidencias: {' | '.join(proposal.evidence)}",
             f"Arquivos confirmados: {', '.join(proposal.related_files)}",
             f"Simbolos: {', '.join(proposal.related_symbols)}",
+            f"Mudanca solicitada: {proposal.suggested_change}",
             f"Preservar: {', '.join(proposal.preserve)}",
             f"Testes: {', '.join(proposal.required_tests)}",
         ]
@@ -449,16 +549,19 @@ class AyaDevService:
 
     def _patch_rules(self) -> str:
         return (
-            "Produza somente um diff unificado aplicavel por git apply. "
+            "Produza somente um diff unificado puro aplicavel por git apply. "
+            "A primeira linha deve iniciar com 'diff --git ' ou '--- '. "
+            "Nao escreva explicacoes, Markdown, cercas ``` ou conclusoes. "
             f"Maximo {self.max_files} arquivos e {self.max_changed_lines} linhas. "
             "Nao altere .env, dados, logs, banco, modelos, backups ou arquivos fora da raiz. "
             "Nao desative testes nem inclua comandos. Preserve o comportamento descrito."
         )
 
     def _extract_patch(self, response: str) -> str:
-        match = re.search(r"```(?:diff|patch)?\s*(.*?)```", response, re.DOTALL | re.IGNORECASE)
-        patch = match.group(1).strip() if match else response.strip()
-        return self.workspace.sanitize(patch, 50000).rstrip() + "\n"
+        patch = self.workspace.sanitize(response, 50000).strip()
+        if "```" in patch:
+            raise ValueError("Resposta em Markdown recusada; envie somente diff unificado puro.")
+        return patch.rstrip() + "\n"
 
     def _related_tests(self, proposal: EngineeringProposal) -> list[str]:
         indexed = {item.path: item for item in self.index.build()}
@@ -499,7 +602,11 @@ class AyaDevService:
             try:
                 proposal = EngineeringProposal(**item)
             except (TypeError, ValueError):
-                continue
+                try:
+                    known = {field.name for field in EngineeringProposal.__dataclass_fields__.values()}
+                    proposal = EngineeringProposal(**{key: value for key, value in item.items() if key in known})
+                except (AttributeError, TypeError, ValueError):
+                    continue
             if proposal.state in PROPOSAL_STATES:
                 proposal.risk = self.classify_risk(
                     proposal.problem,
@@ -517,3 +624,55 @@ class AyaDevService:
         text = json.dumps(payload, ensure_ascii=True, indent=2)
         temporary.write_text(self.workspace.sanitize(text, max(len(text), 5000)), encoding="utf-8")
         temporary.replace(self.storage_path)
+
+    def _record_failure(self, proposal: EngineeringProposal, stage: str, reason: str, message: str) -> None:
+        proposal.failure_stage = stage
+        proposal.failure_reason = reason
+        proposal.failure_message = self.workspace.sanitize(message, 4000)
+        proposal.failure_at = datetime.now().isoformat(timespec="seconds")
+        proposal.project_unchanged = self.workspace.git_state().safe
+
+    def _cleanup_failed_workspace(self, proposal: EngineeringProposal) -> None:
+        workspace = proposal.workspace or proposal.workspace_path
+        if not workspace:
+            return
+        try:
+            current_diff = self.workspace.diff(workspace)
+            if current_diff.strip() and current_diff != "Diff indisponivel.":
+                proposal.patch = current_diff
+                proposal.diff_preserved = True
+        except (OSError, RuntimeError, ValueError):
+            pass
+        try:
+            proposal.cleanup_result = self.workspace.discard(workspace)
+            proposal.workspace_cleaned = True
+            proposal.workspace = ""
+        except (OSError, RuntimeError, ValueError) as exc:
+            proposal.cleanup_result = self.workspace.sanitize(str(exc))
+            proposal.workspace_cleaned = False
+
+    def _validation_summary(self, proposal: EngineeringProposal) -> str:
+        if not proposal.validation:
+            return "Informacao nao registrada."
+        lines = []
+        for item in proposal.validation[-12:]:
+            status = "APROVADO" if item.get("passed") else "REPROVADO"
+            lines.append(f"- {item.get('phase', '?')} {item.get('name', '?')}: {status}")
+        return "\n".join(lines)
+
+    def _decision_summary(self, proposal: EngineeringProposal) -> str:
+        decisions = {
+            "APROVADA": "aprovacao humana registrada; patch nao aplicado automaticamente",
+            "REJEITADA": "rejeicao humana registrada",
+            "DESCARTADA": "descarte humano registrado",
+            "APLICADA": "aplicacao registrada",
+        }
+        return decisions.get(proposal.state, "Informacao nao registrada.")
+
+    def _neutralize_success_text(self, text: str) -> str:
+        cleaned = re.sub(
+            r"(?im)^.*(alteracao|mudanca|correcao).*(realizada|concluida|sucesso).*$",
+            "[Texto de sucesso do modelo neutralizado: ainda depende de diff e testes reais.]",
+            text or "",
+        )
+        return cleaned.strip()

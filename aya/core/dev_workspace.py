@@ -54,6 +54,7 @@ class PatchInspection:
     message: str
     files: tuple[str, ...]
     changed_lines: int
+    diff_created: bool = False
 
 
 class DevWorkspace:
@@ -61,7 +62,7 @@ class DevWorkspace:
 
     def __init__(self, root: str | Path, workspace_root: str | Path | None = None):
         self.root = Path(root).resolve()
-        self.workspace_root = Path(workspace_root or self.root / "data_local" / "aya_dev_workspaces").resolve()
+        self.workspace_root = Path(workspace_root or self.root.parent / "aya_dev_workspaces").resolve()
 
     def git_state(self) -> GitState:
         top = self._run(("git", "rev-parse", "--show-toplevel"), self.root, 15)
@@ -94,16 +95,37 @@ class DevWorkspace:
             raise RuntimeError(f"Nao foi possivel criar Git worktree: {self.sanitize(result.stderr or result.stdout)}")
         return target
 
-    def discard(self, workspace: str | Path) -> None:
+    def discard(self, workspace: str | Path) -> str:
         path = self._workspace_path(workspace)
-        result = self._run(("git", "worktree", "remove", "--force", str(path)), self.root, 90)
+        status = self._run(("git", "status", "--porcelain"), path, 30)
+        dirty = bool(status.stdout.strip()) if status.returncode == 0 else True
+        command = ("git", "worktree", "remove", str(path))
+        if dirty:
+            command = ("git", "worktree", "remove", "--force", str(path))
+        result = self._run(command, self.root, 90)
         if result.returncode != 0 and path.exists():
             shutil.rmtree(path)
+        prune = self._run(("git", "worktree", "prune"), self.root, 90)
+        if result.returncode != 0:
+            return f"Worktree removido por fallback; prune codigo={prune.returncode}."
+        return f"Worktree removido {'com --force apos preservar diff' if dirty else 'sem --force'}; prune codigo={prune.returncode}."
 
-    def inspect_patch(self, patch: str, max_files: int = 4, max_lines: int = 250) -> PatchInspection:
+    def inspect_patch(
+        self,
+        patch: str,
+        max_files: int = 4,
+        max_lines: int = 250,
+        allowed_files: list[str] | tuple[str, ...] | None = None,
+    ) -> PatchInspection:
+        if not self._looks_like_pure_unified_diff(patch):
+            return PatchInspection(False, "O modelo deve retornar somente diff unificado puro.", (), 0, False)
+        allowed = set(allowed_files or ())
         files: list[str] = []
         changed_lines = 0
+        has_hunk = False
         for line in patch.splitlines():
+            if line.startswith("@@ "):
+                has_hunk = True
             if line.startswith(("+++ ", "--- ")):
                 raw = line[4:].split("\t", 1)[0].strip()
                 if raw == "/dev/null":
@@ -111,30 +133,41 @@ class DevWorkspace:
                 rel = raw[2:] if raw.startswith(("a/", "b/")) else raw
                 error = self._path_error(rel)
                 if error:
-                    return PatchInspection(False, error, tuple(files), changed_lines)
+                    return PatchInspection(False, error, tuple(files), changed_lines, True)
+                if allowed and rel not in allowed:
+                    return PatchInspection(False, f"Arquivo fora do escopo autorizado: {rel}.", tuple(files), changed_lines, True)
                 if line.startswith("+++ ") and rel not in files:
                     files.append(rel)
             elif line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
                 changed_lines += 1
         if not files:
-            return PatchInspection(False, "O modelo nao produziu um diff unificado verificavel.", (), changed_lines)
+            return PatchInspection(False, "O modelo nao produziu um diff unificado verificavel.", (), changed_lines, False)
+        if not has_hunk:
+            return PatchInspection(False, "Diff unificado sem hunk verificavel.", tuple(files), changed_lines, True)
         if len(files) > max_files:
-            return PatchInspection(False, f"Patch excede o limite de {max_files} arquivos.", tuple(files), changed_lines)
+            return PatchInspection(False, f"Patch excede o limite de {max_files} arquivos.", tuple(files), changed_lines, True)
         if changed_lines > max_lines:
-            return PatchInspection(False, f"Patch excede o limite de {max_lines} linhas modificadas.", tuple(files), changed_lines)
-        return PatchInspection(True, "Patch dentro dos limites.", tuple(files), changed_lines)
+            return PatchInspection(False, f"Patch excede o limite de {max_lines} linhas modificadas.", tuple(files), changed_lines, True)
+        return PatchInspection(True, "Patch dentro dos limites.", tuple(files), changed_lines, True)
 
-    def apply_patch(self, workspace: str | Path, patch: str, max_files: int = 4, max_lines: int = 250) -> PatchInspection:
+    def apply_patch(
+        self,
+        workspace: str | Path,
+        patch: str,
+        max_files: int = 4,
+        max_lines: int = 250,
+        allowed_files: list[str] | tuple[str, ...] | None = None,
+    ) -> PatchInspection:
         path = self._workspace_path(workspace)
-        inspection = self.inspect_patch(patch, max_files, max_lines)
+        inspection = self.inspect_patch(patch, max_files, max_lines, allowed_files)
         if not inspection.valid:
             return inspection
         check = self._run(("git", "apply", "--check", "-"), path, 30, input_text=patch)
         if check.returncode != 0:
-            return PatchInspection(False, f"Patch recusado pelo Git: {self.sanitize(check.stderr)}", inspection.files, inspection.changed_lines)
+            return PatchInspection(False, f"Patch recusado pelo Git: {self.sanitize(check.stderr)}", inspection.files, inspection.changed_lines, True)
         applied = self._run(("git", "apply", "-"), path, 30, input_text=patch)
         if applied.returncode != 0:
-            return PatchInspection(False, f"Falha ao aplicar no workspace: {self.sanitize(applied.stderr)}", inspection.files, inspection.changed_lines)
+            return PatchInspection(False, f"Falha ao aplicar no workspace: {self.sanitize(applied.stderr)}", inspection.files, inspection.changed_lines, True)
         return inspection
 
     def diff(self, workspace: str | Path) -> str:
@@ -218,6 +251,18 @@ class DevWorkspace:
             except ValueError:
                 return "Patch aponta para link simbolico externo."
         return ""
+
+    def _looks_like_pure_unified_diff(self, patch: str) -> bool:
+        text = patch.strip()
+        if not text or "```" in text:
+            return False
+        lines = text.splitlines()
+        allowed_prefixes = ("diff --git ", "index ", "--- ", "+++ ", "@@ ", "+", "-", " ")
+        for line in lines:
+            if line.startswith(allowed_prefixes) or line == r"\ No newline at end of file":
+                continue
+            return False
+        return any(line.startswith("--- ") for line in lines) and any(line.startswith("+++ ") for line in lines)
 
     def _safe_id(self, value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):

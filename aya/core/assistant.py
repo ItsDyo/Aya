@@ -3,6 +3,7 @@
 from collections.abc import Callable
 import json
 import logging
+import re
 
 from aya.config import MODEL_CONFIG, RUNTIME_CONFIG
 from aya.core.advice import TechnicalAdviceService
@@ -155,6 +156,10 @@ class Assistant:
         if mensagem_usuario.startswith("/"):
             return self.executar_comando(mensagem_usuario, channel)
 
+        aya_dev_response = self._responder_aya_dev_natural(mensagem_usuario)
+        if aya_dev_response:
+            return aya_dev_response
+
         denial = self._authorize(channel, Capability.CHAT)
         if denial:
             return denial
@@ -269,6 +274,18 @@ class Assistant:
             "/plano": lambda: self._comando_plano_alteracao(resto, channel),
             "/aya-dev": lambda: self.aya_dev.execute(resto),
         }
+
+    def _responder_aya_dev_natural(self, mensagem: str) -> str:
+        texto = mensagem.lower()
+        match = re.search(r"\bdev-\d{8}-[a-f0-9]{6}\b", mensagem, re.IGNORECASE)
+        if not match or not any(term in texto for term in ("aya dev", "aya-dev", "proposta", "patch", "falha")):
+            return ""
+        proposal_id = match.group(0)
+        if any(term in texto for term in ("falha", "erro", "falhou", "motivo")):
+            return self.aya_dev.falha(proposal_id)
+        if any(term in texto for term in ("diff", "patch")):
+            return self.aya_dev.diff(proposal_id)
+        return self.aya_dev.mostrar(proposal_id)
 
     def ajuda(self) -> str:
         return """Voce pode falar naturalmente comigo. Comandos sao atalhos, nao obrigacao.

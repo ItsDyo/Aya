@@ -126,6 +126,40 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertIn("fora da raiz", result.message)
 
+    def test_diff_unificado_valido(self):
+        result = self.service.workspace.inspect_patch(
+            "--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-import json\n+import json\n",
+            allowed_files=["aya/core/sample.py"],
+        )
+        self.assertTrue(result.valid)
+        self.assertEqual(("aya/core/sample.py",), result.files)
+
+    def test_texto_explicativo_e_recusado(self):
+        result = self.service.workspace.inspect_patch(
+            "Claro, aqui esta o patch:\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-a\n+b\n"
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("diff unificado puro", result.message)
+
+    def test_markdown_e_recusado(self):
+        with self.assertRaisesRegex(ValueError, "Markdown recusada"):
+            self.service._extract_patch(
+                "```diff\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-a\n+b\n```"
+            )
+
+    def test_diff_sem_hunk_e_recusado(self):
+        result = self.service.workspace.inspect_patch("--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n")
+        self.assertFalse(result.valid)
+        self.assertIn("sem hunk", result.message)
+
+    def test_arquivo_fora_da_proposta_e_recusado(self):
+        result = self.service.workspace.inspect_patch(
+            "--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-a\n+b\n",
+            allowed_files=["tests/test_sample.py"],
+        )
+        self.assertFalse(result.valid)
+        self.assertIn("fora do escopo", result.message)
+
     def test_patch_bloqueia_link_simbolico_externo(self):
         external = self.root.parent / "outside.py"
         external.write_text("x = 1\n", encoding="utf-8")
@@ -195,7 +229,7 @@ class AyaDevTestCase(unittest.TestCase):
 
     def test_extrator_preserva_quebra_final_exigida_pelo_git(self):
         patch_text = self.service._extract_patch(
-            "```diff\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-import json\n+import re\n```"
+            "--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n@@ -1 +1 @@\n-import json\n+import re\n"
         )
 
         self.assertTrue(patch_text.endswith("\n"))
@@ -246,6 +280,7 @@ class AyaDevTestCase(unittest.TestCase):
         self.service.testar(proposal.id)
         self.assertEqual("FALHOU", proposal.state)
         self.assertIn("recusada", self.service.aprovar(proposal.id))
+        self.assertIn("testes", self.service.falha(proposal.id))
 
     def test_diff_e_somente_leitura(self):
         proposal = self.proposal()
@@ -254,6 +289,36 @@ class AyaDevTestCase(unittest.TestCase):
         response = self.service.diff(proposal.id)
         self.assertIn("somente leitura", response)
         self.assertEqual(before, self.storage.read_bytes())
+
+    def test_falha_id_mostra_dados_registrados_sem_modelo(self):
+        proposal = self.proposal()
+        proposal.state = "FALHOU"
+        self.service._record_failure(proposal, "patch", "diff recusado", "token=segredo")
+        response = self.service.execute(f"falha {proposal.id}")
+        self.assertIn("Etapa: patch", response)
+        self.assertIn("Motivo: diff recusado", response)
+        self.assertNotIn("segredo", response)
+
+    def test_mostrar_neutraliza_falso_sucesso_do_modelo(self):
+        proposal = self.proposal(suggested_change="Alteracao realizada com sucesso.")
+        response = self.service.mostrar(proposal.id)
+        self.assertIn("neutralizado", response)
+        self.assertIn("Plano sugerido", response)
+
+    def test_proposta_antiga_compativel_sem_campos_de_falha(self):
+        proposal = self.proposal()
+        data = self.storage.read_text(encoding="utf-8")
+        self.storage.write_text(data.replace(',\n    "failure_stage": ""', ""), encoding="utf-8")
+        loaded = AyaDevService(
+            self.root,
+            self.client,
+            ProjectTools(self.root),
+            storage_path=self.storage,
+            index_path=self.cache,
+            workspace_root=self.workspaces,
+        )
+        self.assertIn(proposal.id, loaded.proposals)
+        self.assertIn("Informacao nao registrada", loaded.falha(proposal.id))
 
     def test_historico_tecnico_persiste_separado(self):
         proposal = self.proposal()
@@ -289,6 +354,47 @@ class AyaDevTestCase(unittest.TestCase):
         self.service.workspace.git_state = Mock(return_value=GitState(False, False, "invalido"))
         self.service.preparar(proposal.id)
         self.assertEqual(original, (self.root / "aya/core/sample.py").read_bytes())
+
+    def test_git_apply_check_falhando_registra_falha_e_limpa_worktree(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.client.resposta = (
+            "--- a/aya/core/sample.py\n"
+            "+++ b/aya/core/sample.py\n"
+            "@@ -99 +99 @@\n"
+            "-linha inexistente\n"
+            "+linha nova\n"
+        )
+        response = self.service.preparar(proposal.id)
+        self.assertIn("Patch recusado", response)
+        self.assertEqual("FALHOU", proposal.state)
+        self.assertEqual("patch", proposal.failure_stage)
+        self.assertTrue(proposal.workspace_cleaned)
+        self.assertFalse(Path(proposal.workspace_path).exists())
+
+    def test_patch_markdown_falha_com_motivo_persistido_e_worktree_removido(self):
+        proposal = self.proposal(related_files=["aya/core/sample.py"])
+        self.init_git()
+        proposal.state = "PLANEJADA"
+        self.client.resposta = (
+            "```diff\n--- a/aya/core/sample.py\n+++ b/aya/core/sample.py\n"
+            "@@ -1 +1 @@\n-import json\n+import re\n```"
+        )
+        response = self.service.preparar(proposal.id)
+        self.assertIn("Markdown recusada", response)
+        self.assertEqual("preparacao", proposal.failure_stage)
+        self.assertTrue(proposal.raw_response_saved)
+        self.assertTrue(proposal.workspace_cleaned)
+
+    def test_aprovacao_nao_aplica_patch(self):
+        proposal = self.proposal()
+        proposal.state = "AGUARDANDO_APROVACAO"
+        before = (self.root / "aya/core/sample.py").read_text(encoding="utf-8")
+        self.service.aprovar(proposal.id)
+        after = (self.root / "aya/core/sample.py").read_text(encoding="utf-8")
+        self.assertEqual(before, after)
+        self.assertIn("nao habilitada", self.service.aplicar(proposal.id).lower())
 
     def test_validacao_nao_executa_comando_arbitrario_do_modelo(self):
         workspace = self.workspaces / "safe"
@@ -336,6 +442,34 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             assistant = Assistant(db=Database(Path(tmp) / "test.db"), llm=StaticClient())
             self.assertIn("Aya Dev", assistant.responder("/aya-dev status"))
+            assistant.encerrar()
+
+    def test_pergunta_natural_sobre_proposta_usa_dados_estruturados(self):
+        from aya.core.assistant import Assistant
+        from aya.core.llm import StaticClient
+        from aya.data.database import Database
+
+        with tempfile.TemporaryDirectory() as tmp:
+            assistant = Assistant(db=Database(Path(tmp) / "test.db"), llm=StaticClient("chat generico"))
+            proposal = assistant.aya_dev.create_proposal(
+                title="Documentar modulo",
+                problem="Falta docstring.",
+                evidence=["Indice AST confirmou aya/core/aya_dev.py."],
+                related_files=["aya/core/aya_dev.py"],
+                related_symbols=["AyaDevService"],
+                probable_cause="Documentacao interna incompleta.",
+                suggested_change="Adicionar docstring.",
+                preserve=["comportamento atual"],
+                impact="baixo",
+                urgency="baixa",
+                difficulty="baixa",
+                required_tests=["tests/test_aya_dev.py"],
+                done_criteria=["testes passam"],
+            )
+            response = assistant.responder(f"qual foi a falha da proposta {proposal.id} do Aya Dev?")
+            self.assertIn("Falha", response)
+            self.assertIn("Informacao nao registrada", response)
+            self.assertNotIn("chat generico", response)
             assistant.encerrar()
 
 

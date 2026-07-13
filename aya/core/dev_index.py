@@ -55,6 +55,7 @@ class TechnicalIndex:
         return entries
 
     def select(self, query: str, limit: int = 6) -> list[TechnicalFile]:
+        """Return technical files ranked deterministically by query relevance."""
         entries = self.build()
         terms = {term for term in re.findall(r"[a-zA-Z_][\w.]+", query.lower()) if len(term) >= 3}
         ranked: list[tuple[int, TechnicalFile]] = []
