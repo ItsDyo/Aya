@@ -338,6 +338,8 @@ class AyaDevService:
         try:
             proposal.base_commit = git_head = self.workspace.head()
             manifest: dict | None = None
+            decision: dict | None = None
+            target_file = ""
             if self._use_structured_patch(proposal):
                 raw_decision = self._request_patch_decision(proposal, git_head)
                 proposal.raw_response = self.workspace.sanitize(
@@ -349,16 +351,6 @@ class AyaDevService:
                 proposal.raw_response = self.workspace.sanitize(json.dumps(decision, ensure_ascii=True), 50000)
                 proposal.raw_response_saved = True
                 target_file = self._structured_target_file(proposal)
-                expected_sha256 = self._file_sha256(target_file)
-                manifest = self.structured_patch.build_manifest(
-                    decision,
-                    proposal.id,
-                    git_head,
-                    target_file,
-                    expected_sha256,
-                    self._related_tests(proposal),
-                )
-                proposal.patch_manifest = manifest
             worktree = self.workspace.create(proposal.id)
             proposal.workspace = str(worktree)
             proposal.workspace_path = str(worktree)
@@ -375,8 +367,17 @@ class AyaDevService:
                 self._save()
                 return proposal.review_result
             if self._use_structured_patch(proposal):
-                if manifest is None:
+                if decision is None:
                     raise StructuredPatchError("Manifesto estruturado nao foi preparado.")
+                manifest = self.structured_patch.build_manifest(
+                    decision,
+                    proposal.id,
+                    git_head,
+                    target_file,
+                    self._file_sha256(target_file, worktree),
+                    self._related_tests(proposal),
+                )
+                proposal.patch_manifest = manifest
                 result = self.structured_patch.apply(
                     worktree,
                     manifest,
@@ -702,10 +703,11 @@ class AyaDevService:
             raise StructuredPatchError("Structured Patch exige exatamente um arquivo de codigo autorizado.")
         return code_files[0]
 
-    def _file_sha256(self, rel: str) -> str:
-        path = (self.root / rel).resolve()
+    def _file_sha256(self, rel: str, base: str | Path | None = None) -> str:
+        root = Path(base).resolve() if base is not None else self.root
+        path = (root / rel).resolve()
         try:
-            path.relative_to(self.root)
+            path.relative_to(root)
         except ValueError as exc:
             raise StructuredPatchError("Arquivo fora da raiz.") from exc
         return hashlib.sha256(path.read_bytes()).hexdigest()
