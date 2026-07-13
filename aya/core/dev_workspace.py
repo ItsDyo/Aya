@@ -191,7 +191,7 @@ class DevWorkspace:
         if related_tests:
             safe_tests = [test for test in related_tests if not self._path_error(test) and test.endswith(".py")]
             if safe_tests:
-                results.append(self._check("testes relacionados", ("python", "-m", "pytest", *safe_tests), 300, path))
+                results.append(self._check("testes relacionados", ("python", "-m", "pytest", *safe_tests), 600, path))
                 if not results[-1].passed:
                     return results
         for name, command, timeout in VALIDATION_COMMANDS:
