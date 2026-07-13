@@ -7,6 +7,7 @@ class ChangePlanService:
     """Monta pedidos de planejamento sem executar alteracoes em arquivos."""
 
     def build_prompt(self, review: FileReview, objective: str = "") -> str:
+        """Build a safe planning prompt from a file review."""
         objetivo = (objective or "").strip() or "melhorar o arquivo com o menor risco possivel"
         return (
             "Modo plano de alteracao da Aya.\n"
