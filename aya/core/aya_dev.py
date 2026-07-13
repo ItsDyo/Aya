@@ -22,7 +22,10 @@ PROPOSAL_STATES = {
     "DETECTADA", "PROPOSTA", "PLANEJADA", "PREPARANDO", "EM_TESTE",
     "AGUARDANDO_APROVACAO", "APROVADA", "REJEITADA", "FALHOU",
     "PREPARANDO_COMMIT", "COMMIT_PRONTO", "VALIDANDO_INTEGRACAO",
-    "INTEGRANDO", "INTEGRADA", "INTEGRACAO_BLOQUEADA", "APLICADA", "REVERTIDA",
+    "INTEGRANDO", "INTEGRADA", "INTEGRACAO_BLOQUEADA",
+    "REVERSAO_SOLICITADA", "VALIDANDO_REVERSAO", "AGUARDANDO_APROVACAO_REVERSAO",
+    "REVERSAO_APROVADA", "REVERTENDO", "REVERTIDA", "REVERSAO_BLOQUEADA",
+    "REVERSAO_FALHOU", "REVERSAO_PARCIAL", "APLICADA",
 }
 RISK_ORDER = {"baixo": 0, "medio": 1, "alto": 2}
 HIGH_RISK_TERMS = {
@@ -110,6 +113,31 @@ class EngineeringProposal:
     integration_block_reason: str = ""
     integration_partial: bool = False
     integration_cleanup_result: str = ""
+    reversal_requested_at: str = ""
+    reversal_reason: str = ""
+    reversal_requested_by: str = ""
+    reversal_approved_at: str = ""
+    reversal_approved_by: str = ""
+    reversal_approval_valid: bool = False
+    reversal_approval_invalid_reason: str = ""
+    reversal_target_commit: str = ""
+    reversal_base_commit: str = ""
+    reversal_main_before: str = ""
+    reversal_commit: str = ""
+    reversal_main_after: str = ""
+    reversal_validation: list[dict] = field(default_factory=list)
+    reversal_post_validation: list[dict] = field(default_factory=list)
+    reversal_validation_sha256: str = ""
+    reversal_review_sha256: str = ""
+    reversal_manifest_sha256: str = ""
+    reversal_approved_validation_sha256: str = ""
+    reversal_approved_review_sha256: str = ""
+    reversal_approved_manifest_sha256: str = ""
+    reversal_approved_base_commit: str = ""
+    reversal_started_at: str = ""
+    reversal_completed_at: str = ""
+    reversal_error: str = ""
+    reversal_partial: bool = False
 
 
 class AyaDevService:
@@ -163,7 +191,8 @@ class AyaDevService:
             return handlers[action]()
         if action in {
             "mostrar", "falha", "commit", "integracao", "planejar", "preparar", "revisar", "testar", "diff",
-            "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "reverter", "pacote-codex",
+            "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "solicitar-reversao",
+            "reversao", "aprovar-reversao", "reverter", "pacote-codex",
         }:
             if not argument.strip():
                 return f"Informe o ID: /aya-dev {action} id"
@@ -319,6 +348,9 @@ class AyaDevService:
             "",
             "Integracao:",
             self.integracao(proposal.id),
+            "",
+            "Reversao:",
+            self.reversao(proposal.id),
         ]
         return "\n".join(lines)
 
@@ -747,9 +779,165 @@ class AyaDevService:
             f"- Estado final: {proposal.state}",
         ])
 
+    def solicitar_reversao(self, payload: str) -> str:
+        raw_id, _, reason = payload.partition(" ")
+        if not raw_id.strip() or not reason.strip():
+            return "Solicitacao recusada: informe /aya-dev solicitar-reversao ID MOTIVO."
+        proposal = self._get(raw_id.strip())
+        if proposal.state != "INTEGRADA":
+            return "Solicitacao recusada: somente propostas INTEGRADAS podem ser revertidas."
+        previous = proposal.state
+        proposal.state = "REVERSAO_SOLICITADA"
+        proposal.reversal_requested_at = datetime.now().isoformat(timespec="seconds")
+        proposal.reversal_reason = self.workspace.sanitize(reason.strip(), 1000)
+        proposal.reversal_requested_by = "local_user"
+        proposal.reversal_target_commit = proposal.integrated_commit or proposal.proposal_commit
+        proposal.reversal_base_commit = self.workspace.head()
+        proposal.reversal_main_before = proposal.reversal_base_commit
+        proposal.reversal_error = ""
+        proposal.reversal_partial = False
+        self._event(proposal, "reversao solicitada", previous, proposal.state)
+        try:
+            proposal.state = "VALIDANDO_REVERSAO"
+            self._event(proposal, "validando reversao solicitada", "REVERSAO_SOLICITADA", proposal.state)
+            self._validate_reversal_preconditions(proposal, require_approval=False)
+            validation = self._validate_reversal_in_clean_worktree(proposal)
+            proposal.reversal_validation = validation
+            proposal.reversal_validation_sha256 = self._sha_json(validation)
+            proposal.reversal_review_sha256 = self._sha_text(proposal.reversal_reason)
+            proposal.reversal_manifest_sha256 = self._sha_json(self._reversal_manifest(proposal))
+            if not all(item.get("passed") for item in validation):
+                raise RuntimeError("VALIDACAO_REVERSAO_REPROVADA")
+            proposal.state = "AGUARDANDO_APROVACAO_REVERSAO"
+            self._event(proposal, "reversao aguardando aprovacao humana", "VALIDANDO_REVERSAO", proposal.state)
+            self._save()
+            return "\n".join([
+                f"Reversao solicitada para {proposal.id}.",
+                f"- Motivo: {proposal.reversal_reason}",
+                f"- Commit alvo: {proposal.reversal_target_commit}",
+                f"- Main antes: {proposal.reversal_main_before}",
+                f"- Validacao previa: {self._checks_status(proposal.reversal_validation)}",
+                "- Proximo passo: /aya-dev aprovar-reversao ID",
+            ])
+        except Exception as exc:
+            proposal.state = "REVERSAO_BLOQUEADA"
+            proposal.reversal_error = self.workspace.sanitize(str(exc))
+            self._event(proposal, "reversao bloqueada", "VALIDANDO_REVERSAO", proposal.state)
+            self._save()
+            return f"Reversao bloqueada: {proposal.reversal_error}. Main permaneceu intacta."
+
+    def aprovar_reversao(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        if proposal.state != "AGUARDANDO_APROVACAO_REVERSAO":
+            return "Aprovacao de reversao recusada: solicite e valide a reversao antes."
+        valid, reason = self._reversal_snapshot_valid(proposal)
+        if not valid:
+            proposal.reversal_approval_valid = False
+            proposal.reversal_approval_invalid_reason = reason
+            self._save()
+            return f"Aprovacao de reversao recusada: {reason}"
+        previous = proposal.state
+        proposal.state = "REVERSAO_APROVADA"
+        proposal.reversal_approved_at = datetime.now().isoformat(timespec="seconds")
+        proposal.reversal_approved_by = "local_user"
+        proposal.reversal_approved_validation_sha256 = self._sha_json(proposal.reversal_validation)
+        proposal.reversal_approved_review_sha256 = self._sha_text(proposal.reversal_reason)
+        proposal.reversal_approved_manifest_sha256 = self._sha_json(self._reversal_manifest(proposal))
+        proposal.reversal_approved_base_commit = proposal.reversal_base_commit
+        proposal.reversal_approval_valid = True
+        proposal.reversal_approval_invalid_reason = ""
+        self._event(proposal, "aprovacao humana de reversao registrada", previous, proposal.state)
+        self._save()
+        return "Aprovacao de reversao registrada. Nenhum revert foi executado ainda."
+
+    def reversao(self, proposal_id: str) -> str:
+        proposal = self._get(proposal_id)
+        valid, reason = self._reversal_currently_valid(proposal)
+        return "\n".join([
+            f"Reversao {proposal.id}:",
+            f"- Estado: {proposal.state}",
+            f"- Motivo: {proposal.reversal_reason or 'Informacao nao registrada.'}",
+            f"- Solicitada em: {proposal.reversal_requested_at or 'Informacao nao registrada.'}",
+            f"- Aprovada: {'sim' if proposal.reversal_approval_valid else 'nao'}",
+            f"- Aprovacao valida agora: {'sim' if valid else 'nao'}",
+            f"- Motivo de bloqueio: {reason or proposal.reversal_error or 'nenhum'}",
+            f"- Commit alvo: {proposal.reversal_target_commit or 'Informacao nao registrada.'}",
+            f"- Main antes: {proposal.reversal_main_before or 'Informacao nao registrada.'}",
+            f"- Commit de reversao: {proposal.reversal_commit or 'Informacao nao registrada.'}",
+            f"- Main depois: {proposal.reversal_main_after or 'Informacao nao registrada.'}",
+            f"- Validacao previa: {self._checks_status(proposal.reversal_validation)}",
+            f"- Validacao posterior: {self._checks_status(proposal.reversal_post_validation)}",
+            f"- Reversao parcial: {'sim' if proposal.reversal_partial else 'nao'}",
+            "- Push executado: nao",
+            "- Remoto usado: nao",
+        ])
+
     def reverter(self, proposal_id: str) -> str:
-        self._get(proposal_id)
-        return "Reversao bloqueada: nenhum commit aplicado por Aya Dev neste ciclo."
+        proposal = self._get(proposal_id)
+        if proposal.state == "REVERTIDA":
+            return self._reverted_idempotent_response(proposal)
+        if proposal.state in {"REVERSAO_PARCIAL", "REVERSAO_FALHOU"} and proposal.reversal_commit and self.workspace.head() == proposal.reversal_commit:
+            return self._finalize_already_reverted(proposal)
+        if proposal.state != "REVERSAO_APROVADA":
+            return "Reversao bloqueada: aprove explicitamente antes com /aya-dev aprovar-reversao ID."
+        previous = proposal.state
+        proposal.state = "REVERTENDO"
+        proposal.reversal_started_at = datetime.now().isoformat(timespec="seconds")
+        proposal.reversal_main_before = self.workspace.head()
+        self._event(proposal, "reversao iniciada por git revert", previous, proposal.state)
+        try:
+            self._validate_reversal_preconditions(proposal, require_approval=True)
+            validation = self._validate_reversal_in_clean_worktree(proposal)
+            proposal.reversal_validation = validation
+            if not all(item.get("passed") for item in validation):
+                raise RuntimeError("VALIDACAO_REVERSAO_REPROVADA")
+            self._validate_main_ready_for_revert(proposal)
+            revert = self.workspace._run(("git", "revert", "--no-edit", proposal.reversal_target_commit), self.root, 120)
+            if revert.returncode != 0:
+                raise RuntimeError(f"GIT_REVERT_FALHOU: {self.workspace.sanitize(revert.stderr or revert.stdout)}")
+            proposal.reversal_commit = self.workspace.head()
+            proposal.reversal_main_after = proposal.reversal_commit
+            post = self._post_reversal_validation(proposal)
+            proposal.reversal_post_validation = post
+            if not all(item.get("passed") for item in post):
+                proposal.reversal_partial = True
+                proposal.state = "REVERSAO_PARCIAL"
+                proposal.reversal_error = "VALIDACAO_POS_REVERSAO_REPROVADA"
+                self._event(proposal, "validacao pos-reversao reprovada", "REVERTENDO", proposal.state)
+                self._save()
+                return "Reversao parcial registrada: o commit de revert foi criado, mas a validacao posterior falhou."
+            proposal.reversal_completed_at = datetime.now().isoformat(timespec="seconds")
+            proposal.reversal_partial = False
+            proposal.state = "REVERTIDA"
+            self._event(proposal, "reversao concluida por git revert", "REVERTENDO", proposal.state)
+            self._save()
+            return "\n".join([
+                "Reversao concluida por git revert.",
+                f"- Commit alvo: {proposal.reversal_target_commit}",
+                f"- Commit de reversao: {proposal.reversal_commit}",
+                f"- Main antes: {proposal.reversal_main_before}",
+                f"- Main depois: {proposal.reversal_main_after}",
+                f"- Validacao previa: {self._checks_status(proposal.reversal_validation)}",
+                f"- Validacao posterior: {self._checks_status(proposal.reversal_post_validation)}",
+                "- Push executado: nao",
+                "- Remoto usado: nao",
+                "- Estado final: REVERTIDA",
+            ])
+        except Exception as exc:
+            if proposal.reversal_main_before and self.workspace.head() != proposal.reversal_main_before:
+                proposal.reversal_partial = True
+                proposal.state = "REVERSAO_PARCIAL"
+                proposal.reversal_commit = self.workspace.head()
+                proposal.reversal_main_after = proposal.reversal_commit
+                proposal.reversal_error = self.workspace.sanitize(str(exc))
+                self._event(proposal, "reversao parcial registrada", previous, proposal.state)
+                self._save()
+                return "Reversao parcial registrada: a main avancou, mas a operacao nao foi concluida. Revisao humana necessaria."
+            proposal.state = "REVERSAO_FALHOU"
+            proposal.reversal_error = self.workspace.sanitize(str(exc))
+            self._event(proposal, "reversao falhou antes de mover a main", previous, proposal.state)
+            self._save()
+            return f"Reversao bloqueada: {proposal.reversal_error}. Main permaneceu intacta."
 
     def rejeitar(self, proposal_id: str) -> str:
         raw_id, _, reason = proposal_id.partition("|")
@@ -1396,6 +1584,174 @@ class AyaDevService:
             f"- Commit alcancavel pela main: {'sim' if still_integrated else 'nao'}",
             "- Novo merge executado: nao",
         ])
+
+    def _validate_reversal_preconditions(self, proposal: EngineeringProposal, *, require_approval: bool) -> None:
+        if not proposal.reversal_reason:
+            raise RuntimeError("MOTIVO_AUSENTE")
+        if not proposal.reversal_target_commit:
+            raise RuntimeError("COMMIT_ALVO_AUSENTE")
+        if self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip() != "main":
+            raise RuntimeError("MAIN_BRANCH_DIVERGENTE")
+        if self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip():
+            raise RuntimeError("MAIN_SUJA")
+        self._git(("rev-parse", f"{proposal.reversal_target_commit}^{{commit}}"), cwd=self.root, timeout=30)
+        if not self._commit_is_in_main(proposal.reversal_target_commit):
+            raise RuntimeError("COMMIT_FORA_DA_MAIN")
+        existing_revert = self._find_revert_commit(proposal.reversal_target_commit)
+        if existing_revert and proposal.state not in {"REVERSAO_PARCIAL", "REVERTIDA"}:
+            raise RuntimeError("COMMIT_JA_REVERTIDO")
+        if require_approval:
+            valid, reason = self._reversal_currently_valid(proposal)
+            if not valid:
+                proposal.reversal_approval_valid = False
+                proposal.reversal_approval_invalid_reason = reason
+                raise RuntimeError(reason.upper().replace(" ", "_"))
+            if self.workspace.head() != proposal.reversal_approved_base_commit:
+                raise RuntimeError("BASE_REVERSAO_DIVERGENTE")
+
+    def _validate_reversal_in_clean_worktree(self, proposal: EngineeringProposal) -> list[dict]:
+        target = self.workspace.workspace_root / f"reversal-{proposal.id}-{uuid.uuid4().hex[:8]}"
+        results: list[CheckResult] = []
+        try:
+            self._git(("worktree", "add", "--detach", str(target), self.workspace.head()), cwd=self.root, timeout=90)
+            revert = self.workspace._run(("git", "revert", "--no-commit", proposal.reversal_target_commit), target, 120)
+            results.append(CheckResult("git revert --no-commit", "git revert --no-commit", revert.returncode, 0, self.workspace.sanitize(revert.stderr or revert.stdout)))
+            if revert.returncode == 0:
+                results.append(self._check_command("git diff --check", ("git", "diff", "--check"), 30, target))
+                results.extend(self.workspace.validate(target))
+                results.append(self._check_command("git status --porcelain", ("git", "status", "--porcelain"), 30, target))
+        finally:
+            if target.exists():
+                remove = self.workspace._run(("git", "worktree", "remove", "--force", str(target)), self.root, 90)
+                prune = self.workspace._run(("git", "worktree", "prune"), self.root, 90)
+                if remove.returncode != 0:
+                    results.append(CheckResult("limpeza worktree reversao", "git worktree remove --force", remove.returncode, 0, self.workspace.sanitize(remove.stderr or remove.stdout)))
+                if prune.returncode != 0:
+                    results.append(CheckResult("git worktree prune", "git worktree prune", prune.returncode, 0, self.workspace.sanitize(prune.stderr or prune.stdout)))
+        return [asdict(result) | {"passed": result.passed, "phase": "reversal_validation"} for result in results]
+
+    def _validate_main_ready_for_revert(self, proposal: EngineeringProposal) -> None:
+        if self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip() != "main":
+            raise RuntimeError("MAIN_BRANCH_DIVERGENTE")
+        if self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip():
+            raise RuntimeError("MAIN_SUJA")
+        if self.workspace.head() != proposal.reversal_approved_base_commit:
+            raise RuntimeError("BASE_REVERSAO_DIVERGENTE")
+        if self._find_revert_commit(proposal.reversal_target_commit):
+            raise RuntimeError("COMMIT_JA_REVERTIDO")
+
+    def _post_reversal_validation(self, proposal: EngineeringProposal) -> list[dict]:
+        results = [
+            self._check_command("git diff --check HEAD^ HEAD", ("git", "diff", "--check", "HEAD^", "HEAD"), 30, self.root),
+            self._check_command("pytest", ("python", "-m", "pytest"), 600, self.root),
+            self._check_command("ruff", ("python", "-m", "ruff", "check", "."), 180, self.root),
+            self._check_command("compileall", ("python", "-m", "compileall", "."), 180, self.root),
+            self._check_command("pip check", ("python", "-m", "pip", "check"), 180, self.root),
+            self._check_command("smoke", ("python", "scripts/smoke_test.py"), 180, self.root),
+        ]
+        current = self.workspace.head()
+        parents = self._git(("show", "-s", "--format=%P", "HEAD"), cwd=self.root, timeout=30).stdout.split()
+        checks = [
+            ("reversal head registrado", current == proposal.reversal_commit, current),
+            ("reversal possui um pai", len(parents) == 1, "pais=" + str(len(parents))),
+            ("status limpo", not self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip(), ""),
+        ]
+        for name, passed, output in checks:
+            results.append(CheckResult(name, name, 0 if passed else 1, 0, output))
+        return [asdict(result) | {"passed": result.passed, "phase": "post_reversal"} for result in results]
+
+    def _reversal_snapshot_valid(self, proposal: EngineeringProposal) -> tuple[bool, str]:
+        if not proposal.reversal_validation:
+            return False, "validacao de reversao ausente"
+        if not proposal.reversal_target_commit:
+            return False, "commit alvo ausente"
+        if not proposal.reversal_base_commit:
+            return False, "base de reversao ausente"
+        if not proposal.reversal_reason:
+            return False, "motivo ausente"
+        if not all(item.get("passed") for item in proposal.reversal_validation):
+            return False, "validacao de reversao reprovada"
+        expected_validation = self._sha_json(proposal.reversal_validation)
+        expected_review = self._sha_text(proposal.reversal_reason)
+        expected_manifest = self._sha_json(self._reversal_manifest(proposal))
+        if proposal.reversal_validation_sha256 and proposal.reversal_validation_sha256 != expected_validation:
+            return False, "validacao de reversao invalidada"
+        if proposal.reversal_review_sha256 and proposal.reversal_review_sha256 != expected_review:
+            return False, "motivo de reversao invalidado"
+        if proposal.reversal_manifest_sha256 and proposal.reversal_manifest_sha256 != expected_manifest:
+            return False, "manifesto de reversao invalidado"
+        return True, ""
+
+    def _reversal_currently_valid(self, proposal: EngineeringProposal) -> tuple[bool, str]:
+        if not proposal.reversal_approval_valid:
+            return False, proposal.reversal_approval_invalid_reason or "aprovacao de reversao nao registrada"
+        expected = {
+            "validation": self._sha_json(proposal.reversal_validation),
+            "review": self._sha_text(proposal.reversal_reason),
+            "manifest": self._sha_json(self._reversal_manifest(proposal)),
+            "base": proposal.reversal_base_commit,
+        }
+        actual = {
+            "validation": proposal.reversal_approved_validation_sha256,
+            "review": proposal.reversal_approved_review_sha256,
+            "manifest": proposal.reversal_approved_manifest_sha256,
+            "base": proposal.reversal_approved_base_commit,
+        }
+        for key, value in expected.items():
+            if value != actual[key]:
+                return False, f"aprovacao de reversao invalidada por mudanca em {key}"
+        return True, ""
+
+    def _reversal_manifest(self, proposal: EngineeringProposal) -> dict:
+        return {
+            "proposal_id": proposal.id,
+            "target_commit": proposal.reversal_target_commit,
+            "base_commit": proposal.reversal_base_commit,
+            "reason_sha256": self._sha_text(proposal.reversal_reason),
+            "files": self._commit_files(proposal.reversal_target_commit) if proposal.reversal_target_commit else [],
+        }
+
+    def _commit_is_in_main(self, commit: str) -> bool:
+        return self.workspace._run(("git", "merge-base", "--is-ancestor", commit, "main"), self.root, 30).returncode == 0
+
+    def _find_revert_commit(self, commit: str) -> str:
+        result = self._git(("log", "--format=%H", "--grep", f"This reverts commit {commit}"), cwd=self.root, timeout=30)
+        return result.stdout.splitlines()[0] if result.stdout.splitlines() else ""
+
+    def _reverted_idempotent_response(self, proposal: EngineeringProposal) -> str:
+        return "\n".join([
+            "Proposta ja revertida.",
+            f"- Commit alvo: {proposal.reversal_target_commit}",
+            f"- Commit de reversao: {proposal.reversal_commit}",
+            f"- Main atual: {self.workspace.head()}",
+            "- Novo revert executado: nao",
+        ])
+
+    def _finalize_already_reverted(self, proposal: EngineeringProposal) -> str:
+        previous = proposal.state
+        try:
+            proposal.reversal_post_validation = self._post_reversal_validation(proposal)
+            if not all(item.get("passed") for item in proposal.reversal_post_validation):
+                raise RuntimeError("VALIDACAO_RECONCILIACAO_REVERSAO_REPROVADA")
+            proposal.reversal_completed_at = datetime.now().isoformat(timespec="seconds")
+            proposal.reversal_partial = False
+            proposal.state = "REVERTIDA"
+            self._event(proposal, "reversao reconciliada sem novo revert", previous, proposal.state)
+            self._save()
+            return "\n".join([
+                "Reversao ja estava criada na main; estado reconciliado.",
+                f"- Commit de reversao: {proposal.reversal_commit}",
+                "- Novo revert executado: nao",
+                f"- Validacao posterior: {self._checks_status(proposal.reversal_post_validation)}",
+                "- Estado final: REVERTIDA",
+            ])
+        except Exception as exc:
+            proposal.state = "REVERSAO_PARCIAL"
+            proposal.reversal_partial = True
+            proposal.reversal_error = self.workspace.sanitize(str(exc))
+            self._event(proposal, "reconciliacao de reversao bloqueada", previous, proposal.state)
+            self._save()
+            return f"Reversao parcial registrada: {proposal.reversal_error}."
 
     def _commit_files(self, commit: str) -> list[str]:
         """Return files changed by a recorded commit."""

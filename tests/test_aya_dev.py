@@ -897,6 +897,145 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Integracao", self.service.execute(f"integracao {proposal.id}"))
         self.assertEqual(before, len(self.client.calls))
 
+    def test_solicitar_reversao_bloqueia_proposta_nao_integrada(self):
+        proposal = self.proposal()
+        response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        self.assertIn("somente propostas INTEGRADAS", response)
+
+    def test_solicitar_reversao_exige_motivo(self):
+        proposal = self.proposal()
+        response = self.service.solicitar_reversao(proposal.id)
+        self.assertIn("MOTIVO", response.upper())
+
+    def test_reverter_bloqueia_sem_aprovacao_de_reversao(self):
+        proposal = self._prepare_integrated_for_reversal()
+        response = self.service.reverter(proposal.id)
+        self.assertIn("aprovar-reversao", response)
+
+    def test_aprovar_reversao_invalida_por_mudanca_no_motivo(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self._request_reversal_ready_for_approval(proposal)
+        proposal.reversal_reason = "motivo alterado"
+        response = self.service.aprovar_reversao(proposal.id)
+        self.assertIn("invalid", response.lower())
+
+    def test_reverter_bloqueia_main_suja(self):
+        proposal = self._prepare_reversal_approved()
+        (self.root / "notes.txt").write_text("sujo\n", encoding="utf-8")
+        response = self.service.reverter(proposal.id)
+        self.assertIn("MAIN_SUJA", response)
+        self.assertEqual(proposal.reversal_base_commit, self._git_head(self.root))
+
+    def test_reverter_bloqueia_commit_inexistente(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self._request_reversal_ready_for_approval(proposal)
+        self.service.aprovar_reversao(proposal.id)
+        proposal.reversal_target_commit = "0" * 40
+        response = self.service.reverter(proposal.id)
+        self.assertIn("unknown revision", response.lower())
+
+    def test_reverter_bloqueia_commit_fora_da_main(self):
+        proposal = self._prepare_integrated_for_reversal()
+        extra = self.workspaces / "fora-main"
+        subprocess.run(("git", "worktree", "add", "-b", "fora-main", str(extra), "HEAD"), cwd=self.root, capture_output=True, check=True)
+        subprocess.run(("git", "commit", "--allow-empty", "-m", "fora main"), cwd=extra, capture_output=True, check=True)
+        outside = self._git_head(extra)
+        subprocess.run(("git", "worktree", "remove", str(extra)), cwd=self.root, capture_output=True, check=True)
+        self._request_reversal_ready_for_approval(proposal)
+        self.service.aprovar_reversao(proposal.id)
+        proposal.reversal_target_commit = outside
+        response = self.service.reverter(proposal.id)
+        self.assertIn("COMMIT_FORA_DA_MAIN", response)
+
+    def test_solicitar_reversao_detecta_revert_existente(self):
+        proposal = self._prepare_reversal_approved()
+        with (
+            patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()),
+            patch.object(self.service, "_post_reversal_validation", return_value=self._passed_validation()),
+        ):
+            self.service.reverter(proposal.id)
+        proposal.state = "INTEGRADA"
+        response = self.service.solicitar_reversao(f"{proposal.id} outro motivo")
+        self.assertIn("COMMIT_JA_REVERTIDO", response)
+
+    def test_solicitar_reversao_bloqueia_validacao_previa_falhando(self):
+        proposal = self._prepare_integrated_for_reversal()
+        failed = CheckResult("git revert --no-commit", "git revert --no-commit", 1, 0, "conflito")
+        with patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=[failed.__dict__ | {"passed": False}]):
+            response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        self.assertIn("VALIDACAO_REVERSAO", response)
+        self.assertEqual("REVERSAO_BLOQUEADA", proposal.state)
+
+    def test_reverter_trata_conflito_do_git_revert(self):
+        proposal = self._prepare_reversal_approved()
+        original_run = self.service.workspace._run
+
+        def fake_run(command, cwd, timeout, input_text=None):
+            if command[:3] == ("git", "revert", "--no-edit"):
+                return subprocess.CompletedProcess(command, 1, "", "CONFLICT")
+            return original_run(command, cwd, timeout, input_text)
+
+        self.service.workspace._run = fake_run
+        response = self.service.reverter(proposal.id)
+        self.assertIn("GIT_REVERT_FALHOU", response)
+        self.assertEqual("REVERSAO_FALHOU", proposal.state)
+
+    def test_reverter_bem_sucedido_e_idempotente(self):
+        proposal = self._prepare_reversal_approved()
+        with (
+            patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()),
+            patch.object(self.service, "_post_reversal_validation", return_value=self._passed_validation()),
+        ):
+            response = self.service.reverter(proposal.id)
+        self.assertIn("Reversao concluida", response)
+        self.assertEqual("REVERTIDA", proposal.state)
+        self.assertTrue(proposal.reversal_commit)
+        self.assertEqual(proposal.reversal_commit, self._git_head(self.root))
+        self.assertFalse(proposal.pushed)
+        self.assertFalse(proposal.remote_used)
+        self.assertIn("ja revertida", self.service.reverter(proposal.id))
+
+    def test_reverter_validacao_posterior_falhando_registra_parcial(self):
+        proposal = self._prepare_reversal_approved()
+        failed = CheckResult("pytest", "python -m pytest", 1, 0, "falhou").__dict__ | {"passed": False}
+        with (
+            patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()),
+            patch.object(self.service, "_post_reversal_validation", return_value=[failed]),
+        ):
+            response = self.service.reverter(proposal.id)
+        self.assertIn("Reversao parcial", response)
+        self.assertEqual("REVERSAO_PARCIAL", proposal.state)
+        self.assertEqual(proposal.reversal_commit, self._git_head(self.root))
+
+    def test_reverter_interrupcao_pos_revert_nao_diz_main_intacta(self):
+        proposal = self._prepare_reversal_approved()
+        with (
+            patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()),
+            patch.object(self.service, "_post_reversal_validation", side_effect=subprocess.TimeoutExpired(("python", "-m", "pytest"), 600)),
+        ):
+            response = self.service.reverter(proposal.id)
+        self.assertIn("Reversao parcial", response)
+        self.assertNotIn("Main permaneceu intacta", response)
+        self.assertEqual("REVERSAO_PARCIAL", proposal.state)
+
+    def test_reverter_reconcilia_reversao_parcial(self):
+        proposal = self._prepare_reversal_approved()
+        with (
+            patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()),
+            patch.object(self.service, "_post_reversal_validation", return_value=[CheckResult("pytest", "python -m pytest", 1, 0, "falhou").__dict__ | {"passed": False}]),
+        ):
+            self.service.reverter(proposal.id)
+        with patch.object(self.service, "_post_reversal_validation", return_value=self._passed_validation()):
+            response = self.service.reverter(proposal.id)
+        self.assertIn("reconciliado", response)
+        self.assertEqual("REVERTIDA", proposal.state)
+
+    def test_reversao_id_nao_chama_modelo(self):
+        proposal = self.proposal()
+        before = len(self.client.calls)
+        self.assertIn("Reversao", self.service.execute(f"reversao {proposal.id}"))
+        self.assertEqual(before, len(self.client.calls))
+
     def test_validacao_nao_executa_comando_arbitrario_do_modelo(self):
         workspace = self.workspaces / "safe"
         workspace.mkdir(parents=True)
@@ -1008,6 +1147,32 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Commit isolado criado", response)
         self.assertEqual("COMMIT_PRONTO", proposal.state)
         self.assertEqual(proposal.commit_parent, self._git_head(self.root))
+        return proposal
+
+    def _passed_validation(self):
+        return [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
+
+    def _prepare_integrated_for_reversal(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        with patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=self._passed_validation()):
+            response = self.service.integrar(proposal.id)
+        self.assertIn("Integracao concluida", response)
+        self.assertEqual("INTEGRADA", proposal.state)
+        return proposal
+
+    def _request_reversal_ready_for_approval(self, proposal):
+        with patch.object(self.service, "_validate_reversal_in_clean_worktree", return_value=self._passed_validation()):
+            response = self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        self.assertIn("Reversao solicitada", response)
+        self.assertEqual("AGUARDANDO_APROVACAO_REVERSAO", proposal.state)
+        return response
+
+    def _prepare_reversal_approved(self):
+        proposal = self._prepare_integrated_for_reversal()
+        self._request_reversal_ready_for_approval(proposal)
+        response = self.service.aprovar_reversao(proposal.id)
+        self.assertIn("Aprovacao de reversao registrada", response)
+        self.assertEqual("REVERSAO_APROVADA", proposal.state)
         return proposal
 
     def _git_head(self, path: Path) -> str:
