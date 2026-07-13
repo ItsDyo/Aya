@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import subprocess
 import tempfile
@@ -11,8 +12,11 @@ from unittest.mock import Mock, patch
 from aya.core.aya_dev import AyaDevService
 from aya.core.dev_workspace import CheckResult, GitState
 from aya.core.llm import StaticClient
+from aya.core.permissions import AccessChannel, PermissionManager
 from aya.core.project_tools import ProjectTools
 from aya.core.structured_patch import PATCH_MANIFEST_SCHEMA, StructuredPatchError
+from aya.ui import aya_dev as aya_dev_ui
+from aya.ui.aya_dev import AyaDevPanel, render_diff
 
 
 class FailingClient:
@@ -1100,6 +1104,174 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertIn("Reversao", self.service.execute(f"reversao {proposal.id}"))
         self.assertEqual(before, len(self.client.calls))
 
+    def test_painel_aya_dev_inicializa_sem_proposta(self):
+        self.service.proposals.clear()
+        panel = self._panel()
+        choices, selected = panel.refresh("todas")
+        self.assertEqual([], choices)
+        self.assertEqual("", selected)
+
+    def test_painel_lista_e_filtra_propostas(self):
+        proposal = self.proposal()
+        proposal.state = "COMMIT_PRONTO"
+        panel = self._panel()
+        all_choices, _ = panel.refresh("todas")
+        filtered, _ = panel.refresh("commit pronto")
+        failed, _ = panel.refresh("falhou")
+        self.assertTrue(any(proposal.id in item for item in all_choices))
+        self.assertTrue(any(proposal.id in item for item in filtered))
+        self.assertFalse(any(proposal.id in item for item in failed))
+
+    def test_painel_selecao_mostra_dados_reais(self):
+        proposal = self.proposal()
+        panel = self._panel()
+        overview, plan, *_ = panel.details(panel._choice(proposal))
+        self.assertIn(proposal.id, overview)
+        self.assertIn(proposal.problem, overview)
+        self.assertIn("nao comprova execucao", plan)
+
+    def test_painel_diff_escapa_html_e_trunca_visualmente(self):
+        dangerous = "diff --git a/x b/x\n+<script>alert(1)</script>\n" + ("+x\n" * 10000)
+        rendered = render_diff(dangerous, expand=False)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertIn("Diff truncado visualmente", rendered)
+        self.assertNotIn("<script>", rendered)
+
+    def test_painel_falha_nao_aparece_como_sucesso(self):
+        proposal = self.proposal()
+        proposal.state = "FALHOU"
+        proposal.failure_reason = "erro real"
+        panel = self._panel()
+        overview, *_ = panel.details(panel._choice(proposal))
+        self.assertIn("FALHOU", overview)
+        self.assertNotIn("concluida", overview.lower())
+
+    def test_painel_botoes_dependem_do_estado(self):
+        proposal = self.proposal()
+        panel = self._panel()
+        actions = panel.available_actions(proposal)
+        self.assertTrue(actions["planejar"])
+        self.assertFalse(actions["integrar"])
+        proposal.state = "COMMIT_PRONTO"
+        actions = panel.available_actions(proposal)
+        self.assertTrue(actions["integrar"])
+
+    def test_painel_aprovacao_exige_texto_exato_e_nao_cria_commit(self):
+        proposal = self.proposal()
+        self._mark_ready_for_approval(proposal)
+        self.init_git()
+        before = self._git_head(self.root)
+        panel = self._panel()
+        selected = panel._choice(proposal)
+        response, *_ = panel.run_action(selected, "aprovar", "APROVAR ERRADO", "")
+        self.assertIn("Confirmacao incorreta", response)
+        self.assertEqual(before, self._git_head(self.root))
+        response, *_ = panel.run_action(selected, "aprovar", f"APROVAR {proposal.id}", "")
+        self.assertIn("Aprovacao registrada", response)
+        self.assertEqual(before, self._git_head(self.root))
+
+    def test_painel_integracao_exige_texto_exato_e_chama_backend(self):
+        proposal = self.proposal()
+        proposal.state = "COMMIT_PRONTO"
+        panel = self._panel()
+        with patch.object(self.service, "integrar", return_value="integrado") as integrar:
+            response, *_ = panel.run_action(panel._choice(proposal), "integrar", "INTEGRAR ERRADO", "")
+            self.assertIn("Confirmacao incorreta", response)
+            integrar.assert_not_called()
+            response, *_ = panel.run_action(panel._choice(proposal), "integrar", f"INTEGRAR {proposal.id}", "")
+            self.assertEqual("integrado", response)
+            integrar.assert_called_once_with(proposal.id)
+
+    def test_painel_motivo_reversao_obrigatorio(self):
+        proposal = self.proposal()
+        proposal.state = "INTEGRADA"
+        panel = self._panel()
+        response, *_ = panel.run_action(panel._choice(proposal), "solicitar_reversao", "", "")
+        self.assertIn("motivo", response.lower())
+
+    def test_painel_previsao_reversao_mostra_diff_arquivos_linhas_e_hash(self):
+        proposal = self.proposal()
+        proposal.state = "AGUARDANDO_APROVACAO_REVERSAO"
+        proposal.reversal_preview_diff = "diff --git a/x b/x\n-old\n+new\n"
+        proposal.reversal_preview_files = ["x"]
+        proposal.reversal_preview_added_lines = 1
+        proposal.reversal_preview_removed_lines = 1
+        proposal.reversal_preview_sha256 = "abcdef123456"
+        panel = self._panel()
+        *_, reversal, _summary = panel.details(panel._choice(proposal))
+        self.assertIn("x", reversal)
+        self.assertIn("abcdef123456", reversal)
+        self.assertIn("Linhas adicionadas: 1", reversal)
+
+    def test_painel_aprovacao_reversao_exige_codigo_e_nao_reverte(self):
+        proposal = self.proposal()
+        proposal.state = "AGUARDANDO_APROVACAO_REVERSAO"
+        proposal.reversal_preview_sha256 = "abcdef123456"
+        panel = self._panel()
+        with patch.object(self.service, "aprovar_reversao", return_value="aprovada") as approve:
+            response, *_ = panel.run_action(panel._choice(proposal), "aprovar_reversao", "REV-errado", "")
+            self.assertIn("Codigo", response)
+            approve.assert_not_called()
+            response, *_ = panel.run_action(panel._choice(proposal), "aprovar_reversao", "REV-abcdef12", "")
+            self.assertEqual("aprovada", response)
+            approve.assert_called_once_with(proposal.id)
+
+    def test_painel_execucao_reversao_exige_confirmacao_e_chama_backend(self):
+        proposal = self.proposal()
+        proposal.state = "REVERSAO_APROVADA"
+        panel = self._panel()
+        with patch.object(self.service, "reverter", return_value="revertida") as revert:
+            response, *_ = panel.run_action(panel._choice(proposal), "reverter", "REVERTER ERRADO", "")
+            self.assertIn("Confirmacao incorreta", response)
+            revert.assert_not_called()
+            response, *_ = panel.run_action(panel._choice(proposal), "reverter", f"REVERTER {proposal.id}", "")
+            self.assertEqual("revertida", response)
+            revert.assert_called_once_with(proposal.id)
+
+    def test_painel_recarrega_estado_e_mostra_erro_persistido(self):
+        proposal = self.proposal()
+        panel = self._panel()
+
+        def fail_action(proposal_id):
+            proposal.state = "FALHOU"
+            proposal.failure_reason = "erro persistido"
+            return "falhou"
+
+        with patch.object(self.service, "planejar", side_effect=fail_action):
+            response, overview, *_ = panel.run_action(panel._choice(proposal), "planejar", "", "")
+        self.assertEqual("falhou", response)
+        self.assertIn("FALHOU", overview)
+
+    def test_painel_acao_concorrente_e_bloqueada_e_lock_libera(self):
+        proposal = self.proposal()
+        panel = self._panel()
+        self.assertTrue(panel._acquire(proposal.id))
+        response, *_ = panel.run_action(panel._choice(proposal), "planejar", "", "")
+        self.assertIn("em andamento", response)
+        panel._release(proposal.id)
+        with patch.object(self.service, "planejar", side_effect=RuntimeError("falha")):
+            response, *_ = panel.run_action(panel._choice(proposal), "planejar", "", "")
+        self.assertIn("Falha", response)
+        self.assertTrue(panel._acquire(proposal.id))
+        panel._release(proposal.id)
+
+    def test_painel_canal_remoto_bloqueia_execucao_mas_visualiza(self):
+        proposal = self.proposal()
+        panel = self._panel(channel=AccessChannel.REMOTE_GRADIO)
+        overview, *_ = panel.details(panel._choice(proposal))
+        self.assertIn(proposal.id, overview)
+        response, *_ = panel.run_action(panel._choice(proposal), "planejar", "", "")
+        self.assertIn("bloqueada", response)
+
+    def test_painel_visualizacao_nao_chama_modelo_e_sem_subprocess(self):
+        proposal = self.proposal()
+        panel = self._panel()
+        before = len(self.client.calls)
+        panel.details(panel._choice(proposal))
+        self.assertEqual(before, len(self.client.calls))
+        source = inspect.getsource(aya_dev_ui)
+        self.assertNotIn("subprocess", source)
+
     def test_validacao_nao_executa_comando_arbitrario_do_modelo(self):
         workspace = self.workspaces / "safe"
         workspace.mkdir(parents=True)
@@ -1269,6 +1441,12 @@ class AyaDevTestCase(unittest.TestCase):
             "invalidated_reason": reason,
         }
 
+    def _panel(self, channel=AccessChannel.LOCAL_GRADIO):
+        fake = type("FakeAssistant", (), {})()
+        fake.aya_dev = self.service
+        fake.permissions = PermissionManager()
+        return AyaDevPanel(fake, channel=channel)
+
     def _git_head(self, path: Path) -> str:
         return subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, capture_output=True, text=True, check=True).stdout.strip()
 
@@ -1283,6 +1461,24 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
             assistant = Assistant(db=Database(Path(tmp) / "test.db"), llm=StaticClient())
             self.assertIn("Aya Dev", assistant.responder("/aya-dev status"))
             assistant.encerrar()
+
+    def test_interface_gradio_normal_inicializa_com_aya_dev(self):
+        from app import create_app
+        from aya.core.assistant import Assistant
+        from aya.core.llm import StaticClient
+        from aya.data.database import Database
+
+        path = Path(tempfile.gettempdir()) / "aya_ui_test.sqlite"
+        assistant = Assistant(db=Database(path), llm=StaticClient())
+        try:
+            demo = create_app(assistant=assistant)
+            self.assertEqual("Blocks", type(demo).__name__)
+        finally:
+            assistant.encerrar()
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
     def test_pergunta_natural_sobre_proposta_usa_dados_estruturados(self):
         from aya.core.assistant import Assistant

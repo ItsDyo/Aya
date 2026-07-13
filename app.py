@@ -11,6 +11,7 @@ from aya.core.assistant import Assistant
 from aya.core.permissions import AccessChannel
 from aya.core.voice import VoiceIO
 from aya.paths import LOG_PATH, ensure_runtime_dirs
+from aya.ui.aya_dev import FILTERS, AyaDevPanel
 from aya.ui.controller import UIController
 
 
@@ -199,6 +200,7 @@ def create_app(
     channel = AccessChannel.REMOTE_GRADIO if config.is_network_exposed else AccessChannel.LOCAL_GRADIO
     admin_visible = channel != AccessChannel.REMOTE_GRADIO
     ui = UIController(aya, VoiceIO(), channel=channel)
+    aya_dev_ui = AyaDevPanel(aya, channel=channel)
 
     with gr.Blocks(title="Aya", fill_width=True) as demo:
         gr.HTML(
@@ -468,6 +470,116 @@ def create_app(
                 autonomia.click(ui.autonomia, outputs=saida_sistema)
                 autonomia_on.click(lambda: ui.autonomia("on"), outputs=saida_sistema)
                 autonomia_off.click(lambda: ui.autonomia("off"), outputs=saida_sistema)
+
+        with gr.Tab("Aya Dev", visible=admin_visible):
+            with gr.Row(elem_classes=["aya-shell", "aya-workspace"]):
+                with gr.Column(scale=4, min_width=320):
+                    filtro_dev = gr.Dropdown(
+                        label="Filtro",
+                        choices=list(FILTERS),
+                        value="todas",
+                    )
+                    atualizar_dev = gr.Button("Atualizar lista", variant="primary")
+                    proposta_dev = gr.Dropdown(label="Propostas", choices=aya_dev_ui.list_choices(), value=None)
+                    resumo_dev = gr.Textbox(label="Resumo", lines=4)
+                    saida_dev = gr.Textbox(label="Resultado da acao", lines=8)
+
+                    with gr.Accordion("Confirmacoes", open=True):
+                        confirmacao_dev = gr.Textbox(
+                            label="Confirmacao",
+                            placeholder="APROVAR ID, INTEGRAR ID, REV-xxxxxxxx ou REVERTER ID",
+                        )
+                        motivo_reversao_dev = gr.Textbox(label="Motivo da reversao", lines=3)
+                        expandir_diff_dev = gr.Checkbox(label="Expandir diff completo", value=False)
+
+                with gr.Column(scale=8, min_width=520):
+                    with gr.Tabs():
+                        with gr.Tab("Visao geral"):
+                            dev_overview = gr.Textbox(label="Visao geral", lines=18)
+                        with gr.Tab("Plano e manifesto"):
+                            dev_plan = gr.Textbox(label="Plano e manifesto", lines=22)
+                        with gr.Tab("Diff"):
+                            dev_diff = gr.Textbox(label="Diff somente leitura", lines=24)
+                        with gr.Tab("Testes e revisao"):
+                            dev_tests = gr.Textbox(label="Testes e revisao", lines=22)
+                        with gr.Tab("Aprovacao e commit"):
+                            dev_approval = gr.Textbox(label="Aprovacao e commit", lines=22)
+                        with gr.Tab("Integracao"):
+                            dev_integration = gr.Textbox(label="Integracao", lines=22)
+                        with gr.Tab("Reversao"):
+                            dev_reversal = gr.Textbox(label="Reversao", lines=24)
+
+                    with gr.Accordion("Acoes supervisionadas", open=False):
+                        with gr.Row(elem_classes="aya-compact"):
+                            dev_planejar = gr.Button("Planejar")
+                            dev_preparar = gr.Button("Preparar")
+                            dev_revisar = gr.Button("Revisar")
+                            dev_testar = gr.Button("Testar")
+                        with gr.Row(elem_classes="aya-compact"):
+                            dev_aprovar = gr.Button("Aprovar alteracao", variant="primary")
+                            dev_rejeitar = gr.Button("Rejeitar")
+                            dev_aplicar = gr.Button("Criar commit isolado")
+                            dev_integrar = gr.Button("Integrar")
+                        with gr.Row(elem_classes="aya-compact"):
+                            dev_solicitar_rev = gr.Button("Solicitar reversao")
+                            dev_prever_rev = gr.Button("Gerar pre-visualizacao")
+                            dev_aprovar_rev = gr.Button("Aprovar reversao")
+                            dev_reverter = gr.Button("Executar reversao")
+                        dev_descartar = gr.Button("Descartar worktree")
+
+            detail_outputs = [
+                dev_overview,
+                dev_plan,
+                dev_diff,
+                dev_tests,
+                dev_approval,
+                dev_integration,
+                dev_reversal,
+                resumo_dev,
+            ]
+            action_outputs = [saida_dev, *detail_outputs]
+
+            def refresh_dev_choices(state_filter):
+                choices, selected = aya_dev_ui.refresh(state_filter)
+                return gr.update(choices=choices, value=selected)
+
+            atualizar_dev.click(
+                refresh_dev_choices,
+                inputs=filtro_dev,
+                outputs=proposta_dev,
+            )
+            proposta_dev.change(
+                aya_dev_ui.details,
+                inputs=[proposta_dev, expandir_diff_dev],
+                outputs=detail_outputs,
+            )
+            expandir_diff_dev.change(
+                aya_dev_ui.details,
+                inputs=[proposta_dev, expandir_diff_dev],
+                outputs=detail_outputs,
+            )
+
+            def dev_action(action_name):
+                return lambda selected, confirmation, reason: aya_dev_ui.run_action(
+                    selected,
+                    action_name,
+                    confirmation,
+                    reason,
+                )
+
+            dev_planejar.click(dev_action("planejar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_preparar.click(dev_action("preparar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_revisar.click(dev_action("revisar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_testar.click(dev_action("testar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_aprovar.click(dev_action("aprovar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_rejeitar.click(dev_action("rejeitar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_aplicar.click(dev_action("aplicar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_integrar.click(dev_action("integrar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_solicitar_rev.click(dev_action("solicitar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_prever_rev.click(dev_action("prever_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_aprovar_rev.click(dev_action("aprovar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_reverter.click(dev_action("reverter"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+            dev_descartar.click(dev_action("descartar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
 
     return demo
 
