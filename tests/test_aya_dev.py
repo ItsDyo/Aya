@@ -877,6 +877,20 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertTrue(proposal.integration_partial)
         self.assertEqual(proposal.proposal_commit, self._git_head(self.root))
 
+    def test_integrar_reconcilia_commit_ja_na_main_sem_novo_merge(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        subprocess.run(("git", "merge", "--ff-only", proposal.proposal_branch), cwd=self.root, capture_output=True, check=True)
+        validation = [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
+        with (
+            patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=validation),
+            patch.object(self.service, "_post_integration_validation", return_value=validation),
+        ):
+            response = self.service.integrar(proposal.id)
+        self.assertIn("reconciliado", response)
+        self.assertIn("Novo merge executado: nao", response)
+        self.assertEqual("INTEGRADA", proposal.state)
+        self.assertEqual(proposal.proposal_commit, self._git_head(self.root))
+
     def test_integracao_id_nao_chama_modelo(self):
         proposal = self.proposal()
         before = len(self.client.calls)

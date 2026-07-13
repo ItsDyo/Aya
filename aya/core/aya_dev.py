@@ -641,6 +641,8 @@ class AyaDevService:
         proposal = self._get(proposal_id)
         if proposal.state == "INTEGRADA":
             return self._integrated_idempotent_response(proposal)
+        if proposal.state == "COMMIT_PRONTO" and proposal.proposal_commit and self.workspace.head() == proposal.proposal_commit:
+            return self._finalize_already_fast_forwarded(proposal)
         previous = proposal.state
         proposal.state = "VALIDANDO_INTEGRACAO"
         proposal.integration_started_at = datetime.now().isoformat(timespec="seconds")
@@ -1194,7 +1196,7 @@ class AyaDevService:
             return False, "risco nao permitido"
         return True, ""
 
-    def _validate_integration_preconditions(self, proposal: EngineeringProposal) -> None:
+    def _validate_integration_preconditions(self, proposal: EngineeringProposal, allow_integrated_head: bool = False) -> None:
         eligible, reason = self._integration_eligibility(proposal)
         if not eligible:
             raise RuntimeError(reason.upper().replace(" ", "_"))
@@ -1245,7 +1247,11 @@ class AyaDevService:
             raise RuntimeError("MAIN_BRANCH_DIVERGENTE")
         if self._git(("status", "--porcelain"), cwd=self.root, timeout=30).stdout.strip():
             raise RuntimeError("MAIN_SUJA")
-        if self.workspace.head() != proposal.commit_parent:
+        current_head = self.workspace.head()
+        expected_heads = {proposal.commit_parent}
+        if allow_integrated_head:
+            expected_heads.add(proposal.proposal_commit)
+        if current_head not in expected_heads:
             raise RuntimeError("BASE_DIVERGENTE")
         if proposal.workspace_path:
             workspace_path = Path(proposal.workspace_path)
@@ -1268,6 +1274,59 @@ class AyaDevService:
         branch_head = self._git(("rev-parse", proposal.proposal_branch), cwd=self.root, timeout=30).stdout.strip()
         if branch_head != proposal.proposal_commit:
             raise RuntimeError("BRANCH_MUDOU")
+
+    def _finalize_already_fast_forwarded(self, proposal: EngineeringProposal) -> str:
+        previous = proposal.state
+        proposal.integration_started_at = proposal.integration_started_at or datetime.now().isoformat(timespec="seconds")
+        proposal.integration_method = "fast-forward"
+        proposal.previous_main_head = proposal.previous_main_head or proposal.commit_parent
+        proposal.resulting_main_head = self.workspace.head()
+        proposal.integrated_commit = proposal.proposal_commit
+        proposal.main_branch = self._git(("branch", "--show-current"), cwd=self.root, timeout=30).stdout.strip()
+        proposal.pushed = False
+        proposal.remote_used = False
+        proposal.merge_commit_created = False
+        try:
+            self._validate_integration_preconditions(proposal, allow_integrated_head=True)
+            validation = self._validate_commit_in_clean_worktree(proposal)
+            proposal.integration_validation = validation
+            post = self._post_integration_validation(proposal)
+            proposal.post_integration_validation = post
+            if not all(item.get("passed") for item in [*validation, *post]):
+                raise RuntimeError("VALIDACAO_DE_RECONCILIACAO_REPROVADA")
+            cleanup = self._cleanup_integrated_worktree(proposal)
+            proposal.integration_cleanup_result = cleanup
+            proposal.workspace_cleaned = "removido" in cleanup.lower()
+            if proposal.workspace_cleaned:
+                proposal.workspace = ""
+                proposal.worktree_cleanup_pending = False
+            else:
+                proposal.worktree_cleanup_pending = True
+            proposal.integrated_at = datetime.now().isoformat(timespec="seconds")
+            proposal.integration_success = True
+            proposal.integration_partial = False
+            proposal.state = "INTEGRADA"
+            self._event(proposal, "integracao reconciliada sem novo merge", previous, proposal.state)
+            self._save()
+            return "\n".join([
+                "Proposta ja estava fast-forwarded na main; estado reconciliado.",
+                f"- Commit integrado: {proposal.integrated_commit}",
+                f"- Main antes: {proposal.previous_main_head}",
+                f"- Main depois: {proposal.resulting_main_head}",
+                "- Novo merge executado: nao",
+                "- Push executado: nao",
+                f"- Validacao previa: {self._checks_status(proposal.integration_validation)}",
+                f"- Validacao posterior: {self._checks_status(proposal.post_integration_validation)}",
+                f"- Limpeza do worktree: {proposal.integration_cleanup_result}",
+                "- Estado final: INTEGRADA",
+            ])
+        except Exception as exc:
+            proposal.state = "INTEGRACAO_BLOQUEADA"
+            proposal.integration_partial = True
+            proposal.integration_block_reason = self.workspace.sanitize(str(exc))
+            self._event(proposal, "reconciliacao de integracao bloqueada", previous, proposal.state)
+            self._save()
+            return f"Integracao parcial registrada: {proposal.integration_block_reason}."
 
     def _validate_commit_in_clean_worktree(self, proposal: EngineeringProposal) -> list[dict]:
         target = self.workspace.workspace_root / f"integration-{proposal.id}-{uuid.uuid4().hex[:8]}"
