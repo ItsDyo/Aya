@@ -1339,6 +1339,7 @@ class AyaDevService:
         ])
 
     def _commit_files(self, commit: str) -> list[str]:
+        """Return files changed by a recorded commit."""
         return self._git(("diff-tree", "--no-commit-id", "--name-only", "-r", commit), cwd=self.root, timeout=30).stdout.splitlines()
 
     def _check_command(self, name: str, command: tuple[str, ...], timeout: int, cwd: Path) -> CheckResult:
