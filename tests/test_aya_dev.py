@@ -984,6 +984,19 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertTrue(proposal.reversal_preview_main_unchanged)
         self.assertTrue(proposal.reversal_preview_workspace_cleaned)
 
+    def test_prever_reversao_real_nao_cria_commit_na_main(self):
+        proposal = self._prepare_integrated_for_reversal()
+        main_before = self._git_head(self.root)
+        self.service.solicitar_reversao(f"{proposal.id} motivo real")
+        response = self.service.prever_reversao(proposal.id)
+        self.assertIn("Previsao de reversao pronta", response)
+        self.assertEqual(main_before, self._git_head(self.root))
+        self.assertIn('"""Executa sample."""', proposal.reversal_preview_diff)
+        self.assertEqual(["aya/core/sample.py"], proposal.reversal_preview_files)
+        self.assertEqual("AGUARDANDO_APROVACAO_REVERSAO", proposal.state)
+        self.assertTrue(proposal.reversal_preview_workspace_cleaned)
+        self.assertFalse(any(path.name.startswith("preview-reversal-") for path in self.workspaces.glob("*")))
+
     def test_prever_reversao_mesma_previsao_mantem_hash(self):
         proposal = self._prepare_integrated_for_reversal()
         self.service.solicitar_reversao(f"{proposal.id} motivo real")

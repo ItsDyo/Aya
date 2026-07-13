@@ -1729,13 +1729,13 @@ class AyaDevService:
                     "valid": False,
                     "invalidated_reason": "CONFLITO_REVERSAO",
                 }
-            diff = self._git(("diff", "--no-ext-diff", "--"), cwd=target, timeout=30).stdout
+            diff = self._git(("diff", "--no-ext-diff", "HEAD", "--"), cwd=target, timeout=30).stdout
             files, added, removed = self._preview_numstat(target)
             for rel in files:
                 error = self.workspace._path_error(rel)
                 if error:
                     raise RuntimeError(error)
-            results.append(self._check_command("git diff --check", ("git", "diff", "--check"), 30, target))
+            results.append(self._check_command("git diff --check", ("git", "diff", "--check", "HEAD"), 30, target))
             results.extend(self.workspace.validate(target, self._related_tests(proposal)))
             abort = self.workspace._run(("git", "revert", "--abort"), target, 60)
             if abort.returncode != 0:
@@ -1814,7 +1814,7 @@ class AyaDevService:
         proposal.approved_reversal_validation_sha256 = ""
 
     def _preview_numstat(self, cwd: Path) -> tuple[list[str], int, int]:
-        result = self._git(("diff", "--numstat"), cwd=cwd, timeout=30)
+        result = self._git(("diff", "--numstat", "HEAD"), cwd=cwd, timeout=30)
         files: list[str] = []
         added = 0
         removed = 0
