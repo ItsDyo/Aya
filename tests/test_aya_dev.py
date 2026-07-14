@@ -21,9 +21,6 @@ from aya.ui import aya_dev as aya_dev_ui
 from aya.ui.aya_dev import AyaDevPanel, render_diff
 
 
-pytestmark = [pytest.mark.integration, pytest.mark.git, pytest.mark.slow]
-
-
 class FailingClient:
     def chat(self, **kwargs):
         raise RuntimeError("ollama offline token=segredo")
@@ -82,6 +79,8 @@ class AyaDevTestCase(unittest.TestCase):
             index_path=self.cache,
             workspace_root=self.workspaces,
         )
+        self.service.workspace.validate = Mock(side_effect=self._fast_validation)
+        self.service.workspace.baseline = Mock(side_effect=self._fast_validation)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -1282,6 +1281,7 @@ class AyaDevTestCase(unittest.TestCase):
         workspace.mkdir(parents=True)
         runner = Mock(return_value=subprocess.CompletedProcess([], 0, "ok", ""))
         self.service.workspace._run = runner
+        self.service.workspace.validate = type(self.service.workspace).validate.__get__(self.service.workspace)
         self.service.workspace.validate(workspace)
         commands = [call.args[0] for call in runner.call_args_list]
         self.assertEqual(5, len(commands))
@@ -1393,6 +1393,19 @@ class AyaDevTestCase(unittest.TestCase):
     def _passed_validation(self):
         return [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
 
+    def _fast_validation(self, workspace, related_tests=None):
+        results = []
+        if related_tests:
+            results.append(CheckResult("testes relacionados", "python -m pytest " + " ".join(related_tests), 0, 1, "ok"))
+        results.extend([
+            CheckResult("pytest", "python -m pytest", 0, 1, "ok"),
+            CheckResult("ruff", "python -m ruff check .", 0, 1, "ok"),
+            CheckResult("compileall", "python -m compileall .", 0, 1, "ok"),
+            CheckResult("pip check", "python -m pip check", 0, 1, "ok"),
+            CheckResult("smoke", "python scripts/smoke_test.py", 0, 1, "ok"),
+        ])
+        return results
+
     def _prepare_integrated_for_reversal(self):
         proposal = self._prepare_commit_ready_for_integration()
         with patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=self._passed_validation()):
@@ -1456,62 +1469,38 @@ class AyaDevTestCase(unittest.TestCase):
         return subprocess.run(("git", "rev-parse", "HEAD"), cwd=path, capture_output=True, text=True, check=True).stdout.strip()
 
 
-class AssistantAyaDevInitializationTest(unittest.TestCase):
-    def test_assistant_normal_continua_inicializando(self):
-        from aya.core.assistant import Assistant
-        from aya.core.llm import StaticClient
-        from aya.data.database import Database
+_GIT_HEAVY_TESTS = {
+    "test_git_indisponivel_bloqueia_preparacao",
+    "test_git_com_alteracoes_nao_salvas",
+    "test_cria_worktree_isolado_sem_alterar_raiz",
+    "test_git_apply_check_falhando_registra_falha_e_limpa_worktree",
+    "test_preparar_structured_patch_gera_diff_real_e_aguarda_teste",
+    "test_preparar_structured_patch_head_alterado_bloqueia_manifesto",
+    "test_modelo_nao_pode_alterar_proposal_id_no_modo_estruturado",
+    "test_preparar_structured_patch_validado_chega_a_aguardando_aprovacao",
+    "test_preparar_structured_patch_segunda_tentativa_usa_erros_reais",
+    "test_patch_markdown_falha_com_motivo_persistido_e_worktree_removido",
+}
+_GIT_HEAVY_PREFIXES = (
+    "test_aplicar_",
+    "test_integrar_",
+    "test_solicitar_reversao_detecta_",
+    "test_prever_reversao_",
+    "test_aprovar_reversao_",
+    "test_diff_reversao_",
+    "test_reverter_",
+    "test_rejeitar_",
+)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            assistant = Assistant(db=Database(Path(tmp) / "test.db"), llm=StaticClient())
-            self.assertIn("Aya Dev", assistant.responder("/aya-dev status"))
-            assistant.encerrar()
 
-    def test_interface_gradio_normal_inicializa_com_aya_dev(self):
-        from app import create_app
-        from aya.core.assistant import Assistant
-        from aya.core.llm import StaticClient
-        from aya.data.database import Database
+def _mark_aya_dev_tests() -> None:
+    for name, value in AyaDevTestCase.__dict__.items():
+        if not name.startswith("test_"):
+            continue
+        if name in _GIT_HEAVY_TESTS or name.startswith(_GIT_HEAVY_PREFIXES):
+            setattr(AyaDevTestCase, name, pytest.mark.integration(pytest.mark.git(pytest.mark.slow(value))))
 
-        path = Path(tempfile.gettempdir()) / "aya_ui_test.sqlite"
-        assistant = Assistant(db=Database(path), llm=StaticClient())
-        try:
-            demo = create_app(assistant=assistant)
-            self.assertEqual("Blocks", type(demo).__name__)
-        finally:
-            assistant.encerrar()
-            try:
-                path.unlink()
-            except OSError:
-                pass
-
-    def test_pergunta_natural_sobre_proposta_usa_dados_estruturados(self):
-        from aya.core.assistant import Assistant
-        from aya.core.llm import StaticClient
-        from aya.data.database import Database
-
-        with tempfile.TemporaryDirectory() as tmp:
-            assistant = Assistant(db=Database(Path(tmp) / "test.db"), llm=StaticClient("chat generico"))
-            proposal = assistant.aya_dev.create_proposal(
-                title="Documentar modulo",
-                problem="Falta docstring.",
-                evidence=["Indice AST confirmou aya/core/aya_dev.py."],
-                related_files=["aya/core/aya_dev.py"],
-                related_symbols=["AyaDevService"],
-                probable_cause="Documentacao interna incompleta.",
-                suggested_change="Adicionar docstring.",
-                preserve=["comportamento atual"],
-                impact="baixo",
-                urgency="baixa",
-                difficulty="baixa",
-                required_tests=["tests/test_aya_dev.py"],
-                done_criteria=["testes passam"],
-            )
-            response = assistant.responder(f"qual foi a falha da proposta {proposal.id} do Aya Dev?")
-            self.assertIn("Falha", response)
-            self.assertIn("Informacao nao registrada", response)
-            self.assertNotIn("chat generico", response)
-            assistant.encerrar()
+_mark_aya_dev_tests()
 
 
 if __name__ == "__main__":

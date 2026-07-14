@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -1317,7 +1318,14 @@ class AyaDevService:
         payload = [asdict(item) for item in sorted(self.proposals.values(), key=lambda value: value.created_at)]
         text = json.dumps(payload, ensure_ascii=True, indent=2)
         temporary.write_text(self.workspace.sanitize(text, max(len(text), 5000)), encoding="utf-8")
-        temporary.replace(self.storage_path)
+        for attempt in range(5):
+            try:
+                temporary.replace(self.storage_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
 
     def _record_failure(self, proposal: EngineeringProposal, stage: str, reason: str, message: str) -> None:
         proposal.failure_stage = stage
