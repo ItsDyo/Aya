@@ -602,6 +602,8 @@ Sistema:
 
     def _comando_release(self, resto: str = "") -> str:
         acao = (resto or "").lower()
+        if "perfil-testes" in acao or "perfil testes" in acao:
+            return self.release.perfil_testes(acao)
         if "executar" in acao or "validar" in acao or "rodar" in acao:
             mode = "rapido" if "rapido" in acao or "rápido" in acao else "completo"
             reuse = "reutilizar" in acao or "reusar" in acao

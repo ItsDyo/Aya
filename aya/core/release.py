@@ -12,6 +12,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 from typing import Protocol
 
 from aya.data.database import Database
@@ -90,11 +91,11 @@ CHECK_STATES = {
 @dataclass(frozen=True)
 class ReleaseTimeoutConfig:
     pytest_related: int = 600
-    pytest_complete: int = 2400
+    pytest_complete: int = 3600
     tool: int = 300
     adaptive_factor: float = 1.5
     adaptive_minimum: int = 900
-    adaptive_maximum: int = 2400
+    adaptive_maximum: int = 3600
     reuse_window_seconds: int = 7200
 
     @classmethod
@@ -102,11 +103,11 @@ class ReleaseTimeoutConfig:
         base = cls()
         return cls(
             pytest_related=_bounded_env_int("AYA_RELEASE_RELATED_PYTEST_TIMEOUT", base.pytest_related, 60, 2400),
-            pytest_complete=_bounded_env_int("AYA_RELEASE_PYTEST_TIMEOUT", base.pytest_complete, 60, 2400),
+            pytest_complete=_bounded_env_int("AYA_RELEASE_PYTEST_TIMEOUT", base.pytest_complete, 60, 5400),
             tool=_bounded_env_int("AYA_RELEASE_TOOL_TIMEOUT", base.tool, 30, 1200),
             adaptive_factor=float(os.getenv("AYA_RELEASE_ADAPTIVE_FACTOR", str(base.adaptive_factor))),
-            adaptive_minimum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MINIMUM", base.adaptive_minimum, 60, 2400),
-            adaptive_maximum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MAXIMUM", base.adaptive_maximum, 60, 3600),
+            adaptive_minimum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MINIMUM", base.adaptive_minimum, 60, 3600),
+            adaptive_maximum=_bounded_env_int("AYA_RELEASE_ADAPTIVE_MAXIMUM", base.adaptive_maximum, 60, 5400),
             reuse_window_seconds=_bounded_env_int(
                 "AYA_RELEASE_REUSE_WINDOW_SECONDS",
                 base.reuse_window_seconds,
@@ -175,6 +176,8 @@ def _bounded_env_int(name: str, default: int, minimum: int, maximum: int) -> int
 class ReleaseReportService:
     """Gera um relatorio honesto de release sem inventar testes nao executados."""
 
+    FAST_MARK_EXPR = "not integration and not slow and not ollama and not release_full"
+
     def __init__(
         self,
         db: Database,
@@ -189,6 +192,7 @@ class ReleaseReportService:
         self.diagnostics_provider = diagnostics_provider
         self.releases_dir = releases_dir or LOGS_DIR / "releases"
         self.evidence_dir = LOGS_DIR / "release_evidence"
+        self.test_profiles_dir = LOGS_DIR / "test_profiles"
         self.runner = runner
         self.timeout_config = timeout_config or ReleaseTimeoutConfig.from_env()
 
@@ -290,6 +294,75 @@ class ReleaseReportService:
             f"- Conflitos: {anterior.conflicts} -> {atual.conflicts}",
             f"- SQLite quick_check: {anterior.quick_check} -> {atual.quick_check}",
         ])
+        return "\n".join(lines)
+
+    def perfil_testes(self, action: str = "") -> str:
+        action = (action or "").strip().lower()
+        if "historico" in action:
+            return self.perfil_testes_historico()
+        if "ultimo" in action:
+            return self.perfil_testes_ultimo()
+        mode = "rapido" if "rapido" in action or "rápido" in action else "completo"
+        created_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_path = self.test_profiles_dir / f"test_profile_{created_at}_{mode}.json"
+        command = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-p",
+            "scripts.pytest_profile_plugin",
+            "--aya-profile-output",
+            str(json_path),
+            *self._pytest_args_for_mode(mode),
+        ]
+        timeout, _source = self._timeout_for_check("pytest", mode)
+        started = time.perf_counter()
+        try:
+            result = self.runner(command, timeout)
+        except subprocess.TimeoutExpired:
+            return f"Perfil de testes excedeu {timeout}s e ficou incompleto. Arquivo esperado: {json_path}"
+        duration = time.perf_counter() - started
+        if not json_path.exists():
+            return f"Perfil de testes nao foi gerado. Codigo: {getattr(result, 'returncode', 'indisponivel')}"
+        data = self._load_profile(json_path)
+        markdown = self._profile_markdown(data)
+        md_path = json_path.with_suffix(".md")
+        md_path.write_text(markdown, encoding="utf-8")
+        status = "APROVADO" if result.returncode == 0 else "REPROVADO"
+        return "\n".join(
+            [
+                "Perfil de desempenho dos testes:",
+                f"- Modo: {mode}",
+                f"- Status: {status}",
+                f"- Duracao observada pelo comando: {duration:.1f}s",
+                f"- Testes coletados: {data.get('total_collected', 'indisponivel')}",
+                f"- Testes aprovados: {data.get('total_passed', 'indisponivel')}",
+                f"- JSON: {json_path}",
+                f"- Markdown: {md_path}",
+                "A suite rapida nao substitui o release completo.",
+            ]
+        )
+
+    def perfil_testes_ultimo(self) -> str:
+        latest = self._latest_profile()
+        if not latest:
+            return "Nenhum perfil de testes encontrado em logs/test_profiles/."
+        md_path = latest.with_suffix(".md")
+        if md_path.exists():
+            return self._trim_output(md_path.read_text(encoding="utf-8", errors="replace"), limit=8000)
+        return self._profile_markdown(self._load_profile(latest))
+
+    def perfil_testes_historico(self, limite: int = 8) -> str:
+        profiles = self._profile_files()
+        if not profiles:
+            return "Nenhum perfil de testes encontrado em logs/test_profiles/."
+        lines = ["Historico de perfis de teste:"]
+        for path in profiles[:limite]:
+            data = self._load_profile(path)
+            lines.append(
+                f"- {path.name} | collected={data.get('total_collected')} | "
+                f"passed={data.get('total_passed')} | duracao_ms={data.get('total_duration_ms')}"
+            )
         return "\n".join(lines)
 
     def _snapshot(self) -> ReleaseSnapshot:
@@ -443,6 +516,8 @@ class ReleaseReportService:
             lines.append(f"  origem_timeout: {check.timeout_source}")
             lines.append(f"  origem_resultado: {check.result_origin}")
             lines.append(f"  evidencia_id: {check.validation_id or 'nao registrada'}")
+            if check.name == "pytest" and " -m " in f" {check.command_text} ":
+                self._append_pytest_scope(lines, check)
             if check.interpretation:
                 lines.append(f"  interpretacao: {check.interpretation}")
             if check.output:
@@ -497,9 +572,8 @@ class ReleaseReportService:
         return "PARCIAL"
 
     def _checks_for_mode(self, mode: str) -> list[tuple[str, list[str], str]]:
-        pytest_command = [sys.executable, "-m", "pytest"]
-        if self._normalize_mode(mode) == "rapido":
-            pytest_command = [sys.executable, "-m", "pytest", "tests/test_aya.py", "-k", "release"]
+        mode = self._normalize_mode(mode)
+        pytest_command = [sys.executable, "-m", "pytest", *self._pytest_args_for_mode(mode)]
         return [
             ("pytest", pytest_command, "suite_completa" if mode == "completo" else "release_curto"),
             ("ruff", [sys.executable, "-m", "ruff", "check", "."], "codigo_estatico"),
@@ -507,6 +581,11 @@ class ReleaseReportService:
             ("pip check", [sys.executable, "-m", "pip", "check"], "dependencias"),
             ("smoke_test.py", [sys.executable, "scripts\\smoke_test.py"], "smoke"),
         ]
+
+    def _pytest_args_for_mode(self, mode: str) -> list[str]:
+        if self._normalize_mode(mode) == "rapido":
+            return ["-m", self.FAST_MARK_EXPR]
+        return []
 
     def _timeout_for_check(self, name: str, mode: str) -> tuple[int, str]:
         if name == "pytest" and self._normalize_mode(mode) == "completo":
@@ -734,6 +813,170 @@ class ReleaseReportService:
             result_origin="reutilizado",
             validation_id=evidence.validation_id,
         )
+
+    def _append_pytest_scope(self, lines: list[str], check: ReleaseCheck) -> None:
+        command = check.command_text
+        if f"-m {self.FAST_MARK_EXPR}" in command:
+            lines.append(f"  selecao: {self.FAST_MARK_EXPR}")
+            lines.append("  aviso: A suite rapida nao substitui o release completo.")
+        else:
+            lines.append("  selecao: suite completa sem filtro de marcadores")
+        collected, deselected = self._parse_pytest_counts(check.output)
+        if collected is not None:
+            lines.append(f"  testes_coletados: {collected}")
+        if deselected is not None:
+            lines.append(f"  testes_excluidos: {deselected}")
+            lines.append(f"  testes_executados_estimados: {max(0, (collected or 0) - deselected)}")
+
+    def _parse_pytest_counts(self, output: str) -> tuple[int | None, int | None]:
+        collected = None
+        deselected = None
+        match = re.search(r"collected\s+(\d+)\s+items", output or "")
+        if match:
+            collected = int(match.group(1))
+        match = re.search(r"(\d+)\s+deselected", output or "")
+        if match:
+            deselected = int(match.group(1))
+        return collected, deselected
+
+    def _load_profile(self, path: Path) -> dict:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def _profile_files(self) -> list[Path]:
+        if not self.test_profiles_dir.exists():
+            return []
+        files = []
+        for path in self.test_profiles_dir.glob("*.json"):
+            try:
+                if "profile_id" in self._load_profile(path):
+                    files.append(path)
+            except (OSError, json.JSONDecodeError):
+                continue
+        return sorted(files, key=lambda item: item.stat().st_mtime, reverse=True)
+
+    def _latest_profile(self) -> Path | None:
+        profiles = self._profile_files()
+        return profiles[0] if profiles else None
+
+    def _profile_markdown(self, data: dict) -> str:
+        tests = data.get("tests", [])
+        commands = data.get("commands", [])
+        by_file = defaultdict(int)
+        by_marker = defaultdict(int)
+        marker_counts = defaultdict(int)
+        for test in tests:
+            by_file[test.get("nodeid", "").split("::", 1)[0]] += int(test.get("total_ms", 0))
+            markers = test.get("markers") or ["unit/inferido"]
+            for marker in markers:
+                by_marker[marker] += int(test.get("total_ms", 0))
+                marker_counts[marker] += 1
+        total = max(1, int(data.get("total_duration_ms", 0)))
+        slowest = sorted(tests, key=lambda item: int(item.get("total_ms", 0)), reverse=True)
+        top10_ms = sum(int(test.get("total_ms", 0)) for test in slowest[:10])
+        lines = [
+            "# Perfil de desempenho dos testes",
+            "",
+            f"- Perfil: {data.get('profile_id')}",
+            f"- HEAD: {data.get('project_head')}",
+            f"- Duracao total: {total} ms",
+            f"- Coletados: {data.get('total_collected')}",
+            f"- Aprovados: {data.get('total_passed')}",
+            f"- Falhas: {data.get('total_failed')}",
+            f"- Pulados: {data.get('total_skipped')}",
+            f"- Python: {data.get('python_version')}",
+            f"- Pytest: {data.get('pytest_version')}",
+            f"- Top 10 testes: {top10_ms} ms de {total} ms ({(top10_ms / total) * 100:.1f}%)",
+            "",
+            "## 20 testes mais lentos",
+            *self._format_profile_rows(slowest[:20], "total_ms"),
+            "",
+            "## 20 setups mais lentos",
+            *self._format_profile_rows(sorted(tests, key=lambda item: int(item.get("setup_ms", 0)), reverse=True)[:20], "setup_ms"),
+            "",
+            "## 20 teardowns mais lentos",
+            *self._format_profile_rows(sorted(tests, key=lambda item: int(item.get("teardown_ms", 0)), reverse=True)[:20], "teardown_ms"),
+            "",
+            "## Duracao acumulada por arquivo",
+            *[f"- {value} ms | {name}" for name, value in sorted(by_file.items(), key=lambda item: item[1], reverse=True)[:20]],
+            "",
+            "## Duracao acumulada por marcador",
+            *[f"- {value} ms | {name}" for name, value in sorted(by_marker.items(), key=lambda item: item[1], reverse=True)[:20]],
+            "",
+            "## Quantidade por categoria",
+            *[f"- {name}: {count}" for name, count in sorted(marker_counts.items())],
+            "",
+            "## Limites",
+            *self._threshold_lines(tests),
+            "",
+            "## Comandos externos mais caros",
+            *[
+                f"- {cmd.get('total_ms')} ms | {cmd.get('count')}x | {cmd.get('command')}"
+                for cmd in sorted(commands, key=lambda item: int(item.get("total_ms", 0)), reverse=True)[:20]
+            ],
+            "",
+            "## Comparacao com perfil anterior",
+            *self._profile_comparison_lines(data),
+        ]
+        return "\n".join(lines)
+
+    def _format_profile_rows(self, tests: list[dict], field: str) -> list[str]:
+        if not tests:
+            return ["- sem dados"]
+        return [f"- {int(test.get(field, 0))} ms | {test.get('nodeid')}" for test in tests]
+
+    def _threshold_lines(self, tests: list[dict]) -> list[str]:
+        lines = []
+        for seconds in (1, 5, 10, 30, 60):
+            threshold = seconds * 1000
+            count = sum(1 for test in tests if int(test.get("total_ms", 0)) >= threshold)
+            lines.append(f"- >= {seconds}s: {count} teste(s)")
+        return lines
+
+    def _profile_comparison_lines(self, current: dict) -> list[str]:
+        profiles = [path for path in self._profile_files() if path.name != self._profile_name(current)]
+        if not profiles:
+            return ["- Perfil anterior indisponivel."]
+        previous = self._load_profile(profiles[0])
+        before = int(previous.get("total_duration_ms", 0))
+        after = int(current.get("total_duration_ms", 0))
+        diff = after - before
+        percent = (diff / before * 100) if before else 0
+        tolerance_ms = 1000
+        tolerance_percent = 5.0
+        signal = "dentro da tolerancia" if abs(diff) < tolerance_ms or abs(percent) < tolerance_percent else "mudanca relevante"
+        return [
+            f"- Anterior: {previous.get('profile_id')} ({before} ms)",
+            f"- Atual: {current.get('profile_id')} ({after} ms)",
+            f"- Diferenca: {diff} ms ({percent:.1f}%) - {signal}",
+            *self._profile_delta_lines(previous, current),
+        ]
+
+    def _profile_name(self, data: dict) -> str:
+        profile_id = str(data.get("profile_id", ""))
+        for path in self._profile_files():
+            try:
+                if self._load_profile(path).get("profile_id") == profile_id:
+                    return path.name
+            except Exception:
+                continue
+        return ""
+
+    def _profile_delta_lines(self, previous: dict, current: dict) -> list[str]:
+        previous_tests = {test.get("nodeid"): test for test in previous.get("tests", [])}
+        current_tests = {test.get("nodeid"): test for test in current.get("tests", [])}
+        added = sorted(set(current_tests) - set(previous_tests))
+        removed = sorted(set(previous_tests) - set(current_tests))
+        deltas = []
+        for nodeid in sorted(set(previous_tests) & set(current_tests)):
+            diff = int(current_tests[nodeid].get("total_ms", 0)) - int(previous_tests[nodeid].get("total_ms", 0))
+            if abs(diff) >= 1000:
+                deltas.append((diff, nodeid))
+        slower = sorted([item for item in deltas if item[0] > 0], reverse=True)[:5]
+        faster = sorted([item for item in deltas if item[0] < 0])[:5]
+        lines = [f"- Testes adicionados: {len(added)}", f"- Testes removidos: {len(removed)}"]
+        lines.extend(f"- Mais lento: +{diff} ms | {nodeid}" for diff, nodeid in slower)
+        lines.extend(f"- Mais rapido: {diff} ms | {nodeid}" for diff, nodeid in faster)
+        return lines
 
     def _risks(self, snapshot: ReleaseSnapshot) -> list[str]:
         risks: list[str] = []

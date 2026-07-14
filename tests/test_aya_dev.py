@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import pytest
+
 from aya.core.aya_dev import AyaDevService
 from aya.core.dev_workspace import CheckResult, GitState
 from aya.core.llm import StaticClient
@@ -17,6 +19,9 @@ from aya.core.project_tools import ProjectTools
 from aya.core.structured_patch import PATCH_MANIFEST_SCHEMA, StructuredPatchError
 from aya.ui import aya_dev as aya_dev_ui
 from aya.ui.aya_dev import AyaDevPanel, render_diff
+
+
+pytestmark = [pytest.mark.integration, pytest.mark.git, pytest.mark.slow]
 
 
 class FailingClient:

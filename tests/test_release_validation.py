@@ -5,10 +5,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from aya.core.assistant import Assistant
 from aya.core.llm import StaticClient
 from aya.core.release import ReleaseTimeoutConfig
 from aya.data.database import Database
+
+
+pytestmark = pytest.mark.release_full
 
 
 class ReleaseValidationTest(unittest.TestCase):
@@ -92,7 +97,7 @@ class ReleaseValidationTest(unittest.TestCase):
         self.assertIn("ERRO_INTERNO", resposta)
         self.assertIn("Status geral: ERRO", resposta)
 
-    def test_modo_rapido_usa_escopo_curto(self):
+    def test_modo_rapido_usa_filtro_oficial(self):
         comandos = []
 
         def runner(command, timeout):
@@ -103,8 +108,8 @@ class ReleaseValidationTest(unittest.TestCase):
 
         self.aya.responder("/release validar rapido")
 
-        self.assertIn("tests/test_aya.py", comandos[0])
-        self.assertIn("-k", comandos[0])
+        self.assertIn("-m", comandos[0])
+        self.assertIn("not integration and not slow and not ollama and not release_full", comandos[0])
 
     def test_modo_completo_e_compatibilidade_validar(self):
         comandos = []
@@ -135,8 +140,8 @@ class ReleaseValidationTest(unittest.TestCase):
             invalido = ReleaseTimeoutConfig.from_env()
 
         self.assertEqual(60, baixo.pytest_complete)
-        self.assertEqual(2400, alto.pytest_complete)
-        self.assertEqual(2400, invalido.pytest_complete)
+        self.assertEqual(5400, alto.pytest_complete)
+        self.assertEqual(3600, invalido.pytest_complete)
 
     def test_timeout_adaptativo_minimo_maximo_e_historico_timeout_nao_reduz(self):
         service = self.aya.release
