@@ -46,6 +46,16 @@ ENGINEERING_MEMORY_EVENT_STATES = {
     "REVERSAO_PARCIAL",
     "REVERTIDA",
 }
+AUTONOMY_POLICY_VERSION = 1
+AUTONOMY_MODES = {"DESLIGADA", "OBSERVAR", "PREPARAR_SUPERVISIONADO"}
+AUTONOMY_MIN_CASES = 3
+AUTONOMY_MIN_SUCCESSES = 2
+AUTONOMY_ALLOWED_OPERATIONS = {"insert_docstring", "replace_exact"}
+AUTONOMY_BLOCKED_TERMS = {
+    ".env", "credencial", "autenticacao", "permissao", "seguranca", "security", "tailscale", "remoto",
+    "banco", "database", "aya/data", "sqlite", "schema", "migracao", "memoria", "rag", "backup", "voz", "subprocess",
+    "git", "release", "dependencia",
+}
 
 
 @dataclass
@@ -185,6 +195,32 @@ class EngineeringMemoryEntry:
     created_at: str
 
 
+@dataclass
+class AutonomousCandidate:
+    candidate_id: str
+    detected_at: str
+    source: str
+    title: str
+    problem: str
+    evidence: list[str]
+    category: str
+    operation_type: str
+    files: list[str]
+    symbols: list[str]
+    estimated_changed_lines: int
+    risk: str
+    required_tests: list[str]
+    confidence: str
+    eligibility: str
+    blocked_reasons: list[str]
+    related_lessons: list[str]
+    similar_proposals: list[str]
+    policy_version: int
+    score: int
+    score_explanation: list[str]
+    record_sha256: str
+
+
 class AyaDevService:
     """Modo de engenharia local supervisionado e sem aplicacao no projeto principal."""
 
@@ -208,6 +244,7 @@ class AyaDevService:
         self.storage_path = Path(storage_path or data_dir / "aya_dev_history.json")
         memory_dir = self.storage_path.parent if storage_path is not None else data_dir
         self.engineering_memory_path = Path(engineering_memory_path or memory_dir / "aya_dev_engineering_memory.jsonl")
+        self.autonomy_path = memory_dir / "aya_dev_autonomy.json"
         self.index = TechnicalIndex(self.root, index_path or data_dir / "aya_dev_index.json")
         self.workspace = DevWorkspace(self.root, workspace_root)
         self.structured_patch = StructuredPatchApplier(
@@ -240,9 +277,25 @@ class AyaDevService:
             "memoria-tecnica": self.engineering_memory,
             "memoria-tecnica-listar": self.engineering_memory,
             "memoria": self.engineering_memory,
+            "autonomia-status": self.autonomy_status,
+            "avaliar-autonomia": self.evaluate_autonomy,
+            "candidatos": self.list_candidates,
+            "fila-autonoma": self.autonomous_queue,
         }
         if action in handlers:
             return handlers[action]()
+        if action == "autonomia":
+            return self.set_autonomy_mode(argument.strip())
+        if action == "selecionar-candidato":
+            return self.select_candidate(argument.strip())
+        if action == "executar-candidato":
+            return self.execute_candidate(argument.strip())
+        if action == "executar-ciclo-seguro":
+            return self.execute_safe_autonomous_cycle()
+        if action == "explicar-selecao":
+            return self.explain_candidate(argument.strip())
+        if action == "cancelar-candidato":
+            return self.cancel_candidate(argument.strip())
         if action == "registrar-memoria":
             return self.register_engineering_memory(argument.strip())
         if action in {
@@ -1247,6 +1300,225 @@ class AyaDevService:
         self._append_engineering_memory(entry)
         return f"Memoria tecnica registrada: {entry.id}."
 
+    def autonomy_status(self) -> str:
+        state = self._load_autonomy_state()
+        candidates = self._autonomous_candidates()
+        return "\n".join([
+            "Autonomia supervisionada do Aya Dev:",
+            f"- Modo: {state['mode']}",
+            f"- Politica: v{AUTONOMY_POLICY_VERSION}",
+            f"- Candidatos detectados agora: {len(candidates)}",
+            f"- Candidato selecionado: {state.get('selected_candidate_id') or 'nenhum'}",
+            f"- Ciclo em execucao: {state.get('active_proposal_id') or 'nenhum'}",
+            "- Limite: uma tarefa por comando; para em AGUARDANDO_APROVACAO.",
+        ])
+
+    def set_autonomy_mode(self, payload: str) -> str:
+        requested = (payload or "").strip().lower().replace("_", "-")
+        mapping = {
+            "desligada": "DESLIGADA",
+            "desligado": "DESLIGADA",
+            "observar": "OBSERVAR",
+            "preparar-supervisionado": "PREPARAR_SUPERVISIONADO",
+        }
+        mode = mapping.get(requested)
+        if not mode:
+            return "Use: /aya-dev autonomia desligada|observar|preparar-supervisionado"
+        state = self._load_autonomy_state()
+        before = state["mode"]
+        state["mode"] = mode
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_autonomy_state(state)
+        self._autonomy_event("autonomy_mode_changed", {"before": before, "after": mode})
+        return f"Modo de autonomia alterado: {before} -> {mode}."
+
+    def evaluate_autonomy(self) -> str:
+        candidates = self._autonomous_candidates()
+        stats = self._operation_stats()
+        lines = [
+            "Avaliacao de autonomia do Aya Dev:",
+            f"- Politica: v{AUTONOMY_POLICY_VERSION}",
+            f"- HEAD: {self._safe_head()}",
+            "- Periodo analisado: historico persistido completo do Aya Dev",
+            f"- Quantidade minima exigida: {AUTONOMY_MIN_CASES} casos, {AUTONOMY_MIN_SUCCESSES} sucessos locais",
+            f"- Amostra disponivel: {sum(item['total'] for item in stats.values())} operacao(oes)",
+            "- Categorias elegiveis: documentacao, mensagem_tecnica, teste_caracterizacao, import_nao_usado",
+            "- Categorias bloqueadas: seguranca, banco, memoria, rag, remoto, voz, release, git interno, dependencias",
+            f"- Operacoes avaliadas: {', '.join(sorted(AUTONOMY_ALLOWED_OPERATIONS))}",
+        ]
+        for operation in sorted(AUTONOMY_ALLOWED_OPERATIONS):
+            item = stats.get(operation, {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0})
+            status = self._operation_policy_status(operation, item)
+            lines.append(
+                f"- {operation}: total={item['total']}; sucesso={item['success']}; falhas={item['fail']}; "
+                f"primeira_tentativa={item['first_attempt_success']}; escalonamentos={item['escalated']}; politica={status}"
+            )
+        blocked = sum(1 for candidate in candidates if candidate.eligibility == "BLOQUEADO")
+        eligible = sum(1 for candidate in candidates if candidate.eligibility == "ELEGIVEL")
+        insufficient = sum(1 for candidate in candidates if candidate.eligibility == "DADOS_INSUFICIENTES")
+        lines.extend([
+            f"- Candidatos detectados: {len(candidates)}",
+            f"- Elegiveis: {eligible}",
+            f"- Dados insuficientes: {insufficient}",
+            f"- Bloqueados: {blocked}",
+        ])
+        self._autonomy_event("autonomy_evaluated", {"candidates": len(candidates), "eligible": eligible})
+        return "\n".join(lines)
+
+    def list_candidates(self) -> str:
+        candidates = self._autonomous_candidates()
+        if not candidates:
+            return "Candidatos autonomos: nenhum candidato real detectado."
+        lines = ["Candidatos autonomos do Aya Dev:"]
+        for item in candidates[:20]:
+            lines.append(
+                f"- {item.candidate_id} [{item.eligibility}] score={item.score} risco={item.risk} "
+                f"{item.operation_type}: {item.title}"
+            )
+            if item.blocked_reasons:
+                lines.append(f"  bloqueios: {'; '.join(item.blocked_reasons)}")
+        return "\n".join(lines)
+
+    def explain_candidate(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id)
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        return "\n".join([
+            f"Candidato {candidate.candidate_id}:",
+            f"- Titulo: {candidate.title}",
+            f"- Problema: {candidate.problem}",
+            f"- Operacao: {candidate.operation_type}",
+            f"- Categoria: {candidate.category}",
+            f"- Arquivos: {', '.join(candidate.files)}",
+            f"- Simbolos: {', '.join(candidate.symbols)}",
+            f"- Evidencias: {' | '.join(candidate.evidence)}",
+            f"- Elegibilidade: {candidate.eligibility}",
+            f"- Bloqueios: {' | '.join(candidate.blocked_reasons) or 'nenhum'}",
+            f"- Score: {candidate.score}",
+            f"- Justificativa: {' | '.join(candidate.score_explanation)}",
+            f"- Licoes usadas: {' | '.join(candidate.related_lessons) or 'nenhuma'}",
+            f"- Propostas similares: {' | '.join(candidate.similar_proposals) or 'nenhuma'}",
+            f"- Registro: {candidate.record_sha256}",
+        ])
+
+    def select_candidate(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id)
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        if candidate.eligibility != "ELEGIVEL":
+            return f"Selecao bloqueada: {candidate.eligibility} ({'; '.join(candidate.blocked_reasons) or 'sem motivo adicional'})."
+        state = self._load_autonomy_state()
+        state["selected_candidate_id"] = candidate.candidate_id
+        state["selected_score"] = candidate.score
+        state["selected_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_autonomy_state(state)
+        self._autonomy_event("candidate_selected", asdict(candidate))
+        return f"Candidato selecionado: {candidate.candidate_id} score={candidate.score}."
+
+    def cancel_candidate(self, candidate_id: str) -> str:
+        state = self._load_autonomy_state()
+        if state.get("selected_candidate_id") != candidate_id:
+            return f"Nenhum candidato selecionado com ID {candidate_id}."
+        state["selected_candidate_id"] = ""
+        state["active_proposal_id"] = ""
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_autonomy_state(state)
+        self._autonomy_event("autonomous_cycle_cancelled", {"candidate_id": candidate_id})
+        return f"Candidato cancelado: {candidate_id}."
+
+    def autonomous_queue(self) -> str:
+        state = self._load_autonomy_state()
+        return "\n".join([
+            "Fila autonoma do Aya Dev:",
+            f"- Modo: {state['mode']}",
+            f"- Selecionado: {state.get('selected_candidate_id') or 'nenhum'}",
+            f"- Proposta ativa: {state.get('active_proposal_id') or 'nenhuma'}",
+            f"- Ultima atualizacao: {state.get('updated_at') or 'nao registrada'}",
+        ])
+
+    def execute_safe_autonomous_cycle(self) -> str:
+        state = self._load_autonomy_state()
+        if state["mode"] != "PREPARAR_SUPERVISIONADO":
+            return "SEM_TAREFA_SEGURA: autonomia precisa estar em PREPARAR_SUPERVISIONADO."
+        blocked = self._autonomy_preflight()
+        if blocked:
+            return f"SEM_TAREFA_SEGURA: {blocked}"
+        selected = self._select_best_candidate()
+        if not selected:
+            self._autonomy_event("candidate_blocked", {"reason": "nenhum candidato elegivel"})
+            return "SEM_TAREFA_SEGURA: nenhum candidato elegivel com evidencia suficiente."
+        return self.execute_candidate(selected.candidate_id)
+
+    def execute_candidate(self, candidate_id: str) -> str:
+        state = self._load_autonomy_state()
+        if state["mode"] != "PREPARAR_SUPERVISIONADO":
+            return "Execucao bloqueada: modo atual nao permite preparar proposta."
+        blocked = self._autonomy_preflight()
+        if blocked:
+            return f"Execucao bloqueada: {blocked}"
+        candidate = self._find_candidate(candidate_id)
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        if candidate.eligibility != "ELEGIVEL":
+            return f"Execucao bloqueada: {candidate.eligibility} ({'; '.join(candidate.blocked_reasons)})."
+        self._autonomy_event("autonomous_cycle_started", asdict(candidate))
+        proposal = self.create_proposal(
+            title=f"[AUTO] {candidate.title}",
+            problem=candidate.problem,
+            evidence=candidate.evidence,
+            related_files=candidate.files,
+            related_symbols=candidate.symbols,
+            probable_cause="Melhoria pequena detectada por regra deterministica do Aya Dev.",
+            suggested_change=self._candidate_suggested_change(candidate),
+            preserve=["main intacta", "sem aprovacao automatica", "sem commit automatico"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=candidate.required_tests or ["python -m pytest"],
+            done_criteria=["patch isolado validado", "revisao registrada", "estado AGUARDANDO_APROVACAO"],
+        )
+        proposal.model = f"autonomy-policy-v{AUTONOMY_POLICY_VERSION}"
+        proposal.state = "PLANEJADA"
+        self._event(proposal, "autonomous_proposal_created", "PROPOSTA", "PLANEJADA")
+        state["selected_candidate_id"] = candidate.candidate_id
+        state["active_proposal_id"] = proposal.id
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_autonomy_state(state)
+        self._save()
+        response = self._prepare_autonomous_proposal(proposal, candidate)
+        if proposal.state == "EM_TESTE":
+            test_response = self.testar(proposal.id)
+            review_response = self.revisar(proposal.id)
+            self._autonomy_event("autonomous_review_completed", {"proposal_id": proposal.id})
+            if proposal.state == "AGUARDANDO_APROVACAO":
+                self._autonomy_event("autonomous_waiting_human", {"proposal_id": proposal.id})
+                state["active_proposal_id"] = ""
+                self._save_autonomy_state(state)
+            return "\n".join([
+                response,
+                test_response,
+                review_response,
+                f"Estado final: {proposal.state}",
+                "Aprovacao automatica: nao executada.",
+                "Commit/integracao automatica: nao executados.",
+            ])
+        if proposal.attempts < 2:
+            second = self._prepare_autonomous_proposal(proposal, candidate)
+            if proposal.state == "EM_TESTE":
+                test_response = self.testar(proposal.id)
+                review_response = self.revisar(proposal.id)
+                return "\n".join([response, second, test_response, review_response, f"Estado final: {proposal.state}"])
+            response = "\n".join([response, second])
+        if proposal.state != "AGUARDANDO_APROVACAO":
+            proposal.state = "FALHOU" if proposal.state != "FALHOU" else proposal.state
+            package = self.pacote_codex(proposal.id)
+            self._record_autonomous_escalation(proposal, candidate, package)
+            state["active_proposal_id"] = ""
+            self._save_autonomy_state(state)
+            self._save()
+            return response + "\nESCALADA: limite de duas tentativas atingido.\n" + package[:1200]
+        return response
+
     def _context(self, proposal: EngineeringProposal, include_content: bool) -> str:
         entries = {item.path: item for item in self.index.build()}
         sections = [
@@ -1572,6 +1844,458 @@ class AyaDevService:
         ]
         events.sort(key=lambda item: (item[1].get("at", ""), item[0], item[1].get("action", "")), reverse=True)
         return events
+
+    def _load_autonomy_state(self) -> dict:
+        default = {
+            "mode": "DESLIGADA",
+            "selected_candidate_id": "",
+            "active_proposal_id": "",
+            "events": [],
+            "updated_at": "",
+        }
+        try:
+            raw = json.loads(self.autonomy_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return default
+        if not isinstance(raw, dict):
+            return default
+        default.update({key: raw.get(key, value) for key, value in default.items()})
+        if default["mode"] not in AUTONOMY_MODES:
+            default["mode"] = "DESLIGADA"
+        if not isinstance(default["events"], list):
+            default["events"] = []
+        return default
+
+    def _save_autonomy_state(self, state: dict) -> None:
+        self.autonomy_path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(state, ensure_ascii=True, indent=2, sort_keys=True)
+        self.autonomy_path.write_text(self.workspace.sanitize(text, max(len(text), 5000)), encoding="utf-8")
+
+    def _autonomy_event(self, action: str, data: dict) -> None:
+        state = self._load_autonomy_state()
+        safe_data = json.loads(self.workspace.sanitize(json.dumps(data, ensure_ascii=True, default=str), 3000))
+        state["events"].append({
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "action": action,
+            "policy_version": AUTONOMY_POLICY_VERSION,
+            "data": safe_data,
+        })
+        state["events"] = state["events"][-100:]
+        state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        self._save_autonomy_state(state)
+
+    def _autonomy_preflight(self) -> str:
+        git = self.workspace.git_state()
+        if not git.safe:
+            return git.message
+        worktrees = self._worktree_paths()
+        unexpected = [path for path in worktrees if path != self.root]
+        if unexpected:
+            return "worktree inesperado ativo: " + ", ".join(str(path) for path in unexpected[:3])
+        active = [
+            proposal.id
+            for proposal in self.proposals.values()
+            if proposal.title.startswith("[AUTO]") and proposal.state in {"PROPOSTA", "PLANEJADA", "PREPARANDO", "EM_TESTE"}
+        ]
+        if active:
+            return "outra proposta autonoma em execucao: " + ", ".join(active[:3])
+        return ""
+
+    def _worktree_paths(self) -> list[Path]:
+        result = self._git(("worktree", "list", "--porcelain"), cwd=self.root, timeout=30)
+        paths: list[Path] = []
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                paths.append(Path(line.removeprefix("worktree ")).resolve())
+        return paths
+
+    def _safe_head(self) -> str:
+        try:
+            return self.workspace.head()
+        except RuntimeError:
+            return "HEAD indisponivel"
+
+    def _operation_stats(self) -> dict[str, dict[str, int]]:
+        stats = {
+            operation: {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0}
+            for operation in AUTONOMY_ALLOWED_OPERATIONS
+        }
+        for proposal in self.proposals.values():
+            operations = proposal.patch_manifest.get("operations", []) if isinstance(proposal.patch_manifest, dict) else []
+            for operation in operations:
+                op_type = str(operation.get("type", ""))
+                if op_type not in stats:
+                    continue
+                item = stats[op_type]
+                item["total"] += 1
+                if proposal.state in {"AGUARDANDO_APROVACAO", "APROVADA", "COMMIT_PRONTO", "INTEGRADA", "REVERTIDA"}:
+                    item["success"] += 1
+                    if proposal.attempts <= 1:
+                        item["first_attempt_success"] += 1
+                if proposal.state in {"FALHOU", "REJEITADA", "INTEGRACAO_BLOQUEADA", "REVERSAO_FALHOU", "REVERSAO_PARCIAL"}:
+                    item["fail"] += 1
+                if proposal.failure_reason.lower().find("codex") >= 0:
+                    item["escalated"] += 1
+        return stats
+
+    def _operation_policy_status(self, operation: str, item: dict[str, int]) -> str:
+        if operation not in AUTONOMY_ALLOWED_OPERATIONS:
+            return "OPERACAO_NAO_SUPORTADA"
+        if item["total"] < AUTONOMY_MIN_CASES or item["success"] < AUTONOMY_MIN_SUCCESSES:
+            return "DADOS_INSUFICIENTES"
+        if item["fail"] or item["escalated"]:
+            return "BLOQUEADO_POR_FALHAS"
+        return "ELEGIVEL"
+
+    def _autonomous_candidates(self) -> list[AutonomousCandidate]:
+        candidates: list[AutonomousCandidate] = []
+        for entry in self.index.build():
+            if entry.path.startswith("tests/") or self._candidate_path_blocked(entry.path):
+                continue
+            candidates.extend(self._docstring_candidates(entry))
+            candidates.extend(self._unused_import_candidates(entry))
+        candidates.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
+        for candidate in candidates:
+            self._autonomy_event("candidate_detected", {"candidate_id": candidate.candidate_id, "eligibility": candidate.eligibility})
+        return candidates
+
+    def _docstring_candidates(self, entry: TechnicalFile) -> list[AutonomousCandidate]:
+        path = self.root / entry.path
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, SyntaxError):
+            return []
+        candidates: list[AutonomousCandidate] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if node.name.startswith("_") or ast.get_docstring(node):
+                continue
+            symbol = self._qualified_symbol(tree, node)
+            if not symbol:
+                continue
+            content = f"Document {symbol}."
+            candidates.append(self._build_candidate(
+                source="ast:missing_docstring",
+                title=f"Adicionar docstring em {symbol}",
+                problem=f"O simbolo {symbol} nao possui docstring explicita.",
+                evidence=[f"{entry.path}:{node.lineno} sem docstring", f"Indice AST confirmou {entry.path}."],
+                category="documentacao",
+                operation_type="insert_docstring",
+                files=[entry.path],
+                symbols=[symbol],
+                estimated_changed_lines=1,
+                required_tests=entry.related_tests[:2],
+                operation_payload={"content": content},
+            ))
+        return candidates
+
+    def _unused_import_candidates(self, entry: TechnicalFile) -> list[AutonomousCandidate]:
+        path = self.root / entry.path
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):
+            return []
+        used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        candidates: list[AutonomousCandidate] = []
+        for node in ast.iter_child_nodes(tree):
+            if not isinstance(node, ast.Import) or len(node.names) != 1:
+                continue
+            alias = node.names[0]
+            local_name = alias.asname or alias.name.split(".", 1)[0]
+            if local_name in used_names:
+                continue
+            line = text.splitlines()[node.lineno - 1]
+            candidates.append(self._build_candidate(
+                source="ast:unused_import",
+                title=f"Remover import nao usado {alias.name}",
+                problem=f"O import {alias.name} nao e referenciado no arquivo.",
+                evidence=[f"{entry.path}:{node.lineno} import nao usado por varredura AST local"],
+                category="import_nao_usado",
+                operation_type="replace_exact",
+                files=[entry.path],
+                symbols=[],
+                estimated_changed_lines=1,
+                required_tests=entry.related_tests[:2],
+                operation_payload={"old_text": line + "\n", "new_text": ""},
+            ))
+        return candidates
+
+    def _build_candidate(
+        self,
+        *,
+        source: str,
+        title: str,
+        problem: str,
+        evidence: list[str],
+        category: str,
+        operation_type: str,
+        files: list[str],
+        symbols: list[str],
+        estimated_changed_lines: int,
+        required_tests: list[str],
+        operation_payload: dict,
+    ) -> AutonomousCandidate:
+        risk = self.classify_risk(problem, files, title)
+        lessons = self._candidate_lessons(files, operation_type)
+        similar = self._similar_proposals(files, symbols)
+        blocked = self._candidate_blocked_reasons(files, category, operation_type, risk, estimated_changed_lines)
+        stats = self._operation_stats().get(operation_type, {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0})
+        policy = self._operation_policy_status(operation_type, stats)
+        if policy != "ELEGIVEL" and not blocked:
+            blocked.append(policy)
+        eligibility = "ELEGIVEL" if not blocked else ("DADOS_INSUFICIENTES" if blocked == ["DADOS_INSUFICIENTES"] else "BLOQUEADO")
+        score, score_explanation = self._candidate_score(
+            evidence=evidence,
+            required_tests=required_tests,
+            stats=stats,
+            files=files,
+            changed_lines=estimated_changed_lines,
+            blocked=blocked,
+        )
+        raw = {
+            "source": source,
+            "title": title,
+            "problem": problem,
+            "evidence": evidence,
+            "category": category,
+            "operation_type": operation_type,
+            "files": files,
+            "symbols": symbols,
+            "estimated_changed_lines": estimated_changed_lines,
+            "policy_version": AUTONOMY_POLICY_VERSION,
+            "operation_payload": operation_payload,
+        }
+        digest = self._sha_json(raw)
+        return AutonomousCandidate(
+            candidate_id=f"AUTO-{digest[:12].upper()}",
+            detected_at=datetime.now().isoformat(timespec="seconds"),
+            source=source,
+            title=title,
+            problem=problem,
+            evidence=evidence,
+            category=category,
+            operation_type=operation_type,
+            files=files,
+            symbols=symbols,
+            estimated_changed_lines=estimated_changed_lines,
+            risk=risk,
+            required_tests=required_tests,
+            confidence="baseada em evidencias locais" if eligibility == "ELEGIVEL" else "limitada",
+            eligibility=eligibility,
+            blocked_reasons=blocked,
+            related_lessons=lessons,
+            similar_proposals=similar,
+            policy_version=AUTONOMY_POLICY_VERSION,
+            score=score,
+            score_explanation=score_explanation,
+            record_sha256=digest,
+        )
+
+    def _candidate_blocked_reasons(
+        self,
+        files: list[str],
+        category: str,
+        operation_type: str,
+        risk: str,
+        estimated_changed_lines: int,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if operation_type not in AUTONOMY_ALLOWED_OPERATIONS:
+            reasons.append("OPERACAO_NAO_SUPORTADA")
+        if risk != "baixo":
+            reasons.append(f"RISCO_{risk.upper()}")
+        if len(files) > 2:
+            reasons.append("MAIS_DE_DOIS_ARQUIVOS")
+        if estimated_changed_lines > 80:
+            reasons.append("MAIS_DE_80_LINHAS")
+        if category not in {"documentacao", "mensagem_tecnica", "teste_caracterizacao", "import_nao_usado"}:
+            reasons.append("CATEGORIA_DESCONHECIDA")
+        for file in files:
+            if self._candidate_path_blocked(file):
+                reasons.append(f"ARQUIVO_BLOQUEADO:{file}")
+                break
+        return reasons
+
+    def _candidate_score(
+        self,
+        *,
+        evidence: list[str],
+        required_tests: list[str],
+        stats: dict[str, int],
+        files: list[str],
+        changed_lines: int,
+        blocked: list[str],
+    ) -> tuple[int, list[str]]:
+        score = 0
+        reasons: list[str] = []
+        score += len(evidence) * 10
+        reasons.append(f"evidencias={len(evidence)}")
+        if required_tests:
+            score += 15
+            reasons.append("testes_relacionados=sim")
+        score += stats.get("success", 0) * 8
+        reasons.append(f"sucesso_historico={stats.get('success', 0)}")
+        score -= len(files) * 2
+        score -= changed_lines
+        if blocked:
+            score -= 1000
+            reasons.append("bloqueado=" + ",".join(blocked))
+        return score, reasons
+
+    def _candidate_path_blocked(self, file: str) -> bool:
+        lowered = file.lower()
+        return any(term in lowered for term in AUTONOMY_BLOCKED_TERMS) or self.workspace._path_error(file) != ""
+
+    def _candidate_lessons(self, files: list[str], operation_type: str) -> list[str]:
+        entries = self._load_engineering_memory()
+        needles = [operation_type, *files]
+        lessons = [
+            entry.id
+            for entry in entries
+            if any(needle and needle.lower() in f"{entry.title} {entry.content}".lower() for needle in needles)
+        ]
+        return lessons[:5]
+
+    def _similar_proposals(self, files: list[str], symbols: list[str]) -> list[str]:
+        file_set = set(files)
+        symbol_set = set(symbols)
+        similar = [
+            proposal.id
+            for proposal in self.proposals.values()
+            if file_set & set(proposal.related_files) or symbol_set & set(proposal.related_symbols)
+        ]
+        return similar[-5:]
+
+    def _qualified_symbol(self, tree: ast.AST, target: ast.AST) -> str:
+        parents: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(tree):
+            for child in ast.iter_child_nodes(parent):
+                parents[child] = parent
+        if isinstance(target, ast.ClassDef):
+            return target.name
+        parent = parents.get(target)
+        if isinstance(parent, ast.ClassDef) and hasattr(target, "name"):
+            return f"{parent.name}.{target.name}"
+        return getattr(target, "name", "")
+
+    def _find_candidate(self, candidate_id: str) -> AutonomousCandidate | None:
+        wanted = (candidate_id or "").strip().upper()
+        return next((candidate for candidate in self._autonomous_candidates() if candidate.candidate_id == wanted), None)
+
+    def _select_best_candidate(self) -> AutonomousCandidate | None:
+        candidates = [candidate for candidate in self._autonomous_candidates() if candidate.eligibility == "ELEGIVEL"]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
+        return candidates[0]
+
+    def _candidate_suggested_change(self, candidate: AutonomousCandidate) -> str:
+        return "\n".join([
+            f"Autonomia supervisionada v{AUTONOMY_POLICY_VERSION}.",
+            f"Candidato: {candidate.candidate_id}",
+            f"Operacao: {candidate.operation_type}",
+            f"Score: {candidate.score} ({'; '.join(candidate.score_explanation)})",
+            "Gerar somente manifesto estruturado minimo e parar em AGUARDANDO_APROVACAO.",
+        ])
+
+    def _candidate_decision(self, candidate: AutonomousCandidate) -> dict:
+        if candidate.operation_type == "insert_docstring":
+            return {
+                "type": "insert_docstring",
+                "symbol": candidate.symbols[0],
+                "content": f"Document {candidate.symbols[0]}.",
+            }
+        if candidate.operation_type == "replace_exact":
+            entry = self._unused_import_payload(candidate)
+            return {"type": "replace_exact", **entry}
+        raise StructuredPatchError("Operacao autonoma nao suportada.")
+
+    def _unused_import_payload(self, candidate: AutonomousCandidate) -> dict:
+        path = self.root / candidate.files[0]
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+        evidence = candidate.evidence[0]
+        match = re.search(r":(\d+)\s", evidence)
+        if not match:
+            raise StructuredPatchError("Linha do import nao confirmada.")
+        line = text.splitlines()[int(match.group(1)) - 1]
+        return {"old_text": line + "\n", "new_text": ""}
+
+    def _prepare_autonomous_proposal(self, proposal: EngineeringProposal, candidate: AutonomousCandidate) -> str:
+        if proposal.attempts >= 2:
+            return "Tentativa autonoma bloqueada: limite de duas tentativas."
+        git = self.workspace.git_state()
+        if not git.safe:
+            return f"Tentativa autonoma bloqueada: {git.message}"
+        previous = proposal.state
+        proposal.state = "PREPARANDO"
+        proposal.attempts += 1
+        self._event(proposal, f"autonomous_attempt_started {proposal.attempts}", previous, proposal.state)
+        try:
+            proposal.base_commit = self.workspace.head()
+            target_file = candidate.files[0]
+            decision = self._candidate_decision(candidate)
+            worktree = self.workspace.create(proposal.id)
+            proposal.workspace = str(worktree)
+            proposal.workspace_path = str(worktree)
+            proposal.workspace_created = True
+            baseline = self.workspace.baseline(worktree, self._related_tests(proposal))
+            proposal.validation = [asdict(result) | {"passed": result.passed, "phase": "baseline"} for result in baseline]
+            proposal.tests_executed = True
+            if not all(result.passed for result in baseline):
+                raise RuntimeError("Baseline reprovou antes do patch autonomo.")
+            manifest = self.structured_patch.build_manifest(
+                decision,
+                proposal.id,
+                proposal.base_commit,
+                target_file,
+                self._file_sha256(target_file, worktree),
+                self._related_tests(proposal),
+            )
+            proposal.patch_manifest = manifest
+            result = self.structured_patch.apply(
+                worktree,
+                manifest,
+                proposal.id,
+                proposal.base_commit,
+                proposal.related_files,
+                proposal.related_symbols,
+            )
+            proposal.diff_created = result.ok
+            proposal.patch = self.workspace.diff(worktree)
+            inspection = self.workspace.inspect_patch(proposal.patch, 2, 80, proposal.related_files)
+            if not inspection.valid:
+                raise StructuredPatchError(inspection.message)
+            diff_check = self.workspace.diff_check(worktree)
+            proposal.validation.append(asdict(diff_check) | {"passed": diff_check.passed, "phase": "patch"})
+            if not diff_check.passed:
+                raise StructuredPatchError(diff_check.output)
+            proposal.state = "EM_TESTE"
+            self._event(proposal, "autonomous_patch_prepared", "PREPARANDO", proposal.state)
+            self._autonomy_event("autonomous_patch_prepared", {"proposal_id": proposal.id, "candidate_id": candidate.candidate_id})
+            self._save()
+            return f"Patch autonomo preparado em worktree isolado para {proposal.id}."
+        except Exception as exc:
+            proposal.state = "FALHOU"
+            message = self.workspace.sanitize(str(exc), 1200)
+            proposal.review_result = message
+            proposal.diff_preserved = bool(proposal.patch)
+            self._record_failure(proposal, "autonomia", "tentativa autonoma falhou", message)
+            self._cleanup_failed_workspace(proposal)
+            self._event(proposal, "autonomous_attempt_failed", "PREPARANDO", "FALHOU")
+            self._autonomy_event("autonomous_attempt_failed", {"proposal_id": proposal.id, "error": message})
+            self._save()
+            return f"Tentativa autonoma falhou: {message}"
+
+    def _record_autonomous_escalation(self, proposal: EngineeringProposal, candidate: AutonomousCandidate, package: str) -> None:
+        proposal.failure_reason = "ESCALADA"
+        proposal.failure_message = self.workspace.sanitize(package, 3000)
+        self._autonomy_event("autonomous_cycle_escalated", {
+            "proposal_id": proposal.id,
+            "candidate_id": candidate.candidate_id,
+            "package_sha256": self._sha_text(package),
+        })
 
     def _derived_engineering_memory(self) -> list[str]:
         proposals = sorted(self.proposals.values(), key=lambda value: value.id)

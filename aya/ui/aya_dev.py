@@ -68,6 +68,20 @@ class AyaDevPanel:
         choices = self.list_choices(state_filter)
         return choices, choices[0] if choices else ""
 
+    def autonomy_overview(self) -> tuple[str, str, str]:
+        return (
+            self.aya.aya_dev.autonomy_status(),
+            self.aya.aya_dev.evaluate_autonomy(),
+            self.aya.aya_dev.list_candidates(),
+        )
+
+    def run_safe_autonomy_cycle(self, confirmation: str) -> str:
+        if not self._can_execute():
+            return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)
+        if (confirmation or "").strip() != "EXECUTAR CICLO SEGURO":
+            return "Confirmacao incorreta. Digite exatamente: EXECUTAR CICLO SEGURO"
+        return self.aya.aya_dev.execute_safe_autonomous_cycle()
+
     def details(self, selected: str, expand_diff: bool = False) -> tuple[str, str, str, str, str, str, str, str]:
         proposal = self._selected_proposal(selected)
         if not proposal:

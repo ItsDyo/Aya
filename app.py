@@ -492,6 +492,19 @@ def create_app(
                         motivo_reversao_dev = gr.Textbox(label="Motivo da reversao", lines=3)
                         expandir_diff_dev = gr.Checkbox(label="Expandir diff completo", value=False)
 
+                    with gr.Accordion("Autonomia supervisionada", open=False):
+                        autonomia_confirmacao_dev = gr.Textbox(
+                            label="Confirmacao de ciclo seguro",
+                            placeholder="EXECUTAR CICLO SEGURO",
+                        )
+                        with gr.Row(elem_classes="aya-compact"):
+                            autonomia_detectar_dev = gr.Button("Detectar candidatos")
+                            autonomia_executar_dev = gr.Button("Executar ciclo seguro")
+                        autonomia_status_dev = gr.Textbox(label="Modo e estado", lines=7)
+                        autonomia_avaliacao_dev = gr.Textbox(label="Elegibilidade", lines=10)
+                        autonomia_candidatos_dev = gr.Textbox(label="Candidatos", lines=12)
+                        autonomia_resultado_dev = gr.Textbox(label="Resultado autonomo", lines=8)
+
                 with gr.Column(scale=8, min_width=520):
                     with gr.Tabs():
                         with gr.Tab("Visao geral"):
@@ -547,6 +560,15 @@ def create_app(
                 refresh_dev_choices,
                 inputs=filtro_dev,
                 outputs=proposta_dev,
+            )
+            autonomia_detectar_dev.click(
+                aya_dev_ui.autonomy_overview,
+                outputs=[autonomia_status_dev, autonomia_avaliacao_dev, autonomia_candidatos_dev],
+            )
+            autonomia_executar_dev.click(
+                aya_dev_ui.run_safe_autonomy_cycle,
+                inputs=autonomia_confirmacao_dev,
+                outputs=autonomia_resultado_dev,
             )
             proposta_dev.change(
                 aya_dev_ui.details,
