@@ -34,6 +34,18 @@ HIGH_RISK_TERMS = {
     ".env", "credencial", "autenticacao", "tailscale", "remoto", "banco", "database", "sqlite", "schema",
     "migracao", "memoria", "excluir", "comando", "privacidade", "seguranca", "backup", "rag",
 }
+ENGINEERING_MEMORY_KINDS = {"decisao", "aprendizado", "risco", "teste", "incidente", "tecnica"}
+ENGINEERING_MEMORY_EVENT_STATES = {
+    "COMMIT_PRONTO",
+    "FALHOU",
+    "INTEGRACAO_BLOQUEADA",
+    "INTEGRADA",
+    "PREVISAO_REVERSAO_BLOQUEADA",
+    "REVERSAO_BLOQUEADA",
+    "REVERSAO_FALHOU",
+    "REVERSAO_PARCIAL",
+    "REVERTIDA",
+}
 
 
 @dataclass
@@ -163,6 +175,16 @@ class EngineeringProposal:
     approved_reversal_validation_sha256: str = ""
 
 
+@dataclass
+class EngineeringMemoryEntry:
+    id: str
+    kind: str
+    title: str
+    content: str
+    source: str
+    created_at: str
+
+
 class AyaDevService:
     """Modo de engenharia local supervisionado e sem aplicacao no projeto principal."""
 
@@ -175,6 +197,7 @@ class AyaDevService:
         reviewer_model: str = MODEL_CONFIG.reviewer,
         storage_path: str | Path | None = None,
         index_path: str | Path | None = None,
+        engineering_memory_path: str | Path | None = None,
         workspace_root: str | Path | None = None,
         max_files: int = 4,
         max_changed_lines: int = 250,
@@ -183,6 +206,8 @@ class AyaDevService:
         self.root = Path(root).resolve()
         data_dir = self.root / "data_local"
         self.storage_path = Path(storage_path or data_dir / "aya_dev_history.json")
+        memory_dir = self.storage_path.parent if storage_path is not None else data_dir
+        self.engineering_memory_path = Path(engineering_memory_path or memory_dir / "aya_dev_engineering_memory.jsonl")
         self.index = TechnicalIndex(self.root, index_path or data_dir / "aya_dev_index.json")
         self.workspace = DevWorkspace(self.root, workspace_root)
         self.structured_patch = StructuredPatchApplier(
@@ -209,9 +234,17 @@ class AyaDevService:
             "auditar": self.audit,
             "propostas": self.list_proposals,
             "historico": self.history,
+            "metricas": self.metrics,
+            "metrics": self.metrics,
+            "eventos-tecnicos": self.engineering_events,
+            "memoria-tecnica": self.engineering_memory,
+            "memoria-tecnica-listar": self.engineering_memory,
+            "memoria": self.engineering_memory,
         }
         if action in handlers:
             return handlers[action]()
+        if action == "registrar-memoria":
+            return self.register_engineering_memory(argument.strip())
         if action in {
             "mostrar", "falha", "commit", "integracao", "planejar", "preparar", "revisar", "testar", "diff",
             "aprovar", "rejeitar", "descartar", "aplicar", "integrar", "solicitar-reversao",
@@ -236,6 +269,7 @@ class AyaDevService:
             f"- Modelo principal: {self.primary_model}",
             f"- Modelo revisor: {self.reviewer_model}",
             f"- Limites: {self.max_files} arquivos, {self.max_changed_lines} linhas, {self.max_attempts} tentativas",
+            "- Observabilidade: /aya-dev metricas, /aya-dev eventos-tecnicos, /aya-dev memoria-tecnica",
             "- Aplicacao no projeto principal: exige comando separado e validacao completa",
         ])
 
@@ -1106,6 +1140,113 @@ class AyaDevService:
             lines.append(f"- {event['at']} {proposal_id}: {event['action']} ({event['before']} -> {event['after']})")
         return "\n".join(lines)
 
+    def engineering_events(self) -> str:
+        events = self._technical_events()
+        if not events:
+            return "Eventos tecnicos do Aya Dev: nenhum evento relevante registrado."
+        lines = ["Eventos tecnicos relevantes do Aya Dev:"]
+        for proposal_id, event in events[:30]:
+            action = self.workspace.sanitize(str(event.get("action", "")), 160)
+            before = self.workspace.sanitize(str(event.get("before", "")), 80)
+            after = self.workspace.sanitize(str(event.get("after", "")), 80)
+            lines.append(f"- {event.get('at', '')} {proposal_id}: {action} ({before} -> {after})")
+        return "\n".join(lines)
+
+    def metrics(self) -> str:
+        proposals = sorted(self.proposals.values(), key=lambda value: value.id)
+        states = self._count_values(proposal.state for proposal in proposals)
+        risks = self._count_values(proposal.risk for proposal in proposals)
+        failures = self._count_values(
+            f"{proposal.failure_stage or 'etapa_indisponivel'}:{proposal.failure_reason or 'motivo_indisponivel'}"
+            for proposal in proposals
+            if proposal.failure_stage or proposal.failure_reason
+        )
+        related_files = self._count_values(file for proposal in proposals for file in proposal.related_files)
+        validation = [item for proposal in proposals for item in self._all_validation_records(proposal)]
+        validation_passed = sum(1 for item in validation if item.get("passed") is True)
+        validation_failed = sum(1 for item in validation if item.get("passed") is False)
+        partials = sum(
+            1
+            for proposal in proposals
+            if proposal.integration_partial or proposal.reversal_partial or proposal.state in {"REVERSAO_PARCIAL"}
+        )
+        attention = [
+            proposal.id
+            for proposal in proposals
+            if proposal.state
+            in {
+                "FALHOU", "INTEGRACAO_BLOQUEADA", "REVERSAO_BLOQUEADA",
+                "REVERSAO_FALHOU", "REVERSAO_PARCIAL", "PREVISAO_REVERSAO_BLOQUEADA",
+            }
+        ]
+        memory_entries = self._load_engineering_memory()
+        technical_events = self._technical_events()
+        lines = [
+            "Metricas deterministicas do Aya Dev:",
+            f"- Origem das propostas: {self.storage_path}",
+            f"- Propostas registradas: {len(proposals)}",
+            f"- Estados: {self._format_counts(states)}",
+            f"- Riscos: {self._format_counts(risks)}",
+            f"- Validacoes registradas: {len(validation)} (aprovadas={validation_passed}, reprovadas={validation_failed})",
+            f"- Propostas integradas: {states.get('INTEGRADA', 0)}",
+            f"- Propostas revertidas: {states.get('REVERTIDA', 0)}",
+            f"- Propostas com falha ou bloqueio: {len(attention)}",
+            f"- Estados parciais: {partials}",
+            f"- Eventos tecnicos relevantes: {len(technical_events)}",
+            f"- Memorias tecnicas registradas: {len(memory_entries)}",
+            "- Falhas por etapa: " + self._format_counts(failures),
+            "- Arquivos relacionados mais citados: " + self._format_counts(related_files, limit=8),
+            "- Observacao: este calculo usa somente dados persistidos; nao executa Git, modelo, testes ou rede.",
+        ]
+        if attention:
+            lines.append("- Propostas que pedem atencao: " + ", ".join(attention[:10]))
+        return "\n".join(lines)
+
+    def engineering_memory(self) -> str:
+        entries = self._load_engineering_memory()
+        lines = ["Memoria tecnica de engenharia do Aya Dev:"]
+        if entries:
+            for item in entries[-20:]:
+                lines.append(f"- {item.id} [{item.kind}] {item.title}: {item.content}")
+        else:
+            lines.append("- Nenhuma memoria tecnica registrada manualmente.")
+        derived = self._derived_engineering_memory()
+        if derived:
+            lines.extend(["", "Sinais derivados do historico:"])
+            lines.extend(f"- {item}" for item in derived)
+        else:
+            lines.extend(["", "Sinais derivados do historico:", "- Nenhum sinal recorrente encontrado."])
+        return "\n".join(lines)
+
+    def register_engineering_memory(self, payload: str) -> str:
+        parts = [part.strip() for part in payload.split("|")]
+        if len(parts) == 2:
+            kind = "tecnica"
+            title, content = parts
+        elif len(parts) == 3:
+            kind, title, content = parts
+        else:
+            return "Use assim: /aya-dev registrar-memoria tipo | titulo | conteudo"
+        kind = self._normalize_memory_kind(kind)
+        title = self.workspace.sanitize(title, 160).strip()
+        content = self.workspace.sanitize(content, 1200).strip()
+        if not title or not content:
+            return "Memoria tecnica recusada: informe titulo e conteudo."
+        entry_id = self._engineering_memory_id(kind, title, content, "manual")
+        existing = {entry.id: entry for entry in self._load_engineering_memory()}
+        if entry_id in existing:
+            return f"Memoria tecnica ja registrada: {entry_id}."
+        entry = EngineeringMemoryEntry(
+            id=entry_id,
+            kind=kind,
+            title=title,
+            content=content,
+            source="manual",
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        self._append_engineering_memory(entry)
+        return f"Memoria tecnica registrada: {entry.id}."
+
     def _context(self, proposal: EngineeringProposal, include_content: bool) -> str:
         entries = {item.path: item for item in self.index.build()}
         sections = [
@@ -1286,6 +1427,7 @@ class AyaDevService:
             "before": before,
             "after": after,
         })
+        self._record_engineering_event_if_relevant(proposal, action, before, after)
 
     def _load(self) -> dict[str, EngineeringProposal]:
         try:
@@ -1326,6 +1468,135 @@ class AyaDevService:
                 if attempt == 4:
                     raise
                 time.sleep(0.05)
+
+    def _all_validation_records(self, proposal: EngineeringProposal) -> list[dict]:
+        records: list[dict] = []
+        for field_name in (
+            "validation",
+            "integration_validation",
+            "post_integration_validation",
+            "reversal_validation",
+            "reversal_post_validation",
+            "reversal_preview_validation",
+        ):
+            value = getattr(proposal, field_name, [])
+            if isinstance(value, list):
+                records.extend(item for item in value if isinstance(item, dict))
+        return records
+
+    def _count_values(self, values) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for value in values:
+            if value:
+                key = self.workspace.sanitize(str(value), 240)
+                counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+    def _format_counts(self, counts: dict[str, int], limit: int | None = None) -> str:
+        if not counts:
+            return "nenhum"
+        items = list(counts.items())
+        if limit is not None:
+            items = items[:limit]
+        return ", ".join(f"{key}={value}" for key, value in items)
+
+    def _normalize_memory_kind(self, kind: str) -> str:
+        normalized = re.sub(r"[^a-z0-9_-]+", "_", kind.lower()).strip("_")
+        return normalized if normalized in ENGINEERING_MEMORY_KINDS else "tecnica"
+
+    def _engineering_memory_id(self, kind: str, title: str, content: str, source: str) -> str:
+        digest = hashlib.sha256(f"{kind}\n{title}\n{content}\n{source}".encode("utf-8")).hexdigest()[:12].upper()
+        return f"ENG-{digest}"
+
+    def _load_engineering_memory(self) -> list[EngineeringMemoryEntry]:
+        try:
+            lines = self.engineering_memory_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        entries: list[EngineeringMemoryEntry] = []
+        for line in lines:
+            try:
+                raw = json.loads(line)
+                entry = EngineeringMemoryEntry(**{
+                    "id": str(raw.get("id", "")),
+                    "kind": self._normalize_memory_kind(str(raw.get("kind", "tecnica"))),
+                    "title": self.workspace.sanitize(str(raw.get("title", "")), 160),
+                    "content": self.workspace.sanitize(str(raw.get("content", "")), 1200),
+                    "source": self.workspace.sanitize(str(raw.get("source", "")), 80),
+                    "created_at": str(raw.get("created_at", "")),
+                })
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if entry.id and entry.title and entry.content:
+                entries.append(entry)
+        entries.sort(key=lambda item: (item.created_at, item.id))
+        return entries
+
+    def _append_engineering_memory(self, entry: EngineeringMemoryEntry) -> None:
+        self.engineering_memory_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(asdict(entry), ensure_ascii=True, sort_keys=True)
+        with self.engineering_memory_path.open("a", encoding="utf-8") as file:
+            file.write(payload + "\n")
+
+    def _record_engineering_event_if_relevant(
+        self,
+        proposal: EngineeringProposal,
+        action: str,
+        before: str,
+        after: str,
+    ) -> None:
+        if after not in ENGINEERING_MEMORY_EVENT_STATES:
+            return
+        kind = "incidente" if after in {"FALHOU", "INTEGRACAO_BLOQUEADA", "REVERSAO_FALHOU", "REVERSAO_PARCIAL"} else "decisao"
+        title = f"{proposal.id}: {after}"
+        content = self.workspace.sanitize(f"{action} ({before} -> {after})", 400)
+        source = f"evento:{proposal.id}:{after}"
+        entry_id = self._engineering_memory_id(kind, title, content, source)
+        if entry_id in {entry.id for entry in self._load_engineering_memory()}:
+            return
+        self._append_engineering_memory(EngineeringMemoryEntry(
+            id=entry_id,
+            kind=kind,
+            title=title,
+            content=content,
+            source=source,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+        ))
+
+    def _technical_events(self) -> list[tuple[str, dict]]:
+        events = [
+            (proposal.id, event)
+            for proposal in self.proposals.values()
+            for event in proposal.history
+            if event.get("after") in ENGINEERING_MEMORY_EVENT_STATES
+        ]
+        events.sort(key=lambda item: (item[1].get("at", ""), item[0], item[1].get("action", "")), reverse=True)
+        return events
+
+    def _derived_engineering_memory(self) -> list[str]:
+        proposals = sorted(self.proposals.values(), key=lambda value: value.id)
+        signals: list[str] = []
+        failures = self._count_values(
+            f"{proposal.failure_stage or 'etapa_indisponivel'} / {proposal.failure_reason or 'motivo_indisponivel'}"
+            for proposal in proposals
+            if proposal.failure_stage or proposal.failure_reason
+        )
+        for key, total in list(failures.items())[:5]:
+            signals.append(f"Falha recorrente: {key} em {total} proposta(s).")
+        integrated = [proposal for proposal in proposals if proposal.state == "INTEGRADA"]
+        if integrated:
+            signals.append(f"Integracoes concluidas por fast-forward estrito: {len(integrated)}.")
+        reverted = [proposal for proposal in proposals if proposal.state == "REVERTIDA"]
+        if reverted:
+            signals.append(f"Reversoes concluidas com git revert: {len(reverted)}.")
+        blocked = [
+            proposal.id
+            for proposal in proposals
+            if proposal.state in {"INTEGRACAO_BLOQUEADA", "REVERSAO_BLOQUEADA", "PREVISAO_REVERSAO_BLOQUEADA"}
+        ]
+        if blocked:
+            signals.append("Bloqueios atuais: " + ", ".join(blocked[:8]) + ".")
+        return signals
 
     def _record_failure(self, proposal: EngineeringProposal, stage: str, reason: str, message: str) -> None:
         proposal.failure_stage = stage
