@@ -177,6 +177,92 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         candidates = self.service._autonomous_candidates()
         self.assertTrue(any(candidate.operation_type == "replace_exact" for candidate in candidates))
 
+    def test_ast_sem_ruff_f401_nao_cria_candidato_de_import(self):
+        (self.root / "aya" / "core" / "sample.py").write_text(
+            "import json\n\nclass Sample:\n    def run(self, value):\n        return value\n",
+            encoding="utf-8",
+        )
+        self.service._ruff_f401_diagnostics = Mock(return_value={})
+        candidates = self.service._autonomous_candidates(force=True)
+        self.assertFalse(any(candidate.operation_type == "replace_exact" for candidate in candidates))
+
+    def test_noqa_type_checking_e_reexport_bloqueiam_f401(self):
+        entry = self.service.index.build()[0]
+        diagnostic = {"line": 1, "diagnostic_sha256": "abc", "message": "unused import"}
+        noqa = self.service._qualify_ruff_f401_candidate(entry, "import json  # noqa: F401\n", "import json  # noqa: F401", diagnostic, "ruff")
+        type_checking = self.service._qualify_ruff_f401_candidate(entry, "from typing import TYPE_CHECKING\nimport json\n", "import json", diagnostic, "ruff")
+        reexport = self.service._qualify_ruff_f401_candidate(entry, "__all__ = ['json']\nimport json\n", "import json", diagnostic, "ruff")
+        self.assertEqual("BLOQUEADO", noqa["qualification_status"])
+        self.assertIn("NOQA_IMPORT", noqa["reason_codes"])
+        self.assertIn("TYPE_CHECKING_IMPORT", type_checking["reason_codes"])
+        self.assertIn("POSSIBLE_REEXPORT", reexport["reason_codes"])
+
+    def test_qualificacao_docstring_filtra_privado_dunder_init_getter_e_trivial(self):
+        (self.root / "aya" / "core" / "sample.py").write_text(
+            "class Sample:\n"
+            "    def __init__(self):\n"
+            "        self.value = 1\n"
+            "    def __str__(self):\n"
+            "        return 'x'\n"
+            "    def _private(self):\n"
+            "        return 1\n"
+            "    def value_getter(self):\n"
+            "        return self.value\n"
+            "    def one(self):\n"
+            "        return 1\n",
+            encoding="utf-8",
+        )
+        candidates = self.service._autonomous_candidates(force=True)
+        operational = {candidate.symbol for candidate in candidates if candidate.qualification_status == "ACAO_RECOMENDADA"}
+        self.assertNotIn("Sample.__init__", operational)
+        self.assertNotIn("Sample.__str__", operational)
+        self.assertNotIn("Sample._private", operational)
+        self.assertTrue(all("PRIVATE_SYMBOL" in candidate.reason_codes or candidate.symbol != "Sample._private" for candidate in candidates))
+
+    def test_reason_codes_pontuacao_e_funil_sao_deterministicos(self):
+        self.seed_successful_docstring_history(production_real=True)
+        first = self.service._autonomous_candidates(force=True)
+        second = self.service._autonomous_candidates()
+        self.assertEqual(
+            [(item.candidate_id, item.priority_score, item.reason_codes) for item in first],
+            [(item.candidate_id, item.priority_score, item.reason_codes) for item in second],
+        )
+        metrics = self.service._candidate_queue_metrics(first)
+        self.assertEqual(metrics["detected"], metrics["classified_total"])
+        self.assertTrue(any("PUBLIC_SYMBOL" in candidate.reason_codes for candidate in first))
+
+    def test_fila_padrao_resume_e_top_ordena_sem_despejar_tudo(self):
+        response = self.service.list_candidates()
+        self.assertIn("Resumo dos Candidatos autonomos", response)
+        self.assertIn("Top candidatos priorizados", response)
+        self.assertLessEqual(response.count("- AUTO-"), 20)
+
+    def test_cache_reutiliza_arquivo_sem_mudanca_e_reanalisa_alterado(self):
+        self.service._autonomous_candidates(force=True)
+        first_report = self.service._candidate_scan_report
+        self.assertGreaterEqual(first_report["cache_misses"], 1)
+        self.service._candidate_cache = None
+        self.service._autonomous_candidates(force=True)
+        second_report = self.service._candidate_scan_report
+        self.assertGreaterEqual(second_report["cache_hits"], 1)
+        (self.root / "aya" / "core" / "sample.py").write_text(
+            "class Sample:\n    def run(self, value):\n        if value:\n            return value\n        return 'x'\n",
+            encoding="utf-8",
+        )
+        self.service._candidate_cache = None
+        self.service._autonomous_candidates(force=True)
+        third_report = self.service._candidate_scan_report
+        self.assertGreaterEqual(third_report["cache_misses"], 1)
+        self.assertEqual(1, third_report["ruff_calls"])
+        self.assertEqual(1, third_report["index_builds"])
+
+    def test_arquivo_removido_contabiliza_cache_removido(self):
+        self.service._autonomous_candidates(force=True)
+        (self.root / "aya" / "core" / "sample.py").unlink()
+        self.service._candidate_cache = None
+        self.service._autonomous_candidates(force=True)
+        self.assertGreaterEqual(self.service._candidate_scan_report["files_removed"], 1)
+
     def test_origem_separa_producao_fixture_legacy_e_unknown(self):
         self.seed_successful_docstring_history(total=1, production_real=True)
         self.seed_successful_docstring_history(total=1)

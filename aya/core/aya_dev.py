@@ -47,14 +47,55 @@ ENGINEERING_MEMORY_EVENT_STATES = {
     "REVERTIDA",
 }
 AUTONOMY_POLICY_VERSION = 1
+AUTONOMY_QUALIFICATION_VERSION = 1
+AUTONOMY_CANDIDATE_SCHEMA_VERSION = 2
+AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v4"
 AUTONOMY_MODES = {"DESLIGADA", "OBSERVAR", "PREPARAR_SUPERVISIONADO"}
 AUTONOMY_MIN_CASES = 3
 AUTONOMY_MIN_SUCCESSES = 2
+AUTONOMY_MIN_DOCSTRING_LINES = 4
 AUTONOMY_ALLOWED_OPERATIONS = {"insert_docstring", "replace_exact"}
 AUTONOMY_BLOCKED_TERMS = {
     ".env", "credencial", "autenticacao", "permissao", "seguranca", "security", "tailscale", "remoto",
     "banco", "database", "aya/data", "sqlite", "schema", "migracao", "memoria", "rag", "backup", "voz", "subprocess",
     "git", "release", "dependencia",
+}
+AUTONOMY_REASON_EXPLANATIONS = {
+    "PUBLIC_NONTRIVIAL_SYMBOL": "Simbolo publico com corpo nao trivial.",
+    "PUBLIC_SYMBOL": "Simbolo publico detectado no HEAD atual.",
+    "EXTERNALLY_REFERENCED": "Simbolo referenciado por outro modulo local.",
+    "HAS_RELATED_TESTS": "Existem testes relacionados ao arquivo.",
+    "MULTI_BRANCH_BODY": "Corpo possui multiplos caminhos de execucao.",
+    "PARAMETERS_NONTRIVIAL": "Assinatura possui parametros relevantes.",
+    "RETURNS_VALUE": "Funcao ou metodo retorna valor explicitamente.",
+    "RAISES_EXCEPTION": "Corpo pode levantar excecao explicitamente.",
+    "CENTRAL_MODULE": "Arquivo pertence a modulo central da Aya.",
+    "TECHNICAL_RESPONSIBILITY": "Nome ou arquivo indica responsabilidade tecnica sensivel.",
+    "LOW_TECHNICAL_VALUE": "Valor tecnico insuficiente para acao recomendada.",
+    "TRIVIAL_BODY": "Corpo pequeno ou simples demais para acao operacional.",
+    "PRIVATE_SYMBOL": "Simbolo privado ou protegido.",
+    "DUNDER_SYMBOL": "Metodo especial dunder.",
+    "INIT_TRIVIAL": "__init__ trivial nao e candidato operacional.",
+    "GETTER_SETTER_TRIVIAL": "Getter, setter ou propriedade trivial.",
+    "NESTED_SYMBOL": "Funcao aninhada nao entra na fila operacional.",
+    "TEST_FILE": "Arquivo de teste nao entra na fila operacional.",
+    "DOCSTRING_EXISTS": "Docstring ja existe.",
+    "RUFF_F401_CONFIRMED": "Ruff confirmou import nao utilizado F401.",
+    "RUFF_F401_UNAVAILABLE": "Diagnostico Ruff F401 indisponivel.",
+    "POSSIBLE_REEXPORT": "Possivel reexportacao publica.",
+    "TYPE_CHECKING_IMPORT": "Import protegido por TYPE_CHECKING.",
+    "SIDE_EFFECT_IMPORT": "Import pode ter efeito colateral.",
+    "NOQA_IMPORT": "Linha possui noqa.",
+    "DUPLICATE_ACTIVE_PROPOSAL": "Existe proposta ativa equivalente.",
+    "DUPLICATE_CURRENT_CANDIDATE": "Existe candidato equivalente na mesma renovacao.",
+    "CAPABILITY_INSUFFICIENT": "Capacidade historica insuficiente.",
+    "HISTORICAL_FAILURES": "Historico possui falhas para esta operacao.",
+    "HIGH_RISK_MODULE": "Modulo classificado como risco medio ou alto.",
+    "FILE_BLOCKED": "Arquivo protegido pela politica.",
+    "STALE_HEAD": "HEAD mudou desde a deteccao.",
+    "STALE_FILE_HASH": "Hash do arquivo mudou.",
+    "STALE_FILE_REMOVED": "Arquivo nao existe mais.",
+    "STALE_RELATED_TEST": "Teste relacionado nao existe mais.",
 }
 
 
@@ -221,6 +262,17 @@ class AutonomousCandidate:
     risk: str
     required_tests: list[str]
     confidence: str
+    detection_valid: bool
+    relevance_valid: bool
+    actionable: bool
+    qualification_status: str
+    qualification_reasons: list[str]
+    documentation_value_score: int
+    documentation_value_reasons: list[str]
+    priority_score: int
+    priority_reasons: list[str]
+    reason_codes: list[str]
+    ruff_diagnostic: dict
     status: str
     eligibility: str
     blocked_reasons: list[str]
@@ -260,6 +312,7 @@ class AyaDevService:
         memory_dir = self.storage_path.parent if storage_path is not None else data_dir
         self.engineering_memory_path = Path(engineering_memory_path or memory_dir / "aya_dev_engineering_memory.jsonl")
         self.autonomy_path = memory_dir / "aya_dev_autonomy.json"
+        self.candidate_cache_path = memory_dir / "aya_dev_candidate_cache.json"
         self.index = TechnicalIndex(self.root, index_path or data_dir / "aya_dev_index.json")
         self.workspace = DevWorkspace(self.root, workspace_root)
         self.structured_patch = StructuredPatchApplier(
@@ -279,6 +332,7 @@ class AyaDevService:
         self._candidate_cache: list[AutonomousCandidate] | None = None
         self._candidate_cache_head = ""
         self._candidate_cache_proposals = -1
+        self._candidate_scan_report = self._empty_candidate_scan_report()
 
     def execute(self, payload: str) -> str:
         action, _, argument = (payload or "status").strip().partition(" ")
@@ -1337,7 +1391,10 @@ class AyaDevService:
             "Autonomia supervisionada do Aya Dev:",
             f"- Modo: {state['mode']}",
             f"- Politica: v{AUTONOMY_POLICY_VERSION}",
-            f"- Candidatos atuais: {metrics['current']}",
+            f"- Detectados: {metrics['detected']}",
+            f"- Acao recomendada: {metrics['recommended_action']}",
+            f"- Manutencao opcional: {metrics['optional_maintenance']}",
+            f"- Informativos: {metrics['informative']}",
             f"- Historicos considerados: {metrics['historical']}",
             f"- Duplicados bloqueados: {metrics['duplicates']}",
             f"- Obsoletos: {metrics['stale']}",
@@ -1394,7 +1451,11 @@ class AyaDevService:
             )
         lines.extend([
             f"- Registros historicos considerados: {metrics['historical']}",
-            f"- Candidatos atuais: {metrics['current']}",
+            f"- Candidatos detectados: {metrics['detected']}",
+            f"- Informativos: {metrics['informative']}",
+            f"- Manutencao opcional: {metrics['optional_maintenance']}",
+            f"- Acao recomendada: {metrics['recommended_action']}",
+            f"- Acionaveis: {metrics['actionable']}",
             f"- Duplicados bloqueados: {metrics['duplicates']}",
             f"- Obsoletos: {metrics['stale']}",
             f"- Elegiveis: {metrics['eligible']}",
@@ -1407,8 +1468,31 @@ class AyaDevService:
 
     def list_candidates(self, scope: str = "") -> str:
         candidates = self._autonomous_candidates()
-        scope = (scope or "atuais").lower().strip()
-        if "obsoleto" in scope:
+        scope = (scope or "resumo").lower().strip()
+        metrics = self._candidate_queue_metrics(candidates)
+        if scope in {"", "resumo", "atuais"}:
+            selected = [candidate for candidate in candidates if not candidate.stale and candidate.qualification_status in {"ACAO_RECOMENDADA", "MANUTENCAO_OPCIONAL"}]
+            lines = [
+                "Resumo dos Candidatos autonomos do Aya Dev:",
+                self._format_candidate_funnel(metrics),
+                "",
+                "Top candidatos priorizados:",
+            ]
+            return "\n".join([*lines, *self._format_candidate_items(selected[:20])])
+        if scope.startswith("top"):
+            candidates = [candidate for candidate in candidates if not candidate.stale and candidate.qualification_status in {"ACAO_RECOMENDADA", "MANUTENCAO_OPCIONAL"}]
+        elif "informativo" in scope:
+            candidates = [candidate for candidate in candidates if candidate.qualification_status == "INFORMATIVO" and not candidate.stale]
+        elif "manutencao" in scope or "manutenção" in scope:
+            candidates = [candidate for candidate in candidates if candidate.qualification_status == "MANUTENCAO_OPCIONAL" and not candidate.stale]
+        elif "bloqueado" in scope:
+            parts = scope.split(maxsplit=1)
+            reason = parts[1].strip().upper() if len(parts) > 1 else ""
+            candidates = [
+                candidate for candidate in candidates
+                if candidate.status == "BLOQUEADO" and (not reason or reason in {code.upper() for code in candidate.reason_codes + candidate.blocked_reasons})
+            ]
+        elif "obsoleto" in scope:
             candidates = [candidate for candidate in candidates if candidate.stale]
         elif "historico" in scope:
             return self.capability_report("")
@@ -1416,18 +1500,48 @@ class AyaDevService:
             candidates = [candidate for candidate in candidates if not candidate.stale]
         if not candidates:
             return "Candidatos autonomos: nenhum candidato real detectado."
-        lines = ["Candidatos autonomos do Aya Dev:"]
-        for item in candidates[:20]:
+        return "\n".join(["Candidatos autonomos do Aya Dev:", *self._format_candidate_items(candidates[:20])])
+
+    def _format_candidate_items(self, candidates: list[AutonomousCandidate]) -> list[str]:
+        if not candidates:
+            return ["- nenhum candidato prioritario."]
+        lines: list[str] = []
+        for item in candidates:
             lines.append(
-                f"- {item.candidate_id} [{item.status}/{item.eligibility}] rota={item.route} score={item.score} "
-                f"risco={item.risk} {item.operation_type}: {item.title}"
+                f"- {item.candidate_id} [{item.qualification_status}/{item.eligibility}] rota={item.route} "
+                f"prioridade={item.priority_score} valor_doc={item.documentation_value_score} risco={item.risk} "
+                f"{item.operation_type}: {item.title}"
             )
             lines.append(f"  head={item.project_head[:12]} arquivo={item.file} simbolo={item.symbol or 'n/a'}")
+            lines.append(f"  razoes: {self._format_reason_codes(item.reason_codes[:8])}")
             if item.blocked_reasons:
                 lines.append(f"  bloqueios: {'; '.join(item.blocked_reasons)}")
             if item.stale:
                 lines.append(f"  obsoleto: {item.stale_reason}")
-        return "\n".join(lines)
+        return lines
+
+    def _format_reason_codes(self, codes: list[str]) -> str:
+        if not codes:
+            return "nenhuma"
+        return "; ".join(f"{code}={AUTONOMY_REASON_EXPLANATIONS.get(code, 'Sem explicacao registrada.')}" for code in codes)
+
+    def _format_candidate_funnel(self, metrics: dict[str, int]) -> str:
+        return "\n".join([
+            f"- Detectados: {metrics['detected']}",
+            f"- Relevantes: {metrics['relevant']}",
+            f"- Nao relevantes: {metrics['not_relevant']}",
+            f"- Acionaveis: {metrics['actionable']}",
+            f"- Informativos: {metrics['informative']}",
+            f"- Manutencao opcional: {metrics['optional_maintenance']}",
+            f"- Acao recomendada: {metrics['recommended_action']}",
+            f"- Qualificados: {metrics['qualified']}",
+            f"- Duplicados: {metrics['duplicates']}",
+            f"- Obsoletos: {metrics['stale']}",
+            f"- Bloqueados por politica: {metrics['blocked_by_policy']}",
+            f"- Bloqueados por capacidade: {metrics['blocked_by_capacity']}",
+            f"- Bloqueados por risco: {metrics['blocked_by_risk']}",
+            f"- Elegiveis: {metrics['eligible']}",
+        ])
 
     def explain_candidate(self, candidate_id: str) -> str:
         return self.show_candidate(candidate_id)
@@ -1453,6 +1567,15 @@ class AyaDevService:
             f"- Simbolos: {', '.join(candidate.symbols)}",
             f"- Evidencias: {' | '.join(candidate.evidence)}",
             f"- Status: {candidate.status}",
+            f"- Classe: {candidate.qualification_status}",
+            f"- Relevante: {'sim' if candidate.relevance_valid else 'nao'}",
+            f"- Acionavel: {'sim' if candidate.actionable else 'nao'}",
+            f"- Valor de documentacao: {candidate.documentation_value_score}",
+            f"- Razoes de valor: {' | '.join(candidate.documentation_value_reasons) or 'nenhuma'}",
+            f"- Prioridade: {candidate.priority_score}",
+            f"- Razoes de prioridade: {' | '.join(candidate.priority_reasons) or 'nenhuma'}",
+            f"- Reason codes: {self._format_reason_codes(candidate.reason_codes)}",
+            f"- Diagnostico Ruff: {candidate.ruff_diagnostic.get('diagnostic_sha256', 'nao aplicavel') if candidate.ruff_diagnostic else 'nao aplicavel'}",
             f"- Atual: {'nao' if candidate.stale else 'sim'}",
             f"- Obsolescencia: {candidate.stale_reason or 'nenhuma'}",
             f"- Fonte: {candidate.source_origin}",
@@ -1469,9 +1592,10 @@ class AyaDevService:
 
     def observe_cycle(self) -> str:
         before = self.workspace.git_state()
-        candidates = self._autonomous_candidates()
+        candidates = self._autonomous_candidates(force=True)
         after = self.workspace.git_state()
         metrics = self._candidate_queue_metrics(candidates)
+        report = self._candidate_scan_report
         return "\n".join([
             "Observacao autonoma somente leitura:",
             f"- Git antes: {before.message}",
@@ -1479,24 +1603,33 @@ class AyaDevService:
             "- Modelo chamado: nao",
             "- Worktree criado: nao",
             "- Codigo alterado: nao",
-            f"- Candidatos atuais: {metrics['current']}",
-            f"- Duplicados bloqueados: {metrics['duplicates']}",
-            f"- Obsoletos: {metrics['stale']}",
-            f"- Elegiveis: {metrics['eligible']}",
-            f"- Bloqueados: {metrics['blocked']}",
+            f"- Duracao da varredura: {report['scan_duration_ms']}ms",
+            f"- Arquivos analisados: {report['files_scanned']}",
+            f"- Arquivos reutilizados: {report['files_reused']}",
+            f"- Cache hits: {report['cache_hits']}",
+            f"- Cache misses: {report['cache_misses']}",
+            f"- Chamadas Ruff: {report['ruff_calls']}",
+            f"- Construcoes do indice: {report['index_builds']}",
+            self._format_candidate_funnel(metrics),
+            "Top candidatos:",
+            *self._format_candidate_items([candidate for candidate in candidates if not candidate.stale][:5]),
         ])
 
     def renew_candidates(self) -> str:
         candidates = self._autonomous_candidates(force=True)
         metrics = self._candidate_queue_metrics(candidates)
+        report = self._candidate_scan_report
         return "\n".join([
             "Renovacao de candidatos concluida sem preparar patch:",
             f"- HEAD: {self._safe_head()}",
-            f"- Candidatos atuais reais: {metrics['current']}",
-            f"- Duplicados bloqueados: {metrics['duplicates']}",
-            f"- Obsoletos: {metrics['stale']}",
-            f"- Elegiveis: {metrics['eligible']}",
-            f"- Bloqueados: {metrics['blocked']}",
+            f"- Duracao: {report['scan_duration_ms']}ms",
+            f"- Arquivos analisados: {report['files_scanned']}",
+            f"- Arquivos reutilizados: {report['files_reused']}",
+            f"- Arquivos removidos: {report['files_removed']}",
+            f"- Cache hits: {report['cache_hits']}",
+            f"- Cache misses: {report['cache_misses']}",
+            f"- Ruff F401: {report['ruff_diagnostics']} diagnostico(s), {report['ruff_calls']} chamada(s)",
+            self._format_candidate_funnel(metrics),
         ])
 
     def capability_report(self, payload: str = "") -> str:
@@ -1544,6 +1677,8 @@ class AyaDevService:
             f"Rota para {candidate.candidate_id}: {candidate.route}",
             f"- Elegibilidade: {candidate.eligibility}",
             f"- Status: {candidate.status}",
+            f"- Classe: {candidate.qualification_status}",
+            f"- Acionavel: {'sim' if candidate.actionable else 'nao'}",
             f"- Obsoleto: {'sim' if candidate.stale else 'nao'} {candidate.stale_reason}",
             f"- Risco: {candidate.risk}",
             f"- Operacao: {candidate.operation_type}",
@@ -1560,6 +1695,8 @@ class AyaDevService:
             return f"Candidato autonomo nao encontrado: {candidate_id}"
         if candidate.stale:
             return f"Selecao bloqueada: OBSOLETO ({candidate.stale_reason})."
+        if candidate.qualification_status != "ACAO_RECOMENDADA" or not candidate.actionable:
+            return f"Selecao bloqueada: {candidate.qualification_status} nao e acao recomendada."
         if candidate.eligibility != "ELEGIVEL":
             return f"Selecao bloqueada: {candidate.eligibility} ({'; '.join(candidate.blocked_reasons) or 'sem motivo adicional'})."
         state = self._load_autonomy_state()
@@ -1616,6 +1753,8 @@ class AyaDevService:
             return f"Candidato autonomo nao encontrado: {candidate_id}"
         if candidate.stale:
             return f"Execucao bloqueada: OBSOLETO ({candidate.stale_reason})."
+        if candidate.qualification_status != "ACAO_RECOMENDADA" or not candidate.actionable:
+            return f"Execucao bloqueada: {candidate.qualification_status} nao e acao recomendada."
         if candidate.route not in {"LOCAL_PREPARE_ONLY", "LOCAL_SUPERVISED"}:
             return f"Execucao bloqueada pela rota: {candidate.route}."
         if candidate.eligibility != "ELEGIVEL":
@@ -2179,7 +2318,124 @@ class AyaDevService:
             return "import_nao_usado"
         return "desconhecida"
 
+    def _empty_candidate_scan_report(self) -> dict:
+        return {
+            "head": "",
+            "files_scanned": 0,
+            "files_reused": 0,
+            "files_changed": 0,
+            "files_removed": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "full_scan": True,
+            "scan_duration_ms": 0,
+            "ruff_calls": 0,
+            "index_builds": 0,
+            "capacity_calculations": 0,
+            "ruff_version": "",
+            "ruff_diagnostics": 0,
+        }
+
+    def _load_candidate_cache(self) -> dict:
+        try:
+            raw = json.loads(self.candidate_cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _save_candidate_cache(self, cache: dict) -> None:
+        self.candidate_cache_path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps(cache, ensure_ascii=True, indent=2, sort_keys=True)
+        self.candidate_cache_path.write_text(self.workspace.sanitize(text, max(len(text), 5000000)), encoding="utf-8")
+
+    def _candidate_from_dict(self, raw: dict, *, head: str) -> AutonomousCandidate | None:
+        if not isinstance(raw, dict):
+            return None
+        allowed = set(AutonomousCandidate.__dataclass_fields__)
+        data = {key: raw.get(key) for key in allowed if key in raw}
+        missing = [key for key in allowed if key not in data]
+        if missing:
+            return None
+        data["project_head"] = head
+        data["deduplication_key"] = self._candidate_dedup_key(
+            head,
+            str(data.get("operation_type", "")),
+            str(data.get("file", "")),
+            str(data.get("symbol", "")),
+            str(data.get("expected_change", "")),
+        )
+        data["record_sha256"] = self._sha_json({
+            "source": data.get("source", ""),
+            "operation_type": data.get("operation_type", ""),
+            "file": data.get("file", ""),
+            "symbol": data.get("symbol", ""),
+            "expected_change": data.get("expected_change", ""),
+            "head": head,
+            "file_sha256": data.get("file_sha256", ""),
+            "deduplication_key": data["deduplication_key"],
+            "schema": AUTONOMY_CANDIDATE_SCHEMA_VERSION,
+        })
+        return AutonomousCandidate(**data)
+
+    def _candidate_cache_compatible(self, cache: dict, *, ruff_version: str) -> bool:
+        return (
+            cache.get("root") == str(self.root)
+            and cache.get("policy_version") == AUTONOMY_POLICY_VERSION
+            and cache.get("qualification_version") == AUTONOMY_QUALIFICATION_VERSION
+            and cache.get("schema_version") == AUTONOMY_CANDIDATE_SCHEMA_VERSION
+            and cache.get("analyzer_version") == AUTONOMY_ANALYZER_VERSION
+            and cache.get("ruff_version") == ruff_version
+        )
+
+    def _ruff_version(self) -> str:
+        result = self.workspace._run(("python", "-m", "ruff", "--version"), self.root, 60)
+        if result.returncode != 0:
+            return "ruff-indisponivel"
+        return result.stdout.strip() or "ruff-versao-desconhecida"
+
+    def _ruff_f401_diagnostics(self, ruff_version: str) -> dict[str, list[dict]]:
+        if ruff_version == "ruff-indisponivel":
+            return {}
+        result = self.workspace._run(
+            ("python", "-m", "ruff", "check", ".", "--select", "F401", "--output-format", "json"),
+            self.root,
+            180,
+        )
+        if result.returncode not in {0, 1}:
+            return {}
+        try:
+            diagnostics = json.loads(result.stdout or "[]")
+        except ValueError:
+            return {}
+        grouped: dict[str, list[dict]] = {}
+        for item in diagnostics if isinstance(diagnostics, list) else []:
+            if item.get("code") != "F401":
+                continue
+            filename = str(item.get("filename", ""))
+            path = Path(filename)
+            rel = self._relative_to_root(path if path.is_absolute() else self.root / path)
+            location = item.get("location") or {}
+            diagnostic = {
+                "code": "F401",
+                "file": rel,
+                "line": int(location.get("row") or 0),
+                "column": int(location.get("column") or 0),
+                "message": str(item.get("message", "")),
+                "fix": item.get("fix") or {},
+                "ruff_version": ruff_version,
+            }
+            diagnostic["diagnostic_sha256"] = self._sha_json(diagnostic)
+            grouped.setdefault(rel, []).append(diagnostic)
+        return grouped
+
+    def _relative_to_root(self, path: Path) -> str:
+        try:
+            return path.resolve().relative_to(self.root).as_posix()
+        except ValueError:
+            return path.as_posix()
+
     def _autonomous_candidates(self, *, force: bool = False) -> list[AutonomousCandidate]:
+        started = time.perf_counter()
         head = self._safe_head()
         proposal_count = len(self.proposals)
         if (
@@ -2188,48 +2444,136 @@ class AyaDevService:
             and self._candidate_cache_head == head
             and self._candidate_cache_proposals == proposal_count
         ):
-            return self._validate_candidate_list(self._candidate_cache)
-        candidates: list[AutonomousCandidate] = []
+            self._candidate_scan_report["scan_duration_ms"] = int((time.perf_counter() - started) * 1000)
+            return self._validate_candidate_list(self._candidate_cache, head=head)
+        report = self._empty_candidate_scan_report()
+        report["head"] = head
+        ruff_version = self._ruff_version()
+        report["ruff_version"] = ruff_version
+        persistent_cache = self._load_candidate_cache()
+        compatible_cache = self._candidate_cache_compatible(persistent_cache, ruff_version=ruff_version)
+        cached_files = persistent_cache.get("files", {}) if compatible_cache else {}
+        report["full_scan"] = not compatible_cache
+        report["ruff_calls"] = 1
+        ruff = self._ruff_f401_diagnostics(ruff_version)
+        report["ruff_diagnostics"] = sum(len(items) for items in ruff.values())
+        report["index_builds"] = 1
+        entries = self.index.build()
         stats = self._operation_stats()
-        for entry in self.index.build():
+        report["capacity_calculations"] = 1
+        entries_by_path = {entry.path: entry for entry in entries}
+        current_paths = set(entries_by_path)
+        cached_paths = set(cached_files) if isinstance(cached_files, dict) else set()
+        report["files_removed"] = len(cached_paths - current_paths)
+        file_cache: dict[str, dict] = {}
+        candidates: list[AutonomousCandidate] = []
+        for entry in entries:
             if entry.path.startswith("tests/") or self._candidate_path_blocked(entry.path):
                 continue
-            candidates.extend(self._docstring_candidates(entry, stats))
-            candidates.extend(self._unused_import_candidates(entry, stats))
+            cached = cached_files.get(entry.path, {}) if isinstance(cached_files, dict) else {}
+            ruff_key = self._sha_json(ruff.get(entry.path, []))
+            can_reuse = (
+                compatible_cache
+                and cached.get("sha256") == entry.sha256
+                and cached.get("ruff_key") == ruff_key
+            )
+            if can_reuse:
+                reused: list[AutonomousCandidate] = []
+                for raw in cached.get("candidates", []):
+                    candidate = self._candidate_from_dict(raw, head=head)
+                    if candidate:
+                        reused.append(candidate)
+                candidates.extend(reused)
+                file_cache[entry.path] = cached
+                report["files_reused"] += 1
+                report["cache_hits"] += 1
+                continue
+            report["files_scanned"] += 1
+            report["files_changed"] += 1 if cached else 0
+            report["cache_misses"] += 1
+            file_candidates = [
+                *self._docstring_candidates(entry, stats, entries),
+                *self._unused_import_candidates(entry, stats, ruff.get(entry.path, []), ruff_version),
+            ]
+            candidates.extend(file_candidates)
+            file_cache[entry.path] = {
+                "sha256": entry.sha256,
+                "ruff_key": ruff_key,
+                "candidates": [asdict(candidate) for candidate in file_candidates],
+            }
+        self._save_candidate_cache({
+            "root": str(self.root),
+            "head": head,
+            "policy_version": AUTONOMY_POLICY_VERSION,
+            "qualification_version": AUTONOMY_QUALIFICATION_VERSION,
+            "schema_version": AUTONOMY_CANDIDATE_SCHEMA_VERSION,
+            "analyzer_version": AUTONOMY_ANALYZER_VERSION,
+            "ruff_version": ruff_version,
+            "files": file_cache,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        report["scan_duration_ms"] = int((time.perf_counter() - started) * 1000)
+        self._candidate_scan_report = report
         self._candidate_cache = candidates
         self._candidate_cache_head = head
         self._candidate_cache_proposals = proposal_count
-        return self._validate_candidate_list(candidates)
+        return self._validate_candidate_list(candidates, head=head)
 
-    def _validate_candidate_list(self, candidates: list[AutonomousCandidate]) -> list[AutonomousCandidate]:
+    def _validate_candidate_list(self, candidates: list[AutonomousCandidate], *, head: str | None = None) -> list[AutonomousCandidate]:
         seen: dict[str, AutonomousCandidate] = {}
         deduplicated: list[AutonomousCandidate] = []
+        current_hashes: dict[str, str] = {}
+        head = head or self._safe_head()
         for candidate in candidates:
-            candidate = self._validate_current_candidate(candidate)
+            candidate = self._validate_current_candidate(candidate, current_hashes=current_hashes, head=head)
             if candidate.deduplication_key in seen:
-                duplicate = self._replace_candidate_status(candidate, "BLOQUEADO", ["DUPLICADO"], route="CODEX_REVIEW_RECOMMENDED")
+                duplicate = self._replace_candidate_status(
+                    candidate,
+                    "BLOQUEADO",
+                    ["DUPLICADO"],
+                    route="CODEX_REVIEW_RECOMMENDED",
+                    reason_codes=["DUPLICATE_CURRENT_CANDIDATE"],
+                )
                 deduplicated.append(duplicate)
                 continue
             seen[candidate.deduplication_key] = candidate
             deduplicated.append(candidate)
-        deduplicated.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
+        deduplicated.sort(key=lambda item: (-item.priority_score, -item.documentation_value_score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
         return deduplicated
 
-    def _docstring_candidates(self, entry: TechnicalFile, stats: dict[str, dict[str, int]]) -> list[AutonomousCandidate]:
+    def _docstring_candidates(
+        self,
+        entry: TechnicalFile,
+        stats: dict[str, dict[str, int]],
+        all_entries: list[TechnicalFile],
+    ) -> list[AutonomousCandidate]:
         path = self.root / entry.path
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            tree = ast.parse(text)
         except (OSError, SyntaxError):
             return []
         parents = self._ast_parents(tree)
+        lines = text.splitlines()
         candidates: list[AutonomousCandidate] = []
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
-            if node.name.startswith("_") or ast.get_docstring(node):
-                continue
             symbol = self._qualified_symbol(tree, node, parents)
             if not symbol:
+                continue
+            qualification = self._qualify_docstring_candidate(entry, node, symbol, parents, lines, all_entries)
+            hard_exclusions = {
+                "DOCSTRING_EXISTS",
+                "TEST_FILE",
+                "PRIVATE_SYMBOL",
+                "DUNDER_SYMBOL",
+                "INIT_TRIVIAL",
+                "GETTER_SETTER_TRIVIAL",
+                "TRIVIAL_BODY",
+                "NESTED_SYMBOL",
+            }
+            if hard_exclusions & set(qualification["reason_codes"]):
                 continue
             candidates.append(self._build_candidate(
                 source="ast:missing_docstring",
@@ -2246,43 +2590,205 @@ class AyaDevService:
                 expected_change=f"inserir docstring em {symbol}",
                 symbol_signature=self._signature_for_symbol(entry, symbol),
                 stats=stats,
+                qualification=qualification,
+                ruff_diagnostic={},
+                file_sha256=entry.sha256,
             ))
         return candidates
 
-    def _unused_import_candidates(self, entry: TechnicalFile, stats: dict[str, dict[str, int]]) -> list[AutonomousCandidate]:
+    def _unused_import_candidates(
+        self,
+        entry: TechnicalFile,
+        stats: dict[str, dict[str, int]],
+        diagnostics: list[dict],
+        ruff_version: str,
+    ) -> list[AutonomousCandidate]:
         path = self.root / entry.path
         try:
             text = path.read_text(encoding="utf-8-sig", errors="replace")
-            tree = ast.parse(text)
-        except (OSError, SyntaxError):
+        except OSError:
             return []
-        used_names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
         candidates: list[AutonomousCandidate] = []
-        for node in ast.iter_child_nodes(tree):
-            if not isinstance(node, ast.Import) or len(node.names) != 1:
+        text_lines = text.splitlines()
+        for diagnostic in diagnostics:
+            line_number = int(diagnostic.get("line") or 0)
+            if line_number <= 0 or line_number > len(text_lines):
                 continue
-            alias = node.names[0]
-            local_name = alias.asname or alias.name.split(".", 1)[0]
-            if local_name in used_names:
-                continue
-            line = text.splitlines()[node.lineno - 1]
+            line = text_lines[line_number - 1]
+            qualification = self._qualify_ruff_f401_candidate(entry, text, line, diagnostic, ruff_version)
             candidates.append(self._build_candidate(
-                source="ast:unused_import",
-                title=f"Remover import nao usado {alias.name}",
-                problem=f"O import {alias.name} nao e referenciado no arquivo.",
-                evidence=[f"{entry.path}:{node.lineno} import nao usado por varredura AST local"],
+                source="ruff:F401",
+                title=f"Remover import nao usado em {entry.path}:{line_number}",
+                problem=diagnostic.get("message", "Ruff F401 confirmou import nao usado."),
+                evidence=[f"{entry.path}:{line_number} F401 confirmado por Ruff", diagnostic.get("diagnostic_sha256", "")],
                 category="import_nao_usado",
                 operation_type="replace_exact",
                 files=[entry.path],
                 symbols=[],
                 estimated_changed_lines=1,
                 required_tests=entry.related_tests[:2],
-                reason="import nao referenciado por varredura AST local",
+                reason="Ruff F401 confirmou import nao utilizado",
                 expected_change=f"remover linha exata: {line.strip()}",
                 symbol_signature="",
                 stats=stats,
+                qualification=qualification,
+                ruff_diagnostic=diagnostic,
+                file_sha256=entry.sha256,
             ))
         return candidates
+
+    def _qualify_docstring_candidate(
+        self,
+        entry: TechnicalFile,
+        node: ast.AST,
+        symbol: str,
+        parents: dict[ast.AST, ast.AST],
+        lines: list[str],
+        all_entries: list[TechnicalFile],
+    ) -> dict:
+        reason_codes: list[str] = []
+        value_reasons: list[str] = []
+        if entry.path.startswith("tests/"):
+            reason_codes.append("TEST_FILE")
+        if ast.get_docstring(node):
+            reason_codes.append("DOCSTRING_EXISTS")
+        name = getattr(node, "name", "")
+        if name == "__init__":
+            reason_codes.append("INIT_TRIVIAL")
+        elif name.startswith("__") and name.endswith("__"):
+            reason_codes.append("DUNDER_SYMBOL")
+        elif name.startswith("_"):
+            reason_codes.append("PRIVATE_SYMBOL")
+        if self._is_nested_symbol(node, parents):
+            reason_codes.append("NESTED_SYMBOL")
+        body_lines = max((getattr(node, "end_lineno", getattr(node, "lineno", 1)) or 1) - (getattr(node, "lineno", 1) or 1) + 1, 1)
+        if body_lines <= 1:
+            reason_codes.append("TRIVIAL_BODY")
+        if self._is_trivial_getter_setter(node):
+            reason_codes.append("GETTER_SETTER_TRIVIAL")
+        if not any(code in reason_codes for code in {"PRIVATE_SYMBOL", "DUNDER_SYMBOL", "INIT_TRIVIAL", "GETTER_SETTER_TRIVIAL", "TRIVIAL_BODY", "NESTED_SYMBOL"}):
+            reason_codes.append("PUBLIC_SYMBOL")
+        if body_lines >= AUTONOMY_MIN_DOCSTRING_LINES:
+            reason_codes.append("PUBLIC_NONTRIVIAL_SYMBOL")
+            value_reasons.append(f"linhas={body_lines}")
+        external_refs = self._external_symbol_references(entry.path, name, all_entries)
+        if external_refs:
+            reason_codes.append("EXTERNALLY_REFERENCED")
+            value_reasons.append(f"referencias_externas={external_refs}")
+        branches = sum(isinstance(child, (ast.If, ast.For, ast.While, ast.Try, ast.With, ast.Match, ast.BoolOp)) for child in ast.walk(node))
+        if branches:
+            reason_codes.append("MULTI_BRANCH_BODY")
+            value_reasons.append(f"caminhos={branches}")
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            params = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs] if arg.arg not in {"self", "cls"}]
+            if params:
+                reason_codes.append("PARAMETERS_NONTRIVIAL")
+                value_reasons.append(f"parametros={len(params)}")
+            if any(isinstance(child, ast.Return) and child.value is not None for child in ast.walk(node)):
+                reason_codes.append("RETURNS_VALUE")
+                value_reasons.append("retorno=sim")
+        if any(isinstance(child, ast.Raise) for child in ast.walk(node)):
+            reason_codes.append("RAISES_EXCEPTION")
+            value_reasons.append("excecao=sim")
+        if entry.related_tests:
+            reason_codes.append("HAS_RELATED_TESTS")
+            value_reasons.append("testes=sim")
+        if entry.path.startswith("aya/core/"):
+            reason_codes.append("CENTRAL_MODULE")
+            value_reasons.append("modulo_central=sim")
+        if any(term in f"{entry.path} {symbol}".lower() for term in ("security", "permission", "database", "sqlite", "memory", "backup", "rag", "auth", "token")):
+            reason_codes.append("TECHNICAL_RESPONSIBILITY")
+            value_reasons.append("responsabilidade_tecnica=sim")
+        value_score = self._documentation_value_score(reason_codes, body_lines)
+        if value_score < 25:
+            reason_codes.append("LOW_TECHNICAL_VALUE")
+        if any(code in reason_codes for code in {"PRIVATE_SYMBOL", "DUNDER_SYMBOL", "INIT_TRIVIAL", "GETTER_SETTER_TRIVIAL", "TRIVIAL_BODY", "NESTED_SYMBOL", "LOW_TECHNICAL_VALUE"}):
+            qualification = "INFORMATIVO"
+            relevance_valid = "LOW_TECHNICAL_VALUE" not in reason_codes
+            actionable = False
+        elif value_score >= 55 and ("EXTERNALLY_REFERENCED" in reason_codes or "TECHNICAL_RESPONSIBILITY" in reason_codes):
+            qualification = "ACAO_RECOMENDADA"
+            relevance_valid = True
+            actionable = True
+        else:
+            qualification = "MANUTENCAO_OPCIONAL"
+            relevance_valid = True
+            actionable = False
+        return {
+            "detection_valid": True,
+            "relevance_valid": relevance_valid,
+            "actionable": actionable,
+            "qualification_status": qualification,
+            "qualification_reasons": reason_codes,
+            "documentation_value_score": value_score,
+            "documentation_value_reasons": value_reasons or ["sem_sinal_forte"],
+            "reason_codes": reason_codes,
+        }
+
+    def _qualify_ruff_f401_candidate(self, entry: TechnicalFile, text: str, line: str, diagnostic: dict, ruff_version: str) -> dict:
+        reason_codes = ["RUFF_F401_CONFIRMED"]
+        if "# noqa" in line.lower():
+            reason_codes.append("NOQA_IMPORT")
+        if "if TYPE_CHECKING" in text or "typing import TYPE_CHECKING" in text:
+            reason_codes.append("TYPE_CHECKING_IMPORT")
+        if entry.path.endswith("__init__.py") or "__all__" in text:
+            reason_codes.append("POSSIBLE_REEXPORT")
+        stripped = line.strip()
+        if stripped.startswith("import ") and " as " not in stripped and "." not in stripped:
+            reason_codes.append("SIDE_EFFECT_IMPORT")
+        blocked = any(code in reason_codes for code in {"NOQA_IMPORT", "TYPE_CHECKING_IMPORT", "POSSIBLE_REEXPORT", "SIDE_EFFECT_IMPORT"})
+        return {
+            "detection_valid": True,
+            "relevance_valid": True,
+            "actionable": not blocked,
+            "qualification_status": "MANUTENCAO_OPCIONAL" if not blocked else "BLOQUEADO",
+            "qualification_reasons": reason_codes,
+            "documentation_value_score": 0,
+            "documentation_value_reasons": [f"ruff={ruff_version}", diagnostic.get("diagnostic_sha256", "")],
+            "reason_codes": reason_codes,
+        }
+
+    def _documentation_value_score(self, reason_codes: list[str], body_lines: int) -> int:
+        weights = {
+            "PUBLIC_NONTRIVIAL_SYMBOL": 20,
+            "EXTERNALLY_REFERENCED": 30,
+            "MULTI_BRANCH_BODY": 15,
+            "PARAMETERS_NONTRIVIAL": 10,
+            "RETURNS_VALUE": 10,
+            "RAISES_EXCEPTION": 12,
+            "HAS_RELATED_TESTS": 10,
+            "CENTRAL_MODULE": 8,
+            "TECHNICAL_RESPONSIBILITY": 20,
+        }
+        score = min(body_lines, 40)
+        return score + sum(weights.get(code, 0) for code in set(reason_codes))
+
+    def _is_nested_symbol(self, node: ast.AST, parents: dict[ast.AST, ast.AST]) -> bool:
+        parent = parents.get(node)
+        while parent is not None:
+            if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return True
+            parent = parents.get(parent)
+        return False
+
+    def _is_trivial_getter_setter(self, node: ast.AST) -> bool:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return False
+        body = [item for item in node.body if not isinstance(item, ast.Expr) or not isinstance(getattr(item, "value", None), ast.Constant)]
+        if len(body) != 1:
+            return False
+        item = body[0]
+        if isinstance(item, ast.Return) and isinstance(item.value, ast.Attribute):
+            return True
+        if isinstance(item, ast.Assign) and len(item.targets) == 1:
+            return True
+        return False
+
+    def _external_symbol_references(self, current_file: str, name: str, entries: list[TechnicalFile]) -> int:
+        if not name:
+            return 0
+        needle = name.lower()
+        return sum(1 for entry in entries if entry.path != current_file and needle in {call.lower() for call in entry.calls})
 
     def _build_candidate(
         self,
@@ -2301,9 +2807,12 @@ class AyaDevService:
         expected_change: str,
         symbol_signature: str,
         stats: dict[str, dict[str, int]],
+        qualification: dict,
+        ruff_diagnostic: dict,
+        file_sha256: str,
     ) -> AutonomousCandidate:
         head = self._safe_head()
-        file_sha256 = self._file_sha256(files[0]) if files else ""
+        file_sha256 = file_sha256 or (self._file_sha256(files[0]) if files else "")
         symbol = symbols[0] if symbols else ""
         risk = self.classify_risk(problem, files, title)
         lessons = self._candidate_lessons(files, operation_type)
@@ -2311,8 +2820,19 @@ class AyaDevService:
         blocked = self._candidate_blocked_reasons(files, category, operation_type, risk, estimated_changed_lines)
         operation_stats = self._empty_operation_stats() | stats.get(operation_type, {})
         policy = self._operation_policy_status(operation_type, operation_stats)
+        reason_codes = list(dict.fromkeys(qualification.get("reason_codes", [])))
         if policy != "ELEGIVEL" and not blocked:
             blocked.append(policy)
+        if policy == "DADOS_INSUFICIENTES":
+            reason_codes.append("CAPABILITY_INSUFFICIENT")
+        if policy == "BLOQUEADO_POR_FALHAS":
+            reason_codes.append("HISTORICAL_FAILURES")
+        if risk != "baixo":
+            reason_codes.append("HIGH_RISK_MODULE")
+        if any(reason.startswith("ARQUIVO_BLOQUEADO") for reason in blocked):
+            reason_codes.append("FILE_BLOCKED")
+        if not qualification.get("actionable", False) and qualification.get("qualification_status") != "BLOQUEADO":
+            blocked.append("NAO_ACIONAVEL")
         eligibility = "ELEGIVEL" if not blocked else ("DADOS_INSUFICIENTES" if blocked == ["DADOS_INSUFICIENTES"] else "BLOQUEADO")
         score, score_explanation = self._candidate_score(
             evidence=evidence,
@@ -2322,8 +2842,16 @@ class AyaDevService:
             changed_lines=estimated_changed_lines,
             blocked=blocked,
         )
+        priority_score, priority_reasons = self._candidate_priority_score(
+            qualification=qualification,
+            stats=operation_stats,
+            risk=risk,
+            blocked=blocked,
+            required_tests=required_tests,
+        )
         deduplication_key = self._candidate_dedup_key(head, operation_type, files[0], symbol, expected_change)
         route = self._route_from_candidate_state(eligibility, blocked, risk, operation_type, operation_stats, stale=False)
+        final_status = qualification.get("qualification_status", "INFORMATIVO")
         raw = {
             "source": source,
             "title": title,
@@ -2339,6 +2867,9 @@ class AyaDevService:
             "file_sha256": file_sha256,
             "symbol_signature": symbol_signature,
             "deduplication_key": deduplication_key,
+            "qualification_status": qualification.get("qualification_status", ""),
+            "priority_score": priority_score,
+            "schema": AUTONOMY_CANDIDATE_SCHEMA_VERSION,
         }
         digest = self._sha_json(raw)
         return AutonomousCandidate(
@@ -2366,7 +2897,18 @@ class AyaDevService:
             risk=risk,
             required_tests=required_tests,
             confidence="baseada em evidencias locais" if eligibility == "ELEGIVEL" else "limitada",
-            status="ELEGIVEL" if eligibility == "ELEGIVEL" else "BLOQUEADO",
+            detection_valid=bool(qualification.get("detection_valid", True)),
+            relevance_valid=bool(qualification.get("relevance_valid", False)),
+            actionable=bool(qualification.get("actionable", False)),
+            qualification_status=str(qualification.get("qualification_status", "INFORMATIVO")),
+            qualification_reasons=list(qualification.get("qualification_reasons", reason_codes)),
+            documentation_value_score=int(qualification.get("documentation_value_score", 0)),
+            documentation_value_reasons=list(qualification.get("documentation_value_reasons", [])),
+            priority_score=priority_score,
+            priority_reasons=priority_reasons,
+            reason_codes=list(dict.fromkeys(reason_codes)),
+            ruff_diagnostic=ruff_diagnostic,
+            status=final_status,
             eligibility=eligibility,
             blocked_reasons=blocked,
             related_lessons=lessons,
@@ -2432,6 +2974,38 @@ class AyaDevService:
             reasons.append("bloqueado=" + ",".join(blocked))
         return score, reasons
 
+    def _candidate_priority_score(
+        self,
+        *,
+        qualification: dict,
+        stats: dict[str, int],
+        risk: str,
+        blocked: list[str],
+        required_tests: list[str],
+    ) -> tuple[int, list[str]]:
+        score = int(qualification.get("documentation_value_score", 0))
+        reasons = [f"valor_tecnico={score}"]
+        if qualification.get("qualification_status") == "ACAO_RECOMENDADA":
+            score += 40
+            reasons.append("acao_recomendada=sim")
+        elif qualification.get("qualification_status") == "MANUTENCAO_OPCIONAL":
+            score += 15
+            reasons.append("manutencao_opcional=sim")
+        if required_tests:
+            score += 10
+            reasons.append("testabilidade=sim")
+        score += min(stats.get("success", 0), 5) * 4
+        if stats.get("fail", 0):
+            score -= 40
+            reasons.append("falhas_historicas=sim")
+        if risk != "baixo":
+            score -= 60
+            reasons.append(f"risco={risk}")
+        if blocked:
+            score -= 100
+            reasons.append("bloqueado=sim")
+        return score, reasons
+
     def _candidate_path_blocked(self, file: str) -> bool:
         lowered = file.lower()
         return any(term in lowered for term in AUTONOMY_BLOCKED_TERMS) or self.workspace._path_error(file) != ""
@@ -2444,14 +3018,24 @@ class AyaDevService:
         name = symbol.split(".")[-1]
         return next((signature for signature in entry.signatures if signature.startswith(f"{name}(")), "")
 
-    def _validate_current_candidate(self, candidate: AutonomousCandidate) -> AutonomousCandidate:
-        if candidate.project_head != self._safe_head():
+    def _validate_current_candidate(
+        self,
+        candidate: AutonomousCandidate,
+        current_hashes: dict[str, str] | None = None,
+        head: str | None = None,
+    ) -> AutonomousCandidate:
+        if candidate.project_head != (head or self._safe_head()):
             return self._stale_candidate(candidate, "HEAD mudou desde a deteccao.")
         path = self.root / candidate.file
         if not path.exists():
             return self._stale_candidate(candidate, "arquivo nao existe mais.")
         try:
-            current_hash = self._file_sha256(candidate.file)
+            if current_hashes is not None and candidate.file in current_hashes:
+                current_hash = current_hashes[candidate.file]
+            else:
+                current_hash = self._file_sha256(candidate.file)
+                if current_hashes is not None:
+                    current_hashes[candidate.file] = current_hash
         except (OSError, StructuredPatchError):
             return self._stale_candidate(candidate, "hash atual indisponivel.")
         if current_hash != candidate.file_sha256:
@@ -2492,7 +3076,22 @@ class AyaDevService:
         return False
 
     def _stale_candidate(self, candidate: AutonomousCandidate, reason: str) -> AutonomousCandidate:
-        return self._replace_candidate_status(candidate, "OBSOLETO", ["OBSOLETO"], stale=True, stale_reason=reason, route="CODEX_REVIEW_RECOMMENDED")
+        code = "STALE_FILE_HASH"
+        if "HEAD" in reason:
+            code = "STALE_HEAD"
+        elif "nao existe" in reason:
+            code = "STALE_FILE_REMOVED"
+        elif "teste" in reason:
+            code = "STALE_RELATED_TEST"
+        return self._replace_candidate_status(
+            candidate,
+            "OBSOLETO",
+            ["OBSOLETO"],
+            stale=True,
+            stale_reason=reason,
+            route="CODEX_REVIEW_RECOMMENDED",
+            reason_codes=[code],
+        )
 
     def _replace_candidate_status(
         self,
@@ -2503,11 +3102,15 @@ class AyaDevService:
         stale: bool | None = None,
         stale_reason: str | None = None,
         route: str | None = None,
+        reason_codes: list[str] | None = None,
     ) -> AutonomousCandidate:
         data = asdict(candidate)
         data["status"] = status
         data["eligibility"] = "ELEGIVEL" if status == "ELEGIVEL" and not blocked_reasons else "BLOQUEADO"
         data["blocked_reasons"] = [*candidate.blocked_reasons, *blocked_reasons]
+        data["qualification_status"] = status if status in {"BLOQUEADO", "OBSOLETO"} else candidate.qualification_status
+        data["reason_codes"] = list(dict.fromkeys([*candidate.reason_codes, *(reason_codes or [])]))
+        data["qualification_reasons"] = list(dict.fromkeys([*candidate.qualification_reasons, *(reason_codes or [])]))
         data["stale"] = candidate.stale if stale is None else stale
         data["stale_reason"] = candidate.stale_reason if stale_reason is None else stale_reason
         data["route"] = candidate.route if route is None else route
@@ -2535,13 +3138,30 @@ class AyaDevService:
 
     def _candidate_queue_metrics(self, candidates: list[AutonomousCandidate]) -> dict[str, int]:
         historical = sum(item["total"] for item in self._operation_stats().values())
+        detected = len(candidates)
+        stale = sum(1 for item in candidates if item.stale or item.qualification_status == "OBSOLETO")
+        blocked = sum(1 for item in candidates if not item.stale and item.qualification_status == "BLOQUEADO")
+        informative = sum(1 for item in candidates if not item.stale and item.qualification_status == "INFORMATIVO")
+        optional = sum(1 for item in candidates if not item.stale and item.qualification_status == "MANUTENCAO_OPCIONAL")
+        recommended = sum(1 for item in candidates if not item.stale and item.qualification_status == "ACAO_RECOMENDADA")
         return {
             "historical": historical,
+            "detected": detected,
             "current": sum(1 for item in candidates if not item.stale),
+            "relevant": sum(1 for item in candidates if item.relevance_valid),
+            "not_relevant": sum(1 for item in candidates if not item.relevance_valid),
+            "actionable": sum(1 for item in candidates if item.actionable),
+            "informative": informative,
+            "optional_maintenance": optional,
+            "recommended_action": recommended,
+            "qualified": informative + optional + recommended + blocked + stale,
+            "classified_total": informative + optional + recommended + blocked + stale,
+            "blocked_class": blocked,
             "duplicates": sum(1 for item in candidates if "DUPLICADO" in item.blocked_reasons),
-            "stale": sum(1 for item in candidates if item.stale),
+            "stale": stale,
             "eligible": sum(1 for item in candidates if item.eligibility == "ELEGIVEL" and not item.stale),
             "blocked": sum(1 for item in candidates if item.eligibility != "ELEGIVEL"),
+            "blocked_by_policy": sum(1 for item in candidates if any(reason in item.blocked_reasons for reason in {"NAO_ACIONAVEL", "DUPLICADO"}) or item.qualification_status == "BLOQUEADO"),
             "blocked_by_risk": sum(1 for item in candidates if any(reason.startswith("RISCO_") for reason in item.blocked_reasons)),
             "blocked_by_capacity": sum(1 for item in candidates if "BLOQUEADO_POR_FALHAS" in item.blocked_reasons),
             "blocked_by_insufficient_data": sum(1 for item in candidates if "DADOS_INSUFICIENTES" in item.blocked_reasons),
@@ -2596,10 +3216,13 @@ class AyaDevService:
         return next((candidate for candidate in self._autonomous_candidates() if candidate.candidate_id == wanted), None)
 
     def _select_best_candidate(self) -> AutonomousCandidate | None:
-        candidates = [candidate for candidate in self._autonomous_candidates() if candidate.eligibility == "ELEGIVEL"]
+        candidates = [
+            candidate for candidate in self._autonomous_candidates()
+            if candidate.eligibility == "ELEGIVEL" and candidate.qualification_status == "ACAO_RECOMENDADA" and candidate.actionable
+        ]
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
+        candidates.sort(key=lambda item: (-item.priority_score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
         return candidates[0]
 
     def _candidate_suggested_change(self, candidate: AutonomousCandidate) -> str:

@@ -79,6 +79,9 @@ class AyaDevPanel:
     def autonomy_capability(self, filter_text: str = "") -> str:
         return self.aya.aya_dev.capability_report(filter_text)
 
+    def autonomy_candidates(self, scope: str = "") -> str:
+        return self.aya.aya_dev.list_candidates(scope)
+
     def autonomy_route(self, candidate_id: str) -> tuple[str, str]:
         candidate_id = (candidate_id or "").strip()
         if not candidate_id:

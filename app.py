@@ -503,6 +503,11 @@ def create_app(
                         autonomia_status_dev = gr.Textbox(label="Modo e estado", lines=7)
                         autonomia_avaliacao_dev = gr.Textbox(label="Elegibilidade", lines=10)
                         autonomia_candidatos_dev = gr.Textbox(label="Candidatos", lines=12)
+                        autonomia_escopo_dev = gr.Dropdown(
+                            label="Filtro de candidatos",
+                            choices=["resumo", "top", "informativos", "manutencao", "bloqueados", "obsoletos", "todos"],
+                            value="resumo",
+                        )
                         autonomia_observar_dev = gr.Textbox(label="Observacao somente leitura", lines=8)
                         autonomia_capacidade_filtro_dev = gr.Textbox(
                             label="Filtro de capacidade",
@@ -511,6 +516,7 @@ def create_app(
                         autonomia_capacidade_dev = gr.Textbox(label="Capacidade historica", lines=8)
                         autonomia_candidato_id_dev = gr.Textbox(label="ID do candidato para rota")
                         with gr.Row(elem_classes="aya-compact"):
+                            autonomia_filtrar_btn_dev = gr.Button("Filtrar candidatos")
                             autonomia_capacidade_btn_dev = gr.Button("Ver capacidade")
                             autonomia_rota_btn_dev = gr.Button("Explicar rota")
                         autonomia_rota_dev = gr.Textbox(label="Rota", lines=2)
@@ -581,6 +587,11 @@ def create_app(
                 aya_dev_ui.autonomy_capability,
                 inputs=autonomia_capacidade_filtro_dev,
                 outputs=autonomia_capacidade_dev,
+            )
+            autonomia_filtrar_btn_dev.click(
+                aya_dev_ui.autonomy_candidates,
+                inputs=autonomia_escopo_dev,
+                outputs=autonomia_candidatos_dev,
             )
             autonomia_rota_btn_dev.click(
                 aya_dev_ui.autonomy_route,
