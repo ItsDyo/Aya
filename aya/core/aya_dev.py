@@ -199,18 +199,29 @@ class EngineeringMemoryEntry:
 class AutonomousCandidate:
     candidate_id: str
     detected_at: str
+    generated_at: str
+    project_head: str
     source: str
+    source_origin: str
     title: str
     problem: str
     evidence: list[str]
     category: str
     operation_type: str
+    file: str
+    file_sha256: str
+    symbol: str
+    symbol_signature: str
+    reason: str
+    expected_change: str
+    allowed_files: list[str]
     files: list[str]
     symbols: list[str]
     estimated_changed_lines: int
     risk: str
     required_tests: list[str]
     confidence: str
+    status: str
     eligibility: str
     blocked_reasons: list[str]
     related_lessons: list[str]
@@ -218,6 +229,10 @@ class AutonomousCandidate:
     policy_version: int
     score: int
     score_explanation: list[str]
+    deduplication_key: str
+    stale: bool
+    stale_reason: str
+    route: str
     record_sha256: str
 
 
@@ -261,6 +276,9 @@ class AyaDevService:
         self.max_changed_lines = max_changed_lines
         self.max_attempts = max_attempts
         self.proposals = self._load()
+        self._candidate_cache: list[AutonomousCandidate] | None = None
+        self._candidate_cache_head = ""
+        self._candidate_cache_proposals = -1
 
     def execute(self, payload: str) -> str:
         action, _, argument = (payload or "status").strip().partition(" ")
@@ -279,11 +297,22 @@ class AyaDevService:
             "memoria": self.engineering_memory,
             "autonomia-status": self.autonomy_status,
             "avaliar-autonomia": self.evaluate_autonomy,
-            "candidatos": self.list_candidates,
             "fila-autonoma": self.autonomous_queue,
+            "observar-ciclo": self.observe_cycle,
+            "renovar-candidatos": self.renew_candidates,
         }
         if action in handlers:
             return handlers[action]()
+        if action == "candidatos":
+            return self.list_candidates(argument.strip())
+        if action in {"capacidade", "confiabilidade"}:
+            return self.capability_report(argument.strip())
+        if action == "candidato":
+            return self.show_candidate(argument.strip())
+        if action == "rota":
+            return self.route_candidate(argument.strip())
+        if action == "explicar-rota":
+            return self.explain_route(argument.strip())
         if action == "autonomia":
             return self.set_autonomy_mode(argument.strip())
         if action == "selecionar-candidato":
@@ -1303,11 +1332,17 @@ class AyaDevService:
     def autonomy_status(self) -> str:
         state = self._load_autonomy_state()
         candidates = self._autonomous_candidates()
+        metrics = self._candidate_queue_metrics(candidates)
         return "\n".join([
             "Autonomia supervisionada do Aya Dev:",
             f"- Modo: {state['mode']}",
             f"- Politica: v{AUTONOMY_POLICY_VERSION}",
-            f"- Candidatos detectados agora: {len(candidates)}",
+            f"- Candidatos atuais: {metrics['current']}",
+            f"- Historicos considerados: {metrics['historical']}",
+            f"- Duplicados bloqueados: {metrics['duplicates']}",
+            f"- Obsoletos: {metrics['stale']}",
+            f"- Elegiveis: {metrics['eligible']}",
+            f"- Bloqueados: {metrics['blocked']}",
             f"- Candidato selecionado: {state.get('selected_candidate_id') or 'nenhum'}",
             f"- Ciclo em execucao: {state.get('active_proposal_id') or 'nenhum'}",
             "- Limite: uma tarefa por comando; para em AGUARDANDO_APROVACAO.",
@@ -1335,6 +1370,7 @@ class AyaDevService:
     def evaluate_autonomy(self) -> str:
         candidates = self._autonomous_candidates()
         stats = self._operation_stats()
+        metrics = self._candidate_queue_metrics(candidates)
         lines = [
             "Avaliacao de autonomia do Aya Dev:",
             f"- Politica: v{AUTONOMY_POLICY_VERSION}",
@@ -1347,39 +1383,56 @@ class AyaDevService:
             f"- Operacoes avaliadas: {', '.join(sorted(AUTONOMY_ALLOWED_OPERATIONS))}",
         ]
         for operation in sorted(AUTONOMY_ALLOWED_OPERATIONS):
-            item = stats.get(operation, {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0})
+            item = self._empty_operation_stats() | stats.get(operation, {})
             status = self._operation_policy_status(operation, item)
             lines.append(
-                f"- {operation}: total={item['total']}; sucesso={item['success']}; falhas={item['fail']}; "
-                f"primeira_tentativa={item['first_attempt_success']}; escalonamentos={item['escalated']}; politica={status}"
+                f"- {operation}: total={item['total']}; sucessos={item['success']}; falhas={item['fail']}; "
+                f"inconclusivos={item['inconclusive']}; rejeitados={item['rejected']}; cancelados={item['cancelled']}; "
+                f"escalados={item['escalated']}; integrados={item['integrated']}; revertidos={item['reverted']}; "
+                f"testes={item['test_fixture']}; importados={item['legacy_import']}; desconhecidos={item['unknown']}; "
+                f"primeira_tentativa={item['first_attempt_success']}; politica={status}"
             )
-        blocked = sum(1 for candidate in candidates if candidate.eligibility == "BLOQUEADO")
-        eligible = sum(1 for candidate in candidates if candidate.eligibility == "ELEGIVEL")
-        insufficient = sum(1 for candidate in candidates if candidate.eligibility == "DADOS_INSUFICIENTES")
         lines.extend([
-            f"- Candidatos detectados: {len(candidates)}",
-            f"- Elegiveis: {eligible}",
-            f"- Dados insuficientes: {insufficient}",
-            f"- Bloqueados: {blocked}",
+            f"- Registros historicos considerados: {metrics['historical']}",
+            f"- Candidatos atuais: {metrics['current']}",
+            f"- Duplicados bloqueados: {metrics['duplicates']}",
+            f"- Obsoletos: {metrics['stale']}",
+            f"- Elegiveis: {metrics['eligible']}",
+            f"- Bloqueados: {metrics['blocked']}",
+            f"- Bloqueados por risco: {metrics['blocked_by_risk']}",
+            f"- Bloqueados por capacidade: {metrics['blocked_by_capacity']}",
+            f"- Bloqueados por dados insuficientes: {metrics['blocked_by_insufficient_data']}",
         ])
-        self._autonomy_event("autonomy_evaluated", {"candidates": len(candidates), "eligible": eligible})
         return "\n".join(lines)
 
-    def list_candidates(self) -> str:
+    def list_candidates(self, scope: str = "") -> str:
         candidates = self._autonomous_candidates()
+        scope = (scope or "atuais").lower().strip()
+        if "obsoleto" in scope:
+            candidates = [candidate for candidate in candidates if candidate.stale]
+        elif "historico" in scope:
+            return self.capability_report("")
+        else:
+            candidates = [candidate for candidate in candidates if not candidate.stale]
         if not candidates:
             return "Candidatos autonomos: nenhum candidato real detectado."
         lines = ["Candidatos autonomos do Aya Dev:"]
         for item in candidates[:20]:
             lines.append(
-                f"- {item.candidate_id} [{item.eligibility}] score={item.score} risco={item.risk} "
-                f"{item.operation_type}: {item.title}"
+                f"- {item.candidate_id} [{item.status}/{item.eligibility}] rota={item.route} score={item.score} "
+                f"risco={item.risk} {item.operation_type}: {item.title}"
             )
+            lines.append(f"  head={item.project_head[:12]} arquivo={item.file} simbolo={item.symbol or 'n/a'}")
             if item.blocked_reasons:
                 lines.append(f"  bloqueios: {'; '.join(item.blocked_reasons)}")
+            if item.stale:
+                lines.append(f"  obsoleto: {item.stale_reason}")
         return "\n".join(lines)
 
     def explain_candidate(self, candidate_id: str) -> str:
+        return self.show_candidate(candidate_id)
+
+    def show_candidate(self, candidate_id: str) -> str:
         candidate = self._find_candidate(candidate_id)
         if not candidate:
             return f"Candidato autonomo nao encontrado: {candidate_id}"
@@ -1389,22 +1442,124 @@ class AyaDevService:
             f"- Problema: {candidate.problem}",
             f"- Operacao: {candidate.operation_type}",
             f"- Categoria: {candidate.category}",
+            f"- HEAD de deteccao: {candidate.project_head}",
+            f"- Arquivo: {candidate.file}",
+            f"- Hash do arquivo: {candidate.file_sha256}",
+            f"- Simbolo: {candidate.symbol or 'nao aplicavel'}",
+            f"- Assinatura: {candidate.symbol_signature or 'nao aplicavel'}",
+            f"- Motivo: {candidate.reason}",
+            f"- Mudanca esperada: {candidate.expected_change}",
             f"- Arquivos: {', '.join(candidate.files)}",
             f"- Simbolos: {', '.join(candidate.symbols)}",
             f"- Evidencias: {' | '.join(candidate.evidence)}",
+            f"- Status: {candidate.status}",
+            f"- Atual: {'nao' if candidate.stale else 'sim'}",
+            f"- Obsolescencia: {candidate.stale_reason or 'nenhuma'}",
+            f"- Fonte: {candidate.source_origin}",
             f"- Elegibilidade: {candidate.eligibility}",
+            f"- Rota: {candidate.route}",
             f"- Bloqueios: {' | '.join(candidate.blocked_reasons) or 'nenhum'}",
             f"- Score: {candidate.score}",
             f"- Justificativa: {' | '.join(candidate.score_explanation)}",
+            f"- Chave de deduplicacao: {candidate.deduplication_key}",
             f"- Licoes usadas: {' | '.join(candidate.related_lessons) or 'nenhuma'}",
             f"- Propostas similares: {' | '.join(candidate.similar_proposals) or 'nenhuma'}",
             f"- Registro: {candidate.record_sha256}",
+        ])
+
+    def observe_cycle(self) -> str:
+        before = self.workspace.git_state()
+        candidates = self._autonomous_candidates()
+        after = self.workspace.git_state()
+        metrics = self._candidate_queue_metrics(candidates)
+        return "\n".join([
+            "Observacao autonoma somente leitura:",
+            f"- Git antes: {before.message}",
+            f"- Git depois: {after.message}",
+            "- Modelo chamado: nao",
+            "- Worktree criado: nao",
+            "- Codigo alterado: nao",
+            f"- Candidatos atuais: {metrics['current']}",
+            f"- Duplicados bloqueados: {metrics['duplicates']}",
+            f"- Obsoletos: {metrics['stale']}",
+            f"- Elegiveis: {metrics['eligible']}",
+            f"- Bloqueados: {metrics['blocked']}",
+        ])
+
+    def renew_candidates(self) -> str:
+        candidates = self._autonomous_candidates(force=True)
+        metrics = self._candidate_queue_metrics(candidates)
+        return "\n".join([
+            "Renovacao de candidatos concluida sem preparar patch:",
+            f"- HEAD: {self._safe_head()}",
+            f"- Candidatos atuais reais: {metrics['current']}",
+            f"- Duplicados bloqueados: {metrics['duplicates']}",
+            f"- Obsoletos: {metrics['stale']}",
+            f"- Elegiveis: {metrics['eligible']}",
+            f"- Bloqueados: {metrics['blocked']}",
+        ])
+
+    def capability_report(self, payload: str = "") -> str:
+        parts = (payload or "").split(maxsplit=1)
+        filter_kind = parts[0].lower() if parts else ""
+        filter_value = parts[1].strip() if len(parts) > 1 else ""
+        filter_value_normalized = filter_value.lower()
+        stats = self._operation_stats(
+            category=filter_value_normalized if filter_kind == "categoria" else "",
+            model=filter_value_normalized if filter_kind == "modelo" else "",
+        )
+        lines = [
+            "Capacidade historica do Aya Dev:",
+            f"- Politica: v{AUTONOMY_POLICY_VERSION}",
+            "- Periodo: historico persistido completo",
+        ]
+        if filter_kind in {"operacao", "categoria", "modelo"}:
+            lines.append(f"- Filtro: {filter_kind}={filter_value}")
+        for operation in sorted(stats):
+            if filter_kind == "operacao" and operation != filter_value_normalized:
+                continue
+            item = self._empty_operation_stats() | stats[operation]
+            level = self._capability_level(operation, item)
+            lines.append(
+                f"- Operacao {operation}: nivel={level}; total={item['total']}; production_real={item['production_real']}; "
+                f"test_fixture={item['test_fixture']}; legacy_import={item['legacy_import']}; unknown={item['unknown']}; "
+                f"sucessos={item['success']}; falhas={item['fail']}; inconclusivos={item['inconclusive']}; "
+                f"rejeitados={item['rejected']}; cancelados={item['cancelled']}; escalados={item['escalated']}; "
+                f"integrados={item['integrated']}; revertidos={item['reverted']}; primeira_tentativa={item['first_attempt_success']}"
+            )
+        return "\n".join(lines)
+
+    def route_candidate(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id)
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        return f"Rota {candidate.candidate_id}: {candidate.route}"
+
+    def explain_route(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id)
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        stats = self._empty_operation_stats() | self._operation_stats().get(candidate.operation_type, {})
+        return "\n".join([
+            f"Rota para {candidate.candidate_id}: {candidate.route}",
+            f"- Elegibilidade: {candidate.eligibility}",
+            f"- Status: {candidate.status}",
+            f"- Obsoleto: {'sim' if candidate.stale else 'nao'} {candidate.stale_reason}",
+            f"- Risco: {candidate.risk}",
+            f"- Operacao: {candidate.operation_type}",
+            f"- Capacidade: {self._capability_level(candidate.operation_type, stats)}",
+            f"- Fonte: {candidate.source_origin}",
+            f"- Bloqueios: {' | '.join(candidate.blocked_reasons) or 'nenhum'}",
+            f"- Score: {candidate.score} ({'; '.join(candidate.score_explanation)})",
+            "- Este comando nao executa patch, modelo, worktree, aprovacao, commit ou integracao.",
         ])
 
     def select_candidate(self, candidate_id: str) -> str:
         candidate = self._find_candidate(candidate_id)
         if not candidate:
             return f"Candidato autonomo nao encontrado: {candidate_id}"
+        if candidate.stale:
+            return f"Selecao bloqueada: OBSOLETO ({candidate.stale_reason})."
         if candidate.eligibility != "ELEGIVEL":
             return f"Selecao bloqueada: {candidate.eligibility} ({'; '.join(candidate.blocked_reasons) or 'sem motivo adicional'})."
         state = self._load_autonomy_state()
@@ -1459,6 +1614,10 @@ class AyaDevService:
         candidate = self._find_candidate(candidate_id)
         if not candidate:
             return f"Candidato autonomo nao encontrado: {candidate_id}"
+        if candidate.stale:
+            return f"Execucao bloqueada: OBSOLETO ({candidate.stale_reason})."
+        if candidate.route not in {"LOCAL_PREPARE_ONLY", "LOCAL_SUPERVISED"}:
+            return f"Execucao bloqueada pela rota: {candidate.route}."
         if candidate.eligibility != "ELEGIVEL":
             return f"Execucao bloqueada: {candidate.eligibility} ({'; '.join(candidate.blocked_reasons)})."
         self._autonomy_event("autonomous_cycle_started", asdict(candidate))
@@ -1915,25 +2074,54 @@ class AyaDevService:
         except RuntimeError:
             return "HEAD indisponivel"
 
-    def _operation_stats(self) -> dict[str, dict[str, int]]:
-        stats = {
-            operation: {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0}
-            for operation in AUTONOMY_ALLOWED_OPERATIONS
+    def _empty_operation_stats(self) -> dict[str, int]:
+        return {
+            "total": 0,
+            "success": 0,
+            "fail": 0,
+            "inconclusive": 0,
+            "rejected": 0,
+            "cancelled": 0,
+            "escalated": 0,
+            "integrated": 0,
+            "reverted": 0,
+            "imported": 0,
+            "first_attempt_success": 0,
+            "production_real": 0,
+            "test_fixture": 0,
+            "legacy_import": 0,
+            "manual_user": 0,
+            "automatic_event": 0,
+            "unknown": 0,
         }
+
+    def _operation_stats(self, *, category: str = "", model: str = "") -> dict[str, dict[str, int]]:
+        stats = {operation: self._empty_operation_stats() for operation in AUTONOMY_ALLOWED_OPERATIONS}
         for proposal in self.proposals.values():
+            if model and proposal.model.lower() != model:
+                continue
             operations = proposal.patch_manifest.get("operations", []) if isinstance(proposal.patch_manifest, dict) else []
             for operation in operations:
                 op_type = str(operation.get("type", ""))
                 if op_type not in stats:
                     continue
+                if category and self._operation_category(op_type) != category:
+                    continue
                 item = stats[op_type]
+                origin = self._proposal_origin(proposal)
+                result = self._proposal_result_bucket(proposal)
                 item["total"] += 1
-                if proposal.state in {"AGUARDANDO_APROVACAO", "APROVADA", "COMMIT_PRONTO", "INTEGRADA", "REVERTIDA"}:
-                    item["success"] += 1
+                item[origin] += 1
+                item[result] += 1
+                if origin == "legacy_import":
+                    item["imported"] += 1
+                if result == "success":
                     if proposal.attempts <= 1:
                         item["first_attempt_success"] += 1
-                if proposal.state in {"FALHOU", "REJEITADA", "INTEGRACAO_BLOQUEADA", "REVERSAO_FALHOU", "REVERSAO_PARCIAL"}:
-                    item["fail"] += 1
+                if proposal.state == "INTEGRADA":
+                    item["integrated"] += 1
+                if proposal.state == "REVERTIDA":
+                    item["reverted"] += 1
                 if proposal.failure_reason.lower().find("codex") >= 0:
                     item["escalated"] += 1
         return stats
@@ -1941,40 +2129,108 @@ class AyaDevService:
     def _operation_policy_status(self, operation: str, item: dict[str, int]) -> str:
         if operation not in AUTONOMY_ALLOWED_OPERATIONS:
             return "OPERACAO_NAO_SUPORTADA"
-        if item["total"] < AUTONOMY_MIN_CASES or item["success"] < AUTONOMY_MIN_SUCCESSES:
+        if item["production_real"] < AUTONOMY_MIN_CASES or item["success"] < AUTONOMY_MIN_SUCCESSES:
             return "DADOS_INSUFICIENTES"
         if item["fail"] or item["escalated"]:
             return "BLOQUEADO_POR_FALHAS"
         return "ELEGIVEL"
 
-    def _autonomous_candidates(self) -> list[AutonomousCandidate]:
+    def _capability_level(self, operation: str, item: dict[str, int]) -> str:
+        if item["total"] == 0:
+            return "SEM_DADOS"
+        status = self._operation_policy_status(operation, item)
+        if status == "DADOS_INSUFICIENTES":
+            return "DADOS_INSUFICIENTES"
+        if item["fail"] or item["reverted"] or item["escalated"]:
+            return "ESCALONAMENTO_RECOMENDADO"
+        if item["production_real"] >= AUTONOMY_MIN_CASES and item["success"] >= AUTONOMY_MIN_SUCCESSES:
+            return "SUPORTADA_LOCALMENTE"
+        return "EXPERIMENTAL"
+
+    def _proposal_origin(self, proposal: EngineeringProposal) -> str:
+        text = " ".join([proposal.title, proposal.problem, " ".join(proposal.evidence), proposal.model]).lower()
+        if "historico docstring" in text or "teste" in text or "aya tests" in text:
+            return "test_fixture"
+        if not proposal.patch_manifest or not proposal.patch_manifest.get("operations"):
+            return "legacy_import"
+        if any(event.get("action", "").startswith("autonomous_") for event in proposal.history):
+            return "automatic_event"
+        if proposal.approved_by == "local_user" or "aprovacao humana" in text:
+            return "manual_user"
+        if proposal.workspace_created and proposal.tests_executed:
+            return "production_real"
+        return "unknown"
+
+    def _proposal_result_bucket(self, proposal: EngineeringProposal) -> str:
+        if proposal.state in {"AGUARDANDO_APROVACAO", "APROVADA", "COMMIT_PRONTO", "INTEGRADA", "REVERTIDA"}:
+            return "success"
+        if proposal.state in {"FALHOU", "INTEGRACAO_BLOQUEADA", "REVERSAO_FALHOU", "REVERSAO_PARCIAL"}:
+            return "fail"
+        if proposal.state == "REJEITADA":
+            return "rejected"
+        if any(event.get("action") == "workspace isolado descartado" for event in proposal.history):
+            return "cancelled"
+        return "inconclusive"
+
+    def _operation_category(self, operation_type: str) -> str:
+        if operation_type == "insert_docstring":
+            return "documentacao"
+        if operation_type == "replace_exact":
+            return "import_nao_usado"
+        return "desconhecida"
+
+    def _autonomous_candidates(self, *, force: bool = False) -> list[AutonomousCandidate]:
+        head = self._safe_head()
+        proposal_count = len(self.proposals)
+        if (
+            not force
+            and self._candidate_cache is not None
+            and self._candidate_cache_head == head
+            and self._candidate_cache_proposals == proposal_count
+        ):
+            return self._validate_candidate_list(self._candidate_cache)
         candidates: list[AutonomousCandidate] = []
+        stats = self._operation_stats()
         for entry in self.index.build():
             if entry.path.startswith("tests/") or self._candidate_path_blocked(entry.path):
                 continue
-            candidates.extend(self._docstring_candidates(entry))
-            candidates.extend(self._unused_import_candidates(entry))
-        candidates.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
-        for candidate in candidates:
-            self._autonomy_event("candidate_detected", {"candidate_id": candidate.candidate_id, "eligibility": candidate.eligibility})
-        return candidates
+            candidates.extend(self._docstring_candidates(entry, stats))
+            candidates.extend(self._unused_import_candidates(entry, stats))
+        self._candidate_cache = candidates
+        self._candidate_cache_head = head
+        self._candidate_cache_proposals = proposal_count
+        return self._validate_candidate_list(candidates)
 
-    def _docstring_candidates(self, entry: TechnicalFile) -> list[AutonomousCandidate]:
+    def _validate_candidate_list(self, candidates: list[AutonomousCandidate]) -> list[AutonomousCandidate]:
+        seen: dict[str, AutonomousCandidate] = {}
+        deduplicated: list[AutonomousCandidate] = []
+        for candidate in candidates:
+            candidate = self._validate_current_candidate(candidate)
+            if candidate.deduplication_key in seen:
+                duplicate = self._replace_candidate_status(candidate, "BLOQUEADO", ["DUPLICADO"], route="CODEX_REVIEW_RECOMMENDED")
+                deduplicated.append(duplicate)
+                continue
+            seen[candidate.deduplication_key] = candidate
+            deduplicated.append(candidate)
+        deduplicated.sort(key=lambda item: (-item.score, item.risk, len(item.files), item.estimated_changed_lines, item.candidate_id))
+        return deduplicated
+
+    def _docstring_candidates(self, entry: TechnicalFile, stats: dict[str, dict[str, int]]) -> list[AutonomousCandidate]:
         path = self.root / entry.path
         try:
             tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
         except (OSError, SyntaxError):
             return []
+        parents = self._ast_parents(tree)
         candidates: list[AutonomousCandidate] = []
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 continue
             if node.name.startswith("_") or ast.get_docstring(node):
                 continue
-            symbol = self._qualified_symbol(tree, node)
+            symbol = self._qualified_symbol(tree, node, parents)
             if not symbol:
                 continue
-            content = f"Document {symbol}."
             candidates.append(self._build_candidate(
                 source="ast:missing_docstring",
                 title=f"Adicionar docstring em {symbol}",
@@ -1986,11 +2242,14 @@ class AyaDevService:
                 symbols=[symbol],
                 estimated_changed_lines=1,
                 required_tests=entry.related_tests[:2],
-                operation_payload={"content": content},
+                reason="docstring ausente no HEAD atual",
+                expected_change=f"inserir docstring em {symbol}",
+                symbol_signature=self._signature_for_symbol(entry, symbol),
+                stats=stats,
             ))
         return candidates
 
-    def _unused_import_candidates(self, entry: TechnicalFile) -> list[AutonomousCandidate]:
+    def _unused_import_candidates(self, entry: TechnicalFile, stats: dict[str, dict[str, int]]) -> list[AutonomousCandidate]:
         path = self.root / entry.path
         try:
             text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -2018,7 +2277,10 @@ class AyaDevService:
                 symbols=[],
                 estimated_changed_lines=1,
                 required_tests=entry.related_tests[:2],
-                operation_payload={"old_text": line + "\n", "new_text": ""},
+                reason="import nao referenciado por varredura AST local",
+                expected_change=f"remover linha exata: {line.strip()}",
+                symbol_signature="",
+                stats=stats,
             ))
         return candidates
 
@@ -2035,25 +2297,33 @@ class AyaDevService:
         symbols: list[str],
         estimated_changed_lines: int,
         required_tests: list[str],
-        operation_payload: dict,
+        reason: str,
+        expected_change: str,
+        symbol_signature: str,
+        stats: dict[str, dict[str, int]],
     ) -> AutonomousCandidate:
+        head = self._safe_head()
+        file_sha256 = self._file_sha256(files[0]) if files else ""
+        symbol = symbols[0] if symbols else ""
         risk = self.classify_risk(problem, files, title)
         lessons = self._candidate_lessons(files, operation_type)
         similar = self._similar_proposals(files, symbols)
         blocked = self._candidate_blocked_reasons(files, category, operation_type, risk, estimated_changed_lines)
-        stats = self._operation_stats().get(operation_type, {"total": 0, "success": 0, "fail": 0, "escalated": 0, "first_attempt_success": 0})
-        policy = self._operation_policy_status(operation_type, stats)
+        operation_stats = self._empty_operation_stats() | stats.get(operation_type, {})
+        policy = self._operation_policy_status(operation_type, operation_stats)
         if policy != "ELEGIVEL" and not blocked:
             blocked.append(policy)
         eligibility = "ELEGIVEL" if not blocked else ("DADOS_INSUFICIENTES" if blocked == ["DADOS_INSUFICIENTES"] else "BLOQUEADO")
         score, score_explanation = self._candidate_score(
             evidence=evidence,
             required_tests=required_tests,
-            stats=stats,
+            stats=operation_stats,
             files=files,
             changed_lines=estimated_changed_lines,
             blocked=blocked,
         )
+        deduplication_key = self._candidate_dedup_key(head, operation_type, files[0], symbol, expected_change)
+        route = self._route_from_candidate_state(eligibility, blocked, risk, operation_type, operation_stats, stale=False)
         raw = {
             "source": source,
             "title": title,
@@ -2065,24 +2335,38 @@ class AyaDevService:
             "symbols": symbols,
             "estimated_changed_lines": estimated_changed_lines,
             "policy_version": AUTONOMY_POLICY_VERSION,
-            "operation_payload": operation_payload,
+            "head": head,
+            "file_sha256": file_sha256,
+            "symbol_signature": symbol_signature,
+            "deduplication_key": deduplication_key,
         }
         digest = self._sha_json(raw)
         return AutonomousCandidate(
             candidate_id=f"AUTO-{digest[:12].upper()}",
             detected_at=datetime.now().isoformat(timespec="seconds"),
+            generated_at=datetime.now().isoformat(timespec="seconds"),
+            project_head=head,
             source=source,
+            source_origin="production_real",
             title=title,
             problem=problem,
             evidence=evidence,
             category=category,
             operation_type=operation_type,
+            file=files[0],
+            file_sha256=file_sha256,
+            symbol=symbol,
+            symbol_signature=symbol_signature,
+            reason=reason,
+            expected_change=expected_change,
+            allowed_files=files,
             files=files,
             symbols=symbols,
             estimated_changed_lines=estimated_changed_lines,
             risk=risk,
             required_tests=required_tests,
             confidence="baseada em evidencias locais" if eligibility == "ELEGIVEL" else "limitada",
+            status="ELEGIVEL" if eligibility == "ELEGIVEL" else "BLOQUEADO",
             eligibility=eligibility,
             blocked_reasons=blocked,
             related_lessons=lessons,
@@ -2090,6 +2374,10 @@ class AyaDevService:
             policy_version=AUTONOMY_POLICY_VERSION,
             score=score,
             score_explanation=score_explanation,
+            deduplication_key=deduplication_key,
+            stale=False,
+            stale_reason="",
+            route=route,
             record_sha256=digest,
         )
 
@@ -2148,6 +2436,124 @@ class AyaDevService:
         lowered = file.lower()
         return any(term in lowered for term in AUTONOMY_BLOCKED_TERMS) or self.workspace._path_error(file) != ""
 
+    def _candidate_dedup_key(self, head: str, operation: str, file: str, symbol: str, goal: str) -> str:
+        normalized = re.sub(r"\s+", " ", goal.lower()).strip()
+        return self._sha_text("\n".join([head, operation, file, symbol, normalized]))
+
+    def _signature_for_symbol(self, entry: TechnicalFile, symbol: str) -> str:
+        name = symbol.split(".")[-1]
+        return next((signature for signature in entry.signatures if signature.startswith(f"{name}(")), "")
+
+    def _validate_current_candidate(self, candidate: AutonomousCandidate) -> AutonomousCandidate:
+        if candidate.project_head != self._safe_head():
+            return self._stale_candidate(candidate, "HEAD mudou desde a deteccao.")
+        path = self.root / candidate.file
+        if not path.exists():
+            return self._stale_candidate(candidate, "arquivo nao existe mais.")
+        try:
+            current_hash = self._file_sha256(candidate.file)
+        except (OSError, StructuredPatchError):
+            return self._stale_candidate(candidate, "hash atual indisponivel.")
+        if current_hash != candidate.file_sha256:
+            return self._stale_candidate(candidate, "hash do arquivo mudou.")
+        if candidate.operation_type == "insert_docstring" and not candidate.symbol:
+            return self._stale_candidate(candidate, "simbolo ausente no candidato.")
+        if candidate.operation_type == "replace_exact":
+            try:
+                payload = self._unused_import_payload(candidate)
+            except StructuredPatchError as exc:
+                return self._stale_candidate(candidate, str(exc))
+            count = path.read_text(encoding="utf-8-sig", errors="replace").count(payload["old_text"])
+            if count != 1:
+                return self._stale_candidate(candidate, "texto antigo nao existe exatamente uma vez.")
+        missing_tests = [test for test in candidate.required_tests if not (self.root / test).exists()]
+        if missing_tests:
+            return self._stale_candidate(candidate, "teste relacionado ausente: " + ", ".join(missing_tests[:3]))
+        return candidate
+
+    def _symbol_missing_docstring(self, file: str, symbol: str, signature: str) -> bool:
+        path = self.root / file
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, SyntaxError):
+            return False
+        parents = self._ast_parents(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            if self._qualified_symbol(tree, node, parents) != symbol:
+                continue
+            if signature and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                args = [arg.arg for arg in [*node.args.posonlyargs, *node.args.args]]
+                actual = f"{node.name}({', '.join(args)})"
+                if actual != signature:
+                    return False
+            return ast.get_docstring(node) is None
+        return False
+
+    def _stale_candidate(self, candidate: AutonomousCandidate, reason: str) -> AutonomousCandidate:
+        return self._replace_candidate_status(candidate, "OBSOLETO", ["OBSOLETO"], stale=True, stale_reason=reason, route="CODEX_REVIEW_RECOMMENDED")
+
+    def _replace_candidate_status(
+        self,
+        candidate: AutonomousCandidate,
+        status: str,
+        blocked_reasons: list[str],
+        *,
+        stale: bool | None = None,
+        stale_reason: str | None = None,
+        route: str | None = None,
+    ) -> AutonomousCandidate:
+        data = asdict(candidate)
+        data["status"] = status
+        data["eligibility"] = "ELEGIVEL" if status == "ELEGIVEL" and not blocked_reasons else "BLOQUEADO"
+        data["blocked_reasons"] = [*candidate.blocked_reasons, *blocked_reasons]
+        data["stale"] = candidate.stale if stale is None else stale
+        data["stale_reason"] = candidate.stale_reason if stale_reason is None else stale_reason
+        data["route"] = candidate.route if route is None else route
+        return AutonomousCandidate(**data)
+
+    def _route_from_candidate_state(
+        self,
+        eligibility: str,
+        blocked: list[str],
+        risk: str,
+        operation_type: str,
+        stats: dict[str, int],
+        *,
+        stale: bool,
+    ) -> str:
+        if stale:
+            return "CODEX_REVIEW_RECOMMENDED"
+        if risk != "baixo" or any(reason.startswith("ARQUIVO_BLOQUEADO") for reason in blocked):
+            return "CODEX_ESCALATION_REQUIRED"
+        if eligibility == "DADOS_INSUFICIENTES" or self._capability_level(operation_type, stats) in {"SEM_DADOS", "DADOS_INSUFICIENTES"}:
+            return "INSUFFICIENT_DATA"
+        if blocked:
+            return "CODEX_REVIEW_RECOMMENDED"
+        return "LOCAL_SUPERVISED"
+
+    def _candidate_queue_metrics(self, candidates: list[AutonomousCandidate]) -> dict[str, int]:
+        historical = sum(item["total"] for item in self._operation_stats().values())
+        return {
+            "historical": historical,
+            "current": sum(1 for item in candidates if not item.stale),
+            "duplicates": sum(1 for item in candidates if "DUPLICADO" in item.blocked_reasons),
+            "stale": sum(1 for item in candidates if item.stale),
+            "eligible": sum(1 for item in candidates if item.eligibility == "ELEGIVEL" and not item.stale),
+            "blocked": sum(1 for item in candidates if item.eligibility != "ELEGIVEL"),
+            "blocked_by_risk": sum(1 for item in candidates if any(reason.startswith("RISCO_") for reason in item.blocked_reasons)),
+            "blocked_by_capacity": sum(1 for item in candidates if "BLOQUEADO_POR_FALHAS" in item.blocked_reasons),
+            "blocked_by_insufficient_data": sum(1 for item in candidates if "DADOS_INSUFICIENTES" in item.blocked_reasons),
+            "selected": 1 if self._load_autonomy_state().get("selected_candidate_id") else 0,
+            "created": sum(1 for proposal in self.proposals.values() if proposal.title.startswith("[AUTO]")),
+            "sem_tarefa_segura": sum(
+                1
+                for event in self._load_autonomy_state().get("events", [])
+                if event.get("action") == "candidate_blocked"
+            ),
+        }
+
     def _candidate_lessons(self, files: list[str], operation_type: str) -> list[str]:
         entries = self._load_engineering_memory()
         needles = [operation_type, *files]
@@ -2168,11 +2574,16 @@ class AyaDevService:
         ]
         return similar[-5:]
 
-    def _qualified_symbol(self, tree: ast.AST, target: ast.AST) -> str:
+    def _ast_parents(self, tree: ast.AST) -> dict[ast.AST, ast.AST]:
         parents: dict[ast.AST, ast.AST] = {}
         for parent in ast.walk(tree):
             for child in ast.iter_child_nodes(parent):
                 parents[child] = parent
+        return parents
+
+    def _qualified_symbol(self, tree: ast.AST, target: ast.AST, parents: dict[ast.AST, ast.AST] | None = None) -> str:
+        if parents is None:
+            parents = self._ast_parents(tree)
         if isinstance(target, ast.ClassDef):
             return target.name
         parent = parents.get(target)

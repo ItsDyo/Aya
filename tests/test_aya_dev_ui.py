@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -61,6 +62,44 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
             self.assertIn("Informacao nao registrada", response)
             self.assertNotIn("chat generico", response)
             assistant.encerrar()
+
+    def test_painel_aya_dev_exibe_observacao_capacidade_e_rota(self):
+        from aya.ui.aya_dev import AyaDevPanel
+
+        class FakeAyaDev:
+            def autonomy_status(self):
+                return "Autonomia supervisionada"
+
+            def evaluate_autonomy(self):
+                return "Avaliacao de autonomia"
+
+            def list_candidates(self, scope=""):
+                return f"Candidatos {scope}"
+
+            def observe_cycle(self):
+                return "Observacao somente leitura"
+
+            def capability_report(self, filter_text=""):
+                return f"Operacao insert_docstring {filter_text}"
+
+            def route_candidate(self, candidate_id):
+                return f"Candidato {candidate_id} nao encontrado"
+
+            def explain_route(self, candidate_id):
+                return f"Candidato {candidate_id} nao encontrado"
+
+        assistant = SimpleNamespace(aya_dev=FakeAyaDev())
+        panel = AyaDevPanel(assistant)
+        status, avaliacao, candidatos, observacao = panel.autonomy_overview()
+        capacidade = panel.autonomy_capability("operacao insert_docstring")
+        rota, explicacao = panel.autonomy_route("AUTO-INEXISTENTE")
+        self.assertIn("Autonomia supervisionada", status)
+        self.assertIn("Avaliacao de autonomia", avaliacao)
+        self.assertIn("Candidatos atuais", candidatos)
+        self.assertIn("somente leitura", observacao)
+        self.assertIn("Operacao insert_docstring", capacidade)
+        self.assertIn("nao encontrado", rota)
+        self.assertIn("nao encontrado", explicacao)
 
 
 if __name__ == "__main__":

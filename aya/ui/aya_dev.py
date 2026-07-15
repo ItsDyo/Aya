@@ -68,12 +68,22 @@ class AyaDevPanel:
         choices = self.list_choices(state_filter)
         return choices, choices[0] if choices else ""
 
-    def autonomy_overview(self) -> tuple[str, str, str]:
+    def autonomy_overview(self) -> tuple[str, str, str, str]:
         return (
             self.aya.aya_dev.autonomy_status(),
             self.aya.aya_dev.evaluate_autonomy(),
-            self.aya.aya_dev.list_candidates(),
+            self.aya.aya_dev.list_candidates("atuais"),
+            self.aya.aya_dev.observe_cycle(),
         )
+
+    def autonomy_capability(self, filter_text: str = "") -> str:
+        return self.aya.aya_dev.capability_report(filter_text)
+
+    def autonomy_route(self, candidate_id: str) -> tuple[str, str]:
+        candidate_id = (candidate_id or "").strip()
+        if not candidate_id:
+            return "Informe um candidato.", "Informe um candidato."
+        return self.aya.aya_dev.route_candidate(candidate_id), self.aya.aya_dev.explain_route(candidate_id)
 
     def run_safe_autonomy_cycle(self, confirmation: str) -> str:
         if not self._can_execute():

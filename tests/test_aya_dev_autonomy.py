@@ -63,12 +63,12 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         if dirty:
             (self.root / "aya" / "core" / "sample.py").write_text("# dirty\n", encoding="utf-8")
 
-    def seed_successful_docstring_history(self, total: int = 3):
+    def seed_successful_docstring_history(self, total: int = 3, *, production_real: bool = False):
         for index in range(total):
             proposal = self.service.create_proposal(
-                title=f"Historico docstring {index}",
+                title=f"Registro operacional docstring {index}" if production_real else f"Historico docstring {index}",
                 problem="Documentar simbolo simples.",
-                evidence=["teste"],
+                evidence=["Indice AST confirmou aya/core/sample.py." if production_real else "teste"],
                 related_files=["aya/core/sample.py"],
                 related_symbols=["Sample.run"],
                 probable_cause="sem docstring",
@@ -82,6 +82,8 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
             )
             proposal.state = "AGUARDANDO_APROVACAO"
             proposal.attempts = 1
+            proposal.workspace_created = production_real
+            proposal.tests_executed = production_real
             proposal.patch_manifest = {
                 "version": 1,
                 "proposal_id": proposal.id,
@@ -103,7 +105,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertTrue(any(candidate.eligibility == "DADOS_INSUFICIENTES" for candidate in candidates))
 
     def test_evidencia_suficiente_deixa_docstring_elegivel_com_score_deterministico(self):
-        self.seed_successful_docstring_history()
+        self.seed_successful_docstring_history(production_real=True)
         first = self.service._autonomous_candidates()
         second = self.service._autonomous_candidates()
         eligible = [candidate for candidate in first if candidate.eligibility == "ELEGIVEL"]
@@ -127,7 +129,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
 
     def test_preparar_supervisionado_cria_proposta_e_para_aguardando_aprovacao(self):
         self.init_git()
-        self.seed_successful_docstring_history()
+        self.seed_successful_docstring_history(production_real=True)
         self.service.set_autonomy_mode("preparar-supervisionado")
         response = self.service.execute_safe_autonomous_cycle()
         proposals = [proposal for proposal in self.service.proposals.values() if proposal.title.startswith("[AUTO]")]
@@ -142,7 +144,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertIn("alteracao", self.service.execute_safe_autonomous_cycle())
 
     def test_modelo_nao_altera_score_e_memoria_nao_reduz_risco(self):
-        self.seed_successful_docstring_history()
+        self.seed_successful_docstring_history(production_real=True)
         self.service.llm = StaticClient(json.dumps({"type": "insert_docstring", "symbol": "Outro", "content": "Outro"}))
         candidate = self.service._select_best_candidate()
         self.assertIsNotNone(candidate)
@@ -174,6 +176,118 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         )
         candidates = self.service._autonomous_candidates()
         self.assertTrue(any(candidate.operation_type == "replace_exact" for candidate in candidates))
+
+    def test_origem_separa_producao_fixture_legacy_e_unknown(self):
+        self.seed_successful_docstring_history(total=1, production_real=True)
+        self.seed_successful_docstring_history(total=1)
+        legacy = self.service.create_proposal(
+            title="Legado sem manifesto",
+            problem="Sem manifesto",
+            evidence=["manual"],
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample.run"],
+            probable_cause="antigo",
+            suggested_change="n/a",
+            preserve=["n/a"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=["tests/test_sample.py"],
+            done_criteria=["n/a"],
+        )
+        legacy.patch_manifest = {}
+        self.assertEqual("production_real", self.service._proposal_origin(next(p for p in self.service.proposals.values() if p.title.startswith("Registro operacional"))))
+        self.assertEqual("test_fixture", self.service._proposal_origin(next(p for p in self.service.proposals.values() if p.title.startswith("Historico docstring"))))
+        self.assertEqual("legacy_import", self.service._proposal_origin(legacy))
+
+    def test_contabilidade_conserva_total_e_exibe_inconclusivo(self):
+        self.seed_successful_docstring_history(total=1, production_real=True)
+        pending = self.service.create_proposal(
+            title="Registro operacional pendente",
+            problem="Documentar",
+            evidence=["Indice AST confirmou aya/core/sample.py."],
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample.run"],
+            probable_cause="sem docstring",
+            suggested_change="docstring",
+            preserve=["comportamento"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=["tests/test_sample.py"],
+            done_criteria=["ok"],
+        )
+        pending.workspace_created = True
+        pending.tests_executed = True
+        pending.patch_manifest = {"operations": [{"type": "insert_docstring", "file": "aya/core/sample.py"}]}
+        stats = self.service._operation_stats()["insert_docstring"]
+        buckets = stats["success"] + stats["fail"] + stats["inconclusive"] + stats["rejected"] + stats["cancelled"]
+        self.assertEqual(stats["total"], buckets)
+        self.assertEqual(1, stats["inconclusive"])
+        self.assertIn("inconclusivos=1", self.service.capability_report("operacao insert_docstring"))
+
+    def test_capacidade_filtra_categoria_e_modelo(self):
+        self.seed_successful_docstring_history(total=1, production_real=True)
+        model = next(iter(self.service.proposals.values())).model
+        by_category = self.service.capability_report("categoria documentacao")
+        by_model = self.service.capability_report(f"modelo {model}")
+        self.assertIn("Filtro: categoria=documentacao", by_category)
+        self.assertIn("Operacao insert_docstring", by_category)
+        self.assertIn(f"Filtro: modelo={model}", by_model)
+        self.assertIn("production_real=1", by_model)
+
+    def test_hash_alterado_e_docstring_adicionada_tornam_candidato_obsoleto(self):
+        self.seed_successful_docstring_history(production_real=True)
+        candidate = self.service._select_best_candidate()
+        self.assertIsNotNone(candidate)
+        (self.root / candidate.file).write_text(
+            "class Sample:\n"
+            "    def run(self, value):\n"
+            "        \"\"\"Return value.\"\"\"\n"
+            "        return value\n",
+            encoding="utf-8",
+        )
+        stale = self.service._validate_current_candidate(candidate)
+        self.assertTrue(stale.stale)
+        self.assertIn("hash", stale.stale_reason)
+
+    def test_replace_exact_sem_texto_torna_obsoleto(self):
+        (self.root / "aya" / "core" / "sample.py").write_text(
+            "import json\n\nclass Sample:\n    def run(self, value):\n        return value\n",
+            encoding="utf-8",
+        )
+        candidate = next(item for item in self.service._autonomous_candidates() if item.operation_type == "replace_exact")
+        (self.root / candidate.file).write_text("class Sample:\n    pass\n", encoding="utf-8")
+        stale = self.service._validate_current_candidate(candidate)
+        self.assertTrue(stale.stale)
+
+    def test_observar_nao_chama_modelo_nao_cria_worktree_nem_altera_git(self):
+        self.init_git()
+        before = subprocess.run(("git", "status", "--porcelain"), cwd=self.root, capture_output=True, text=True, check=True).stdout
+        response = self.service.observe_cycle()
+        after = subprocess.run(("git", "status", "--porcelain"), cwd=self.root, capture_output=True, text=True, check=True).stdout
+        self.assertIn("Modelo chamado: nao", response)
+        self.assertIn("Worktree criado: nao", response)
+        self.assertEqual(before, after)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+        self.assertEqual([], self.service.llm.calls)
+
+    def test_rota_deterministica_e_nao_chama_modelo(self):
+        self.seed_successful_docstring_history(production_real=True)
+        candidate = self.service._select_best_candidate()
+        first = self.service.explain_route(candidate.candidate_id)
+        second = self.service.explain_route(candidate.candidate_id)
+        self.assertEqual(first, second)
+        self.assertIn("nao executa patch", first)
+        self.assertEqual([], self.service.llm.calls)
+
+    def test_candidato_obsoleto_nao_executa(self):
+        self.init_git()
+        self.seed_successful_docstring_history(production_real=True)
+        candidate = self.service._select_best_candidate()
+        (self.root / candidate.file).write_text("# mudou\n", encoding="utf-8")
+        self.service.set_autonomy_mode("preparar-supervisionado")
+        self.assertIn("alteracao", self.service.execute_candidate(candidate.candidate_id))
 
     def _fast_validation(self, workspace, related_tests=None):
         return [

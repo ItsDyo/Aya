@@ -503,6 +503,18 @@ def create_app(
                         autonomia_status_dev = gr.Textbox(label="Modo e estado", lines=7)
                         autonomia_avaliacao_dev = gr.Textbox(label="Elegibilidade", lines=10)
                         autonomia_candidatos_dev = gr.Textbox(label="Candidatos", lines=12)
+                        autonomia_observar_dev = gr.Textbox(label="Observacao somente leitura", lines=8)
+                        autonomia_capacidade_filtro_dev = gr.Textbox(
+                            label="Filtro de capacidade",
+                            placeholder="operacao insert_docstring, categoria documentacao ou modelo llama3.2",
+                        )
+                        autonomia_capacidade_dev = gr.Textbox(label="Capacidade historica", lines=8)
+                        autonomia_candidato_id_dev = gr.Textbox(label="ID do candidato para rota")
+                        with gr.Row(elem_classes="aya-compact"):
+                            autonomia_capacidade_btn_dev = gr.Button("Ver capacidade")
+                            autonomia_rota_btn_dev = gr.Button("Explicar rota")
+                        autonomia_rota_dev = gr.Textbox(label="Rota", lines=2)
+                        autonomia_rota_explicacao_dev = gr.Textbox(label="Explicacao da rota", lines=8)
                         autonomia_resultado_dev = gr.Textbox(label="Resultado autonomo", lines=8)
 
                 with gr.Column(scale=8, min_width=520):
@@ -563,7 +575,17 @@ def create_app(
             )
             autonomia_detectar_dev.click(
                 aya_dev_ui.autonomy_overview,
-                outputs=[autonomia_status_dev, autonomia_avaliacao_dev, autonomia_candidatos_dev],
+                outputs=[autonomia_status_dev, autonomia_avaliacao_dev, autonomia_candidatos_dev, autonomia_observar_dev],
+            )
+            autonomia_capacidade_btn_dev.click(
+                aya_dev_ui.autonomy_capability,
+                inputs=autonomia_capacidade_filtro_dev,
+                outputs=autonomia_capacidade_dev,
+            )
+            autonomia_rota_btn_dev.click(
+                aya_dev_ui.autonomy_route,
+                inputs=autonomia_candidato_id_dev,
+                outputs=[autonomia_rota_dev, autonomia_rota_explicacao_dev],
             )
             autonomia_executar_dev.click(
                 aya_dev_ui.run_safe_autonomy_cycle,
