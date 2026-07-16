@@ -88,12 +88,28 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
             def explain_route(self, candidate_id):
                 return f"Candidato {candidate_id} nao encontrado"
 
-        assistant = SimpleNamespace(aya_dev=FakeAyaDev())
+            def list_experiments(self):
+                return "Experimentos de calibracao"
+
+            def experiment_results(self):
+                return "Resultados de calibracao"
+
+            def create_calibration_experiment(self, candidate_id):
+                return f"Experimento criado para {candidate_id}"
+
+            def execute_calibration_experiment(self, payload):
+                return f"Experimento executado: {payload}"
+
+        permissions = SimpleNamespace(allows=lambda channel, capability: True, denial_message=lambda channel, capability: "negado")
+        assistant = SimpleNamespace(aya_dev=FakeAyaDev(), permissions=permissions)
         panel = AyaDevPanel(assistant)
         status, avaliacao, candidatos, observacao = panel.autonomy_overview()
         capacidade = panel.autonomy_capability("operacao insert_docstring")
         filtrados = panel.autonomy_candidates("informativos")
         rota, explicacao = panel.autonomy_route("AUTO-INEXISTENTE")
+        experimentos, resultados = panel.calibration_overview()
+        criado = panel.create_calibration_experiment("AUTO-1")
+        executado = panel.run_calibration_experiment("EXP-1", "EXECUTAR EXPERIMENTO EXP-1")
         self.assertIn("Autonomia supervisionada", status)
         self.assertIn("Avaliacao de autonomia", avaliacao)
         self.assertIn("Candidatos atuais", candidatos)
@@ -102,6 +118,10 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
         self.assertIn("Candidatos informativos", filtrados)
         self.assertIn("nao encontrado", rota)
         self.assertIn("nao encontrado", explicacao)
+        self.assertIn("Experimentos de calibracao", experimentos)
+        self.assertIn("Resultados de calibracao", resultados)
+        self.assertIn("AUTO-1", criado)
+        self.assertIn("EXP-1", executado)
 
 
 if __name__ == "__main__":

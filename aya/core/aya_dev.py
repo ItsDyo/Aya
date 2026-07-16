@@ -47,9 +47,14 @@ ENGINEERING_MEMORY_EVENT_STATES = {
     "REVERTIDA",
 }
 AUTONOMY_POLICY_VERSION = 1
+AYA_DEV_CAPABILITY_POLICY_VERSION = 1
+PATCH_PIPELINE_VERSION = "structured_patch_discriminated_v1"
+STRUCTURED_PATCH_SCHEMA_VERSION = "operation_schema_v1"
+PATCH_PROMPT_VERSION = "patch_prompt_v1"
+CANDIDATE_ANALYZER_VERSION = AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v4"
+RISK_POLICY_VERSION = "risk_policy_v1"
 AUTONOMY_QUALIFICATION_VERSION = 1
 AUTONOMY_CANDIDATE_SCHEMA_VERSION = 2
-AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v4"
 AUTONOMY_MODES = {"DESLIGADA", "OBSERVAR", "PREPARAR_SUPERVISIONADO"}
 AUTONOMY_MIN_CASES = 3
 AUTONOMY_MIN_SUCCESSES = 2
@@ -96,6 +101,18 @@ AUTONOMY_REASON_EXPLANATIONS = {
     "STALE_FILE_HASH": "Hash do arquivo mudou.",
     "STALE_FILE_REMOVED": "Arquivo nao existe mais.",
     "STALE_RELATED_TEST": "Teste relacionado nao existe mais.",
+    "LEGACY_PIPELINE_FAILURE": "Falha pertence a pipeline antigo ou desconhecido.",
+    "CURRENT_PIPELINE_FAILURE": "Falha pertence ao pipeline atual.",
+    "CALIBRATION_REQUIRED": "Amostra atual ainda exige calibracao supervisionada.",
+    "CALIBRATION_ALLOWED": "Candidato pode ser usado em experimento supervisionado.",
+    "ABSOLUTE_POLICY_BLOCK": "Bloqueio absoluto de politica de seguranca.",
+    "CURRENT_VERSION_SAMPLE_SMALL": "Amostra da versao atual e pequena.",
+    "CURRENT_VERSION_SUCCESS": "Ha sucesso registrado na versao atual.",
+    "CURRENT_VERSION_REGRESSION": "Ha regressao ou falha critica na versao atual.",
+    "CANDIDATE_NOT_ACTION_RECOMMENDED": "Candidato nao e acao recomendada.",
+    "CANDIDATE_TOO_LARGE": "Candidato excede limite do experimento.",
+    "CANDIDATE_STALE": "Candidato esta obsoleto.",
+    "HUMAN_CONFIRMATION_REQUIRED": "Execucao exige confirmacao textual humana.",
 }
 
 
@@ -221,9 +238,51 @@ class EngineeringProposal:
     reversal_preview_invalidated_reason: str = ""
     reversal_preview_sha256: str = ""
     approved_reversal_preview_sha256: str = ""
+    patch_pipeline_version: str = "legacy_unknown"
+    schema_version: str = "legacy_unknown"
+    prompt_version: str = "legacy_unknown"
+    analyzer_version: str = "legacy_unknown"
+    risk_policy_version: str = "legacy_unknown"
+    project_head: str = ""
     approved_reversal_base_head: str = ""
     approved_reversal_target_commit: str = ""
     approved_reversal_validation_sha256: str = ""
+
+
+@dataclass
+class CalibrationExperiment:
+    experiment_id: str
+    candidate_id: str
+    proposal_id: str
+    created_at: str
+    selected_by: str
+    project_head: str
+    file: str
+    file_sha256: str
+    symbol: str
+    operation_type: str
+    category: str
+    pipeline_version: str
+    schema_version: str
+    prompt_version: str
+    model: str
+    reviewer_model: str
+    reason: str
+    expected_change: str
+    allowed_files: list[str]
+    related_tests: list[str]
+    risk: str
+    estimated_changed_lines: int
+    state: str
+    attempt: int = 0
+    manifest_result: str = ""
+    patch_result: str = ""
+    validation_result: str = ""
+    review_result: str = ""
+    human_decision: str = ""
+    evidence_strength: str = ""
+    result: str = ""
+    record_sha256: str = ""
 
 
 @dataclass
@@ -313,6 +372,7 @@ class AyaDevService:
         self.engineering_memory_path = Path(engineering_memory_path or memory_dir / "aya_dev_engineering_memory.jsonl")
         self.autonomy_path = memory_dir / "aya_dev_autonomy.json"
         self.candidate_cache_path = memory_dir / "aya_dev_candidate_cache.json"
+        self.calibration_path = memory_dir / "aya_dev_calibration_experiments.json"
         self.index = TechnicalIndex(self.root, index_path or data_dir / "aya_dev_index.json")
         self.workspace = DevWorkspace(self.root, workspace_root)
         self.structured_patch = StructuredPatchApplier(
@@ -329,10 +389,13 @@ class AyaDevService:
         self.max_changed_lines = max_changed_lines
         self.max_attempts = max_attempts
         self.proposals = self._load()
+        self.experiments = self._load_experiments()
+        self._experiment_locks: set[str] = set()
         self._candidate_cache: list[AutonomousCandidate] | None = None
         self._candidate_cache_head = ""
         self._candidate_cache_proposals = -1
         self._candidate_scan_report = self._empty_candidate_scan_report()
+        self._candidate_exclusion_counts: dict[str, int] = {}
 
     def execute(self, payload: str) -> str:
         action, _, argument = (payload or "status").strip().partition(" ")
@@ -354,6 +417,8 @@ class AyaDevService:
             "fila-autonoma": self.autonomous_queue,
             "observar-ciclo": self.observe_cycle,
             "renovar-candidatos": self.renew_candidates,
+            "experimentos": self.list_experiments,
+            "resultados-experimentos": self.experiment_results,
         }
         if action in handlers:
             return handlers[action]()
@@ -367,6 +432,14 @@ class AyaDevService:
             return self.route_candidate(argument.strip())
         if action == "explicar-rota":
             return self.explain_route(argument.strip())
+        if action == "experimento-candidato":
+            return self.create_calibration_experiment(argument.strip())
+        if action == "experimento":
+            return self.show_experiment(argument.strip())
+        if action == "executar-experimento":
+            return self.execute_calibration_experiment(argument.strip())
+        if action == "cancelar-experimento":
+            return self.cancel_calibration_experiment(argument.strip())
         if action == "autonomia":
             return self.set_autonomy_mode(argument.strip())
         if action == "selecionar-candidato":
@@ -469,6 +542,12 @@ class AyaDevService:
             state="PROPOSTA",
             created_at=datetime.now().isoformat(timespec="seconds"),
             model=self.primary_model,
+            patch_pipeline_version=PATCH_PIPELINE_VERSION,
+            schema_version=STRUCTURED_PATCH_SCHEMA_VERSION,
+            prompt_version=PATCH_PROMPT_VERSION,
+            analyzer_version=CANDIDATE_ANALYZER_VERSION,
+            risk_policy_version=RISK_POLICY_VERSION,
+            project_head=self._safe_head(),
         )
         self._event(proposal, "proposta criada", "DETECTADA", "PROPOSTA")
         self.proposals[proposal.id] = proposal
@@ -1610,6 +1689,9 @@ class AyaDevService:
             f"- Cache misses: {report['cache_misses']}",
             f"- Chamadas Ruff: {report['ruff_calls']}",
             f"- Construcoes do indice: {report['index_builds']}",
+            f"- Total bruto detectado: {report['raw_detected']}",
+            f"- Exclusoes duras: {sum(report['hard_exclusions'].values())}",
+            "- Contadores de exclusao: " + self._format_counts(report["hard_exclusions"]),
             self._format_candidate_funnel(metrics),
             "Top candidatos:",
             *self._format_candidate_items([candidate for candidate in candidates if not candidate.stale][:5]),
@@ -1629,6 +1711,9 @@ class AyaDevService:
             f"- Cache hits: {report['cache_hits']}",
             f"- Cache misses: {report['cache_misses']}",
             f"- Ruff F401: {report['ruff_diagnostics']} diagnostico(s), {report['ruff_calls']} chamada(s)",
+            f"- Total bruto detectado: {report['raw_detected']}",
+            f"- Exclusoes duras: {sum(report['hard_exclusions'].values())}",
+            "- Contadores de exclusao: " + self._format_counts(report["hard_exclusions"]),
             self._format_candidate_funnel(metrics),
         ])
 
@@ -1648,11 +1733,15 @@ class AyaDevService:
         ]
         if filter_kind in {"operacao", "categoria", "modelo"}:
             lines.append(f"- Filtro: {filter_kind}={filter_value}")
+        versioned = self._versioned_operation_stats()
         for operation in sorted(stats):
             if filter_kind == "operacao" and operation != filter_value_normalized:
                 continue
             item = self._empty_operation_stats() | stats[operation]
             level = self._capability_level(operation, item)
+            current = versioned.get(operation, {}).get("current", {})
+            legacy = versioned.get(operation, {}).get("legacy", {})
+            unknown = versioned.get(operation, {}).get("unknown", {})
             lines.append(
                 f"- Operacao {operation}: nivel={level}; total={item['total']}; production_real={item['production_real']}; "
                 f"test_fixture={item['test_fixture']}; legacy_import={item['legacy_import']}; unknown={item['unknown']}; "
@@ -1660,7 +1749,269 @@ class AyaDevService:
                 f"rejeitados={item['rejected']}; cancelados={item['cancelled']}; escalados={item['escalated']}; "
                 f"integrados={item['integrated']}; revertidos={item['reverted']}; primeira_tentativa={item['first_attempt_success']}"
             )
+            lines.append(
+                f"  pipeline_atual: casos={current.get('total', 0)}; sucessos={current.get('success', 0)}; "
+                f"falhas={current.get('fail', 0)}; inconclusivos={current.get('inconclusive', 0)}; "
+                f"integrados={current.get('integrated', 0)}; revertidos={current.get('reverted', 0)}"
+            )
+            lines.append(
+                f"  pipeline_legado: casos={legacy.get('total', 0)}; sucessos={legacy.get('success', 0)}; "
+                f"falhas={legacy.get('fail', 0)}; inconclusivos={legacy.get('inconclusive', 0)}"
+            )
+            lines.append(
+                f"  pipeline_desconhecido: casos={unknown.get('total', 0)}; sucessos={unknown.get('success', 0)}; "
+                f"falhas={unknown.get('fail', 0)}; inconclusivos={unknown.get('inconclusive', 0)}"
+            )
         return "\n".join(lines)
+
+    def list_experiments(self) -> str:
+        if not self.experiments:
+            return "Experimentos de calibracao do Aya Dev: nenhum registrado."
+        lines = [
+            "Experimentos de calibracao do Aya Dev:",
+            f"- Pipeline atual: {PATCH_PIPELINE_VERSION}",
+            f"- Schema: {STRUCTURED_PATCH_SCHEMA_VERSION}",
+            f"- Prompt: {PATCH_PROMPT_VERSION}",
+            "- Autonomia ampliada: nao",
+        ]
+        for experiment in sorted(self.experiments.values(), key=lambda item: item.created_at, reverse=True)[:30]:
+            lines.append(
+                f"- {experiment.experiment_id} [{experiment.state}] candidato={experiment.candidate_id}; "
+                f"proposta={experiment.proposal_id or 'nao criada'}; operacao={experiment.operation_type}; "
+                f"arquivo={experiment.file}; tentativa={experiment.attempt}; resultado={experiment.result or 'pendente'}"
+            )
+        return "\n".join(lines)
+
+    def experiment_results(self) -> str:
+        if not self.experiments:
+            return "Resultados de experimentos: nenhum dado disponivel."
+        counts = self._count_values(experiment.result or experiment.state for experiment in self.experiments.values())
+        by_operation = self._count_values(experiment.operation_type for experiment in self.experiments.values())
+        lines = [
+            "Resultados versionados de calibracao:",
+            f"- Pipeline atual: {PATCH_PIPELINE_VERSION}",
+            "- Resultados: " + self._format_counts(counts),
+            "- Operacoes: " + self._format_counts(by_operation),
+        ]
+        for experiment in sorted(self.experiments.values(), key=lambda item: item.created_at, reverse=True)[:10]:
+            lines.append(
+                f"- {experiment.experiment_id}: estado={experiment.state}; evidencia={experiment.evidence_strength or 'nao registrada'}; "
+                f"patch={experiment.patch_result or 'nao executado'}; validacao={experiment.validation_result or 'nao executada'}; "
+                f"revisao={experiment.review_result or 'nao executada'}"
+            )
+        return "\n".join(lines)
+
+    def create_calibration_experiment(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id.strip())
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        allowed, reasons = self._calibration_candidate_allowed(candidate)
+        if not allowed:
+            return "\n".join([
+                "Experimento de calibracao bloqueado.",
+                f"- Candidato: {candidate.candidate_id}",
+                "- Motivos: " + "; ".join(reasons),
+                "- Patch executado: nao",
+                "- Worktree criado: nao",
+            ])
+        active = [
+            item.experiment_id
+            for item in self.experiments.values()
+            if item.candidate_id == candidate.candidate_id and item.state not in {"CANCELADO", "FALHOU", "BLOQUEADO", "CONCLUIDO"}
+        ]
+        if active:
+            return f"Experimento ja existe para este candidato: {', '.join(active[:3])}"
+        active_global = [
+            item.experiment_id
+            for item in self.experiments.values()
+            if item.state not in {"CANCELADO", "FALHOU", "BLOQUEADO", "CONCLUIDO", "AGUARDANDO_APROVACAO"}
+        ]
+        if len(active_global) >= 3:
+            return "Experimento bloqueado: limite global de 3 experimentos ativos atingido."
+        proposal = self.create_proposal(
+            title=f"[CALIBRATION] {candidate.title}",
+            problem=candidate.problem,
+            evidence=[*candidate.evidence, f"candidato={candidate.candidate_id}", f"pipeline={PATCH_PIPELINE_VERSION}"],
+            related_files=candidate.files,
+            related_symbols=candidate.symbols,
+            probable_cause=candidate.reason,
+            suggested_change=candidate.expected_change,
+            preserve=["comportamento existente", "main intacta", "sem commit automatico"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=candidate.required_tests,
+            done_criteria=["patch preparado em worktree isolado", "validacao obrigatoria aprovada", "revisao registrada", "sem commit automatico"],
+        )
+        proposal.patch_pipeline_version = PATCH_PIPELINE_VERSION
+        proposal.schema_version = STRUCTURED_PATCH_SCHEMA_VERSION
+        proposal.prompt_version = PATCH_PROMPT_VERSION
+        proposal.analyzer_version = CANDIDATE_ANALYZER_VERSION
+        proposal.risk_policy_version = RISK_POLICY_VERSION
+        proposal.project_head = self._safe_head()
+        self._save()
+        experiment_id = f"EXP-{self._sha_json({'candidate': candidate.candidate_id, 'proposal': proposal.id, 'head': candidate.project_head})[:12].upper()}"
+        experiment = CalibrationExperiment(
+            experiment_id=experiment_id,
+            candidate_id=candidate.candidate_id,
+            proposal_id=proposal.id,
+            created_at=datetime.now().isoformat(timespec="seconds"),
+            selected_by="local_user",
+            project_head=candidate.project_head,
+            file=candidate.file,
+            file_sha256=candidate.file_sha256,
+            symbol=candidate.symbol,
+            operation_type=candidate.operation_type,
+            category=candidate.category,
+            pipeline_version=PATCH_PIPELINE_VERSION,
+            schema_version=STRUCTURED_PATCH_SCHEMA_VERSION,
+            prompt_version=PATCH_PROMPT_VERSION,
+            model=self.primary_model,
+            reviewer_model=self.reviewer_model,
+            reason=candidate.reason,
+            expected_change=candidate.expected_change,
+            allowed_files=candidate.allowed_files,
+            related_tests=candidate.required_tests,
+            risk=candidate.risk,
+            estimated_changed_lines=candidate.estimated_changed_lines,
+            state="AGUARDANDO_CONFIRMACAO",
+            evidence_strength="CALIBRACAO_PLANEJADA",
+        )
+        experiment.record_sha256 = self._experiment_record_sha(experiment)
+        self.experiments[experiment.experiment_id] = experiment
+        self._save_experiments()
+        return "\n".join([
+            "Experimento de calibracao criado sem executar patch.",
+            f"- Experimento: {experiment.experiment_id}",
+            f"- Candidato: {candidate.candidate_id}",
+            f"- Proposta supervisionada: {proposal.id}",
+            f"- Pipeline: {PATCH_PIPELINE_VERSION}",
+            f"- Estado: {experiment.state}",
+            "- Modelo chamado: nao",
+            "- Worktree criado: nao",
+            "- Confirmacao para executar: EXECUTAR EXPERIMENTO " + experiment.experiment_id,
+        ])
+
+    def show_experiment(self, experiment_id: str) -> str:
+        experiment = self.experiments.get(experiment_id.strip())
+        if not experiment:
+            return f"Experimento nao encontrado: {experiment_id}"
+        return "\n".join([
+            f"Experimento {experiment.experiment_id}:",
+            f"- Estado: {experiment.state}",
+            f"- Candidato: {experiment.candidate_id}",
+            f"- Proposta: {experiment.proposal_id or 'nao criada'}",
+            f"- HEAD: {experiment.project_head}",
+            f"- Arquivo: {experiment.file}",
+            f"- Hash do arquivo: {experiment.file_sha256}",
+            f"- Simbolo: {experiment.symbol or 'nao aplicavel'}",
+            f"- Operacao: {experiment.operation_type}",
+            f"- Pipeline: {experiment.pipeline_version}",
+            f"- Schema: {experiment.schema_version}",
+            f"- Prompt: {experiment.prompt_version}",
+            f"- Risco: {experiment.risk}",
+            f"- Linhas estimadas: {experiment.estimated_changed_lines}",
+            f"- Tentativa: {experiment.attempt}/2",
+            f"- Manifesto: {experiment.manifest_result or 'nao executado'}",
+            f"- Patch: {experiment.patch_result or 'nao executado'}",
+            f"- Validacao: {experiment.validation_result or 'nao executada'}",
+            f"- Revisao: {experiment.review_result or 'nao executada'}",
+            f"- Decisao humana: {experiment.human_decision or 'pendente'}",
+            f"- Resultado: {experiment.result or 'pendente'}",
+            f"- Registro: {experiment.record_sha256}",
+        ])
+
+    def execute_calibration_experiment(self, payload: str) -> str:
+        experiment_id, _, confirmation = (payload or "").partition("|")
+        experiment_id = experiment_id.strip()
+        confirmation = confirmation.strip() or (payload or "").strip()
+        expected = f"EXECUTAR EXPERIMENTO {experiment_id}"
+        if not experiment_id:
+            return "Informe o ID do experimento."
+        experiment = self.experiments.get(experiment_id)
+        if not experiment:
+            return f"Experimento nao encontrado: {experiment_id}"
+        if confirmation != expected:
+            return f"Confirmacao incorreta. Digite exatamente: {expected}"
+        if experiment.experiment_id in self._experiment_locks:
+            return "Experimento bloqueado: ja existe execucao em andamento."
+        if experiment.state == "AGUARDANDO_APROVACAO":
+            return "Experimento ja preparou patch e aguarda aprovacao humana; nenhum commit foi criado."
+        if experiment.state not in {"AGUARDANDO_CONFIRMACAO", "FALHOU"}:
+            return f"Experimento nao executavel no estado atual: {experiment.state}"
+        if experiment.attempt >= 2:
+            experiment.state = "BLOQUEADO"
+            experiment.result = "LIMITE_DE_TENTATIVAS"
+            experiment.record_sha256 = self._experiment_record_sha(experiment)
+            self._save_experiments()
+            return "Experimento bloqueado: limite de duas tentativas atingido."
+        candidate = self._find_candidate(experiment.candidate_id)
+        allowed, reasons = self._calibration_candidate_allowed(candidate) if candidate else (False, ["candidato indisponivel"])
+        if not allowed:
+            experiment.state = "BLOQUEADO"
+            experiment.result = "CANDIDATO_INVALIDO"
+            experiment.patch_result = "nao executado"
+            experiment.validation_result = "nao executada"
+            experiment.review_result = "nao executada"
+            experiment.record_sha256 = self._experiment_record_sha(experiment)
+            self._save_experiments()
+            return "Experimento bloqueado: " + "; ".join(reasons)
+        proposal = self._get(experiment.proposal_id)
+        self._experiment_locks.add(experiment.experiment_id)
+        try:
+            experiment.state = "EXECUTANDO"
+            experiment.attempt += 1
+            experiment.record_sha256 = self._experiment_record_sha(experiment)
+            self._save_experiments()
+            prepare_result = self._prepare_autonomous_proposal(proposal, candidate)
+            experiment.manifest_result = "gerado" if proposal.patch_manifest else "nao gerado"
+            experiment.patch_result = "preparado" if proposal.patch else self.workspace.sanitize(prepare_result, 400)
+            if proposal.state == "EM_TESTE":
+                test_result = self.testar(proposal.id)
+                experiment.validation_result = "aprovada" if proposal.state == "AGUARDANDO_APROVACAO" else self.workspace.sanitize(test_result, 400)
+            else:
+                experiment.validation_result = "nao executada"
+            if proposal.state == "AGUARDANDO_APROVACAO":
+                review_result = self.revisar(proposal.id)
+                experiment.review_result = "registrada" if proposal.review_result else self.workspace.sanitize(review_result, 400)
+                experiment.state = "AGUARDANDO_APROVACAO"
+                experiment.result = "PATCH_VALIDADO_SEM_COMMIT"
+                experiment.evidence_strength = "CALIBRACAO_VALIDADA"
+            else:
+                experiment.state = "FALHOU"
+                experiment.result = "FALHA_CONTROLADA"
+                experiment.evidence_strength = "CALIBRACAO_FALHOU"
+            experiment.record_sha256 = self._experiment_record_sha(experiment)
+            self._save_experiments()
+            return "\n".join([
+                "Experimento de calibracao executado em fluxo supervisionado.",
+                f"- Experimento: {experiment.experiment_id}",
+                f"- Proposta: {proposal.id}",
+                f"- Estado da proposta: {proposal.state}",
+                f"- Estado do experimento: {experiment.state}",
+                f"- Manifesto: {experiment.manifest_result}",
+                f"- Patch: {experiment.patch_result}",
+                f"- Validacao: {experiment.validation_result}",
+                f"- Revisao: {experiment.review_result}",
+                "- Commit criado: nao",
+                "- Integracao executada: nao",
+                "- Main alterada: nao",
+            ])
+        finally:
+            self._experiment_locks.discard(experiment.experiment_id)
+
+    def cancel_calibration_experiment(self, experiment_id: str) -> str:
+        experiment = self.experiments.get(experiment_id.strip())
+        if not experiment:
+            return f"Experimento nao encontrado: {experiment_id}"
+        if experiment.state in {"AGUARDANDO_APROVACAO", "CONCLUIDO"}:
+            return "Experimento nao cancelado: ja produziu artefato supervisionado."
+        experiment.state = "CANCELADO"
+        experiment.result = "CANCELADO_PELO_USUARIO"
+        experiment.human_decision = "cancelado"
+        experiment.record_sha256 = self._experiment_record_sha(experiment)
+        self._save_experiments()
+        return f"Experimento {experiment.experiment_id} cancelado; nenhum commit foi criado."
 
     def route_candidate(self, candidate_id: str) -> str:
         candidate = self._find_candidate(candidate_id)
@@ -2039,6 +2390,28 @@ class AyaDevService:
                     raise
                 time.sleep(0.05)
 
+    def _load_experiments(self) -> dict[str, CalibrationExperiment]:
+        try:
+            raw = json.loads(self.calibration_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return {}
+        experiments: dict[str, CalibrationExperiment] = {}
+        known = set(CalibrationExperiment.__dataclass_fields__)
+        for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                experiment = CalibrationExperiment(**{key: value for key, value in item.items() if key in known})
+            except (TypeError, ValueError):
+                continue
+            experiments[experiment.experiment_id] = experiment
+        return experiments
+
+    def _save_experiments(self) -> None:
+        self.calibration_path.parent.mkdir(parents=True, exist_ok=True)
+        text = json.dumps([asdict(item) for item in self.experiments.values()], ensure_ascii=True, indent=2, sort_keys=True)
+        self.calibration_path.write_text(self.workspace.sanitize(text, max(len(text), 500000)), encoding="utf-8")
+
     def _all_validation_records(self, proposal: EngineeringProposal) -> list[dict]:
         records: list[dict] = []
         for field_name in (
@@ -2268,6 +2641,12 @@ class AyaDevService:
     def _operation_policy_status(self, operation: str, item: dict[str, int]) -> str:
         if operation not in AUTONOMY_ALLOWED_OPERATIONS:
             return "OPERACAO_NAO_SUPORTADA"
+        versioned = self._versioned_operation_stats().get(operation, {})
+        current = versioned.get("current", {})
+        if current.get("fail", 0) or current.get("reverted", 0):
+            return "BLOQUEADA_POR_FALHA_ATUAL"
+        if item["fail"] and current.get("total", 0) < AUTONOMY_MIN_CASES:
+            return "CALIBRACAO_NECESSARIA"
         if item["production_real"] < AUTONOMY_MIN_CASES or item["success"] < AUTONOMY_MIN_SUCCESSES:
             return "DADOS_INSUFICIENTES"
         if item["fail"] or item["escalated"]:
@@ -2277,14 +2656,97 @@ class AyaDevService:
     def _capability_level(self, operation: str, item: dict[str, int]) -> str:
         if item["total"] == 0:
             return "SEM_DADOS"
+        versioned = self._versioned_operation_stats().get(operation, {})
+        current = versioned.get("current", {})
+        if current.get("fail", 0) or current.get("reverted", 0):
+            return "BLOQUEADA_POR_FALHA_ATUAL"
         status = self._operation_policy_status(operation, item)
+        if status == "CALIBRACAO_NECESSARIA":
+            return "CALIBRACAO_NECESSARIA"
         if status == "DADOS_INSUFICIENTES":
             return "DADOS_INSUFICIENTES"
-        if item["fail"] or item["reverted"] or item["escalated"]:
-            return "ESCALONAMENTO_RECOMENDADO"
-        if item["production_real"] >= AUTONOMY_MIN_CASES and item["success"] >= AUTONOMY_MIN_SUCCESSES:
+        if current.get("total", 0) >= 5 and current.get("success", 0) >= 4 and current.get("first_attempt_success", 0) >= 3 and not current.get("fail", 0):
             return "SUPORTADA_LOCALMENTE"
-        return "EXPERIMENTAL"
+        if current.get("total", 0) >= 2 and current.get("success", 0) >= 1 and not current.get("fail", 0):
+            return "EXPERIMENTAL"
+        if item["reverted"] or item["escalated"]:
+            return "ESCALONAMENTO_RECOMENDADO"
+        return "CALIBRACAO_NECESSARIA"
+
+    def _pipeline_generation(self, proposal: EngineeringProposal) -> str:
+        pipeline = proposal.patch_pipeline_version or "legacy_unknown"
+        schema = proposal.schema_version or "legacy_unknown"
+        if pipeline == PATCH_PIPELINE_VERSION and schema == STRUCTURED_PATCH_SCHEMA_VERSION:
+            return "CURRENT"
+        if pipeline == "legacy_unknown":
+            return "LEGACY_UNKNOWN"
+        if "structured" in pipeline and schema != "legacy_unknown":
+            return "STRUCTURED_PATCH_INITIAL"
+        return "LEGACY_DIFF"
+
+    def _versioned_operation_stats(self) -> dict[str, dict[str, dict[str, int]]]:
+        def empty() -> dict[str, int]:
+            return {
+                "total": 0,
+                "success": 0,
+                "fail": 0,
+                "inconclusive": 0,
+                "integrated": 0,
+                "reverted": 0,
+                "first_attempt_success": 0,
+            }
+
+        stats = {operation: {"current": empty(), "legacy": empty(), "unknown": empty()} for operation in AUTONOMY_ALLOWED_OPERATIONS}
+        for proposal in self.proposals.values():
+            operations = proposal.patch_manifest.get("operations", []) if isinstance(proposal.patch_manifest, dict) else []
+            generation = self._pipeline_generation(proposal)
+            bucket = "current" if generation == "CURRENT" else ("unknown" if generation == "LEGACY_UNKNOWN" else "legacy")
+            result = self._proposal_result_bucket(proposal)
+            for operation in operations:
+                op_type = str(operation.get("type", ""))
+                if op_type not in stats:
+                    continue
+                item = stats[op_type][bucket]
+                item["total"] += 1
+                if result in item:
+                    item[result] += 1
+                if proposal.state == "INTEGRADA":
+                    item["integrated"] += 1
+                if proposal.state == "REVERTIDA":
+                    item["reverted"] += 1
+                if result == "success" and proposal.attempts <= 1:
+                    item["first_attempt_success"] += 1
+        for experiment in self.experiments.values():
+            if experiment.operation_type not in stats:
+                continue
+            item = stats[experiment.operation_type]["current"]
+            if experiment.evidence_strength in {"CALIBRACAO_VALIDADA", "APROVADA_PELO_USUARIO"}:
+                item["total"] += 1
+                item["success"] += 1
+                if experiment.attempt <= 1:
+                    item["first_attempt_success"] += 1
+            elif experiment.state in {"FALHOU", "BLOQUEADO"}:
+                item["total"] += 1
+                item["fail"] += 1
+        return stats
+
+    def _experiment_record_sha(self, experiment: CalibrationExperiment) -> str:
+        return self._sha_json({
+            "experiment_id": experiment.experiment_id,
+            "candidate_id": experiment.candidate_id,
+            "proposal_id": experiment.proposal_id,
+            "project_head": experiment.project_head,
+            "file": experiment.file,
+            "file_sha256": experiment.file_sha256,
+            "operation_type": experiment.operation_type,
+            "pipeline_version": experiment.pipeline_version,
+            "schema_version": experiment.schema_version,
+            "prompt_version": experiment.prompt_version,
+            "state": experiment.state,
+            "attempt": experiment.attempt,
+            "result": experiment.result,
+            "evidence_strength": experiment.evidence_strength,
+        })
 
     def _proposal_origin(self, proposal: EngineeringProposal) -> str:
         text = " ".join([proposal.title, proposal.problem, " ".join(proposal.evidence), proposal.model]).lower()
@@ -2334,6 +2796,8 @@ class AyaDevService:
             "capacity_calculations": 0,
             "ruff_version": "",
             "ruff_diagnostics": 0,
+            "raw_detected": 0,
+            "hard_exclusions": {},
         }
 
     def _load_candidate_cache(self) -> dict:
@@ -2386,6 +2850,21 @@ class AyaDevService:
             and cache.get("analyzer_version") == AUTONOMY_ANALYZER_VERSION
             and cache.get("ruff_version") == ruff_version
         )
+
+    def _record_candidate_exclusion(self, reason: str) -> None:
+        normalized = re.sub(r"[^A-Z0-9_]+", "_", reason.upper()).strip("_") or "UNKNOWN"
+        self._candidate_exclusion_counts[normalized] = self._candidate_exclusion_counts.get(normalized, 0) + 1
+
+    def _merge_candidate_exclusions(self, counts: dict) -> None:
+        if not isinstance(counts, dict):
+            return
+        for key, value in counts.items():
+            try:
+                amount = int(value)
+            except (TypeError, ValueError):
+                continue
+            if amount > 0:
+                self._candidate_exclusion_counts[str(key)] = self._candidate_exclusion_counts.get(str(key), 0) + amount
 
     def _ruff_version(self) -> str:
         result = self.workspace._run(("python", "-m", "ruff", "--version"), self.root, 60)
@@ -2467,9 +2946,12 @@ class AyaDevService:
         report["files_removed"] = len(cached_paths - current_paths)
         file_cache: dict[str, dict] = {}
         candidates: list[AutonomousCandidate] = []
+        self._candidate_exclusion_counts = {}
         for entry in entries:
             if entry.path.startswith("tests/") or self._candidate_path_blocked(entry.path):
+                self._record_candidate_exclusion("TEST_FILE" if entry.path.startswith("tests/") else "PROTECTED_FILE")
                 continue
+            before_exclusions = dict(self._candidate_exclusion_counts)
             cached = cached_files.get(entry.path, {}) if isinstance(cached_files, dict) else {}
             ruff_key = self._sha_json(ruff.get(entry.path, []))
             can_reuse = (
@@ -2485,6 +2967,7 @@ class AyaDevService:
                         reused.append(candidate)
                 candidates.extend(reused)
                 file_cache[entry.path] = cached
+                self._merge_candidate_exclusions(cached.get("hard_exclusions", {}))
                 report["files_reused"] += 1
                 report["cache_hits"] += 1
                 continue
@@ -2495,12 +2978,20 @@ class AyaDevService:
                 *self._docstring_candidates(entry, stats, entries),
                 *self._unused_import_candidates(entry, stats, ruff.get(entry.path, []), ruff_version),
             ]
+            file_exclusions = {
+                key: value - before_exclusions.get(key, 0)
+                for key, value in self._candidate_exclusion_counts.items()
+                if value - before_exclusions.get(key, 0) > 0
+            }
             candidates.extend(file_candidates)
             file_cache[entry.path] = {
                 "sha256": entry.sha256,
                 "ruff_key": ruff_key,
                 "candidates": [asdict(candidate) for candidate in file_candidates],
+                "hard_exclusions": dict(sorted(file_exclusions.items())),
             }
+        report["hard_exclusions"] = dict(sorted(self._candidate_exclusion_counts.items()))
+        report["raw_detected"] = len(candidates) + sum(report["hard_exclusions"].values())
         self._save_candidate_cache({
             "root": str(self.root),
             "head": head,
@@ -2509,6 +3000,7 @@ class AyaDevService:
             "schema_version": AUTONOMY_CANDIDATE_SCHEMA_VERSION,
             "analyzer_version": AUTONOMY_ANALYZER_VERSION,
             "ruff_version": ruff_version,
+            "last_scan_report": report,
             "files": file_cache,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         })
@@ -2574,6 +3066,8 @@ class AyaDevService:
                 "NESTED_SYMBOL",
             }
             if hard_exclusions & set(qualification["reason_codes"]):
+                for reason_code in sorted(hard_exclusions & set(qualification["reason_codes"])):
+                    self._record_candidate_exclusion(reason_code)
                 continue
             candidates.append(self._build_candidate(
                 source="ast:missing_docstring",
@@ -2616,6 +3110,9 @@ class AyaDevService:
                 continue
             line = text_lines[line_number - 1]
             qualification = self._qualify_ruff_f401_candidate(entry, text, line, diagnostic, ruff_version)
+            for reason_code in ("NOQA_IMPORT", "TYPE_CHECKING_IMPORT", "POSSIBLE_REEXPORT", "SIDE_EFFECT_IMPORT"):
+                if reason_code in qualification["reason_codes"]:
+                    self._record_candidate_exclusion(reason_code)
             candidates.append(self._build_candidate(
                 source="ruff:F401",
                 title=f"Remover import nao usado em {entry.path}:{line_number}",
@@ -2825,8 +3322,14 @@ class AyaDevService:
             blocked.append(policy)
         if policy == "DADOS_INSUFICIENTES":
             reason_codes.append("CAPABILITY_INSUFFICIENT")
+        if policy == "CALIBRACAO_NECESSARIA":
+            reason_codes.append("CALIBRATION_REQUIRED")
+            if self._is_calibration_candidate_shape(qualification, files, risk, estimated_changed_lines):
+                reason_codes.append("CALIBRATION_ALLOWED")
+        if policy == "BLOQUEADA_POR_FALHA_ATUAL":
+            reason_codes.append("CURRENT_PIPELINE_FAILURE")
         if policy == "BLOQUEADO_POR_FALHAS":
-            reason_codes.append("HISTORICAL_FAILURES")
+            reason_codes.append("LEGACY_PIPELINE_FAILURE")
         if risk != "baixo":
             reason_codes.append("HIGH_RISK_MODULE")
         if any(reason.startswith("ARQUIVO_BLOQUEADO") for reason in blocked):
@@ -2947,6 +3450,71 @@ class AyaDevService:
                 reasons.append(f"ARQUIVO_BLOQUEADO:{file}")
                 break
         return reasons
+
+    def _is_calibration_candidate_shape(
+        self,
+        qualification: dict,
+        files: list[str],
+        risk: str,
+        estimated_changed_lines: int,
+    ) -> bool:
+        return (
+            qualification.get("qualification_status") == "ACAO_RECOMENDADA"
+            and bool(qualification.get("actionable", False))
+            and risk == "baixo"
+            and len(files) == 1
+            and estimated_changed_lines <= 20
+        )
+
+    def _calibration_candidate_allowed(self, candidate: AutonomousCandidate) -> tuple[bool, list[str]]:
+        reasons: list[str] = []
+        if candidate.stale:
+            reasons.append("candidato obsoleto")
+        if candidate.project_head != self._safe_head():
+            reasons.append("HEAD mudou desde a deteccao")
+        if candidate.qualification_status != "ACAO_RECOMENDADA":
+            reasons.append("candidato nao e acao recomendada")
+        if not candidate.actionable:
+            reasons.append("candidato nao acionavel")
+        if candidate.risk != "baixo":
+            reasons.append(f"risco {candidate.risk}")
+        if len(candidate.files) != 1:
+            reasons.append("experimento aceita exatamente um arquivo")
+        if candidate.estimated_changed_lines > 20:
+            reasons.append("mudanca estimada acima de 20 linhas")
+        if candidate.operation_type not in AUTONOMY_ALLOWED_OPERATIONS:
+            reasons.append("operacao nao suportada")
+        if self._candidate_path_blocked(candidate.file):
+            reasons.append("arquivo protegido ou fora do projeto")
+        absolute_blocks = {
+            "OPERACAO_NAO_SUPORTADA",
+            "MAIS_DE_DOIS_ARQUIVOS",
+            "MAIS_DE_80_LINHAS",
+            "CATEGORIA_DESCONHECIDA",
+            "NAO_ACIONAVEL",
+        }
+        if any(
+            reason.startswith("RISCO_")
+            or reason.startswith("ARQUIVO_BLOQUEADO")
+            or reason in absolute_blocks
+            for reason in candidate.blocked_reasons
+        ):
+            reasons.append("bloqueio absoluto de politica")
+        if "CURRENT_PIPELINE_FAILURE" in candidate.reason_codes or "BLOQUEADA_POR_FALHA_ATUAL" in candidate.blocked_reasons:
+            reasons.append("falha registrada no pipeline atual")
+        if not any(
+            code in candidate.reason_codes
+            for code in {"CALIBRATION_REQUIRED", "CALIBRATION_ALLOWED", "CAPABILITY_INSUFFICIENT", "LEGACY_PIPELINE_FAILURE"}
+        ):
+            reasons.append("candidato nao representa lacuna de calibracao")
+        try:
+            current = self._validate_current_candidate(candidate)
+        except (OSError, RuntimeError, ValueError):
+            reasons.append("validacao atual indisponivel")
+        else:
+            if current.stale:
+                reasons.append(current.stale_reason or "candidato nao esta atual")
+        return not reasons, list(dict.fromkeys(reasons))
 
     def _candidate_score(
         self,
@@ -3130,7 +3698,7 @@ class AyaDevService:
             return "CODEX_REVIEW_RECOMMENDED"
         if risk != "baixo" or any(reason.startswith("ARQUIVO_BLOQUEADO") for reason in blocked):
             return "CODEX_ESCALATION_REQUIRED"
-        if eligibility == "DADOS_INSUFICIENTES" or self._capability_level(operation_type, stats) in {"SEM_DADOS", "DADOS_INSUFICIENTES"}:
+        if eligibility == "DADOS_INSUFICIENTES" or self._capability_level(operation_type, stats) in {"SEM_DADOS", "DADOS_INSUFICIENTES", "CALIBRACAO_NECESSARIA"}:
             return "INSUFFICIENT_DATA"
         if blocked:
             return "CODEX_REVIEW_RECOMMENDED"

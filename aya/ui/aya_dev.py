@@ -88,6 +88,25 @@ class AyaDevPanel:
             return "Informe um candidato.", "Informe um candidato."
         return self.aya.aya_dev.route_candidate(candidate_id), self.aya.aya_dev.explain_route(candidate_id)
 
+    def calibration_overview(self) -> tuple[str, str]:
+        return self.aya.aya_dev.list_experiments(), self.aya.aya_dev.experiment_results()
+
+    def create_calibration_experiment(self, candidate_id: str) -> str:
+        if not self._can_execute():
+            return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)
+        candidate_id = (candidate_id or "").strip()
+        if not candidate_id:
+            return "Informe um candidato."
+        return self.aya.aya_dev.create_calibration_experiment(candidate_id)
+
+    def run_calibration_experiment(self, experiment_id: str, confirmation: str) -> str:
+        if not self._can_execute():
+            return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)
+        experiment_id = (experiment_id or "").strip()
+        if not experiment_id:
+            return "Informe um experimento."
+        return self.aya.aya_dev.execute_calibration_experiment(f"{experiment_id} | {confirmation or ''}")
+
     def run_safe_autonomy_cycle(self, confirmation: str) -> str:
         if not self._can_execute():
             return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)

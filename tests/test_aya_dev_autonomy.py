@@ -219,6 +219,26 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertNotIn("Sample._private", operational)
         self.assertTrue(all("PRIVATE_SYMBOL" in candidate.reason_codes or candidate.symbol != "Sample._private" for candidate in candidates))
 
+    def test_contadores_de_exclusao_conservam_total_bruto(self):
+        (self.root / "aya" / "core" / "sample.py").write_text(
+            "class Sample:\n"
+            "    def __str__(self):\n"
+            "        return 'x'\n"
+            "    def _private(self):\n"
+            "        return 1\n"
+            "    def run(self, value):\n"
+            "        if value:\n"
+            "            return value\n"
+            "        return 'x'\n",
+            encoding="utf-8",
+        )
+        candidates = self.service._autonomous_candidates(force=True)
+        report = self.service._candidate_scan_report
+        exclusions = sum(report["hard_exclusions"].values())
+        self.assertEqual(report["raw_detected"], len(candidates) + exclusions)
+        self.assertGreaterEqual(report["hard_exclusions"].get("PRIVATE_SYMBOL", 0), 1)
+        self.assertIn("Contadores de exclusao", self.service.renew_candidates())
+
     def test_reason_codes_pontuacao_e_funil_sao_deterministicos(self):
         self.seed_successful_docstring_history(production_real=True)
         first = self.service._autonomous_candidates(force=True)
@@ -321,6 +341,109 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertIn("Operacao insert_docstring", by_category)
         self.assertIn(f"Filtro: modelo={model}", by_model)
         self.assertIn("production_real=1", by_model)
+
+    def test_capacidade_versionada_separa_pipeline_atual_e_legado(self):
+        self.seed_successful_docstring_history(total=1, production_real=True)
+        legacy = self.service.create_proposal(
+            title="Historico legado importado",
+            problem="Documentar simbolo simples.",
+            evidence=["manual"],
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample.run"],
+            probable_cause="sem docstring",
+            suggested_change="docstring",
+            preserve=["comportamento"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=["tests/test_sample.py"],
+            done_criteria=["ok"],
+        )
+        legacy.patch_pipeline_version = "legacy_unknown"
+        legacy.schema_version = "legacy_unknown"
+        legacy.state = "AGUARDANDO_APROVACAO"
+        legacy.patch_manifest = {"operations": [{"type": "insert_docstring", "file": "aya/core/sample.py"}]}
+        self.service._save()
+        report = self.service.capability_report("operacao insert_docstring")
+        self.assertIn("pipeline_atual: casos=1", report)
+        self.assertIn("pipeline_desconhecido: casos=1", report)
+
+    def test_falha_do_pipeline_atual_bloqueia_calibracao(self):
+        failed = self.service.create_proposal(
+            title="Falha operacional atual",
+            problem="Documentar simbolo simples.",
+            evidence=["Indice AST confirmou aya/core/sample.py."],
+            related_files=["aya/core/sample.py"],
+            related_symbols=["Sample.run"],
+            probable_cause="sem docstring",
+            suggested_change="docstring",
+            preserve=["comportamento"],
+            impact="baixo",
+            urgency="baixa",
+            difficulty="baixa",
+            required_tests=["tests/test_sample.py"],
+            done_criteria=["ok"],
+        )
+        failed.state = "FALHOU"
+        failed.workspace_created = True
+        failed.tests_executed = True
+        failed.patch_manifest = {"operations": [{"type": "insert_docstring", "file": "aya/core/sample.py"}]}
+        self.service._save()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.operation_type == "insert_docstring")
+        self.assertIn("CURRENT_PIPELINE_FAILURE", candidate.reason_codes)
+        response = self.service.create_calibration_experiment(candidate.candidate_id)
+        self.assertIn("falha registrada no pipeline atual", response)
+
+    def test_criar_experimento_de_calibracao_nao_chama_modelo_nem_worktree(self):
+        candidates = self.service._autonomous_candidates(force=True)
+        candidate = next(item for item in candidates if item.qualification_status == "ACAO_RECOMENDADA")
+        response = self.service.create_calibration_experiment(candidate.candidate_id)
+        self.assertIn("Experimento de calibracao criado", response)
+        self.assertIn("Modelo chamado: nao", response)
+        self.assertIn("Worktree criado: nao", response)
+        self.assertEqual([], self.service.llm.calls)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+        self.assertIn("AGUARDANDO_CONFIRMACAO", {item.state for item in self.service.experiments.values()})
+
+    def test_experimento_exige_confirmacao_explicitamente(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        response = self.service.execute_calibration_experiment(f"{experiment.experiment_id} | confirmar")
+        self.assertIn("Confirmacao incorreta", response)
+        self.assertEqual("AGUARDANDO_CONFIRMACAO", self.service.experiments[experiment.experiment_id].state)
+
+    def test_executar_experimento_para_em_aguardando_aprovacao_sem_commit(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        response = self.service.execute_calibration_experiment(
+            f"{experiment.experiment_id} | EXECUTAR EXPERIMENTO {experiment.experiment_id}"
+        )
+        updated = self.service.experiments[experiment.experiment_id]
+        proposal = self.service._get(updated.proposal_id)
+        self.assertIn("Commit criado: nao", response)
+        self.assertEqual("AGUARDANDO_APROVACAO", updated.state)
+        self.assertEqual("AGUARDANDO_APROVACAO", proposal.state)
+        self.assertEqual("PATCH_VALIDADO_SEM_COMMIT", updated.result)
+        self.assertEqual(
+            "",
+            subprocess.run(("git", "status", "--porcelain"), cwd=self.root, capture_output=True, text=True, check=True).stdout,
+        )
+
+    def test_resultado_de_experimento_validado_alimenta_capacidade_atual(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        experiment.state = "AGUARDANDO_APROVACAO"
+        experiment.result = "PATCH_VALIDADO_SEM_COMMIT"
+        experiment.evidence_strength = "CALIBRACAO_VALIDADA"
+        experiment.record_sha256 = self.service._experiment_record_sha(experiment)
+        self.service._save_experiments()
+        report = self.service.capability_report("operacao insert_docstring")
+        self.assertIn("pipeline_atual: casos=1", report)
+        self.assertIn("sucessos=1", report)
 
     def test_hash_alterado_e_docstring_adicionada_tornam_candidato_obsoleto(self):
         self.seed_successful_docstring_history(production_real=True)

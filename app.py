@@ -522,6 +522,20 @@ def create_app(
                         autonomia_rota_dev = gr.Textbox(label="Rota", lines=2)
                         autonomia_rota_explicacao_dev = gr.Textbox(label="Explicacao da rota", lines=8)
                         autonomia_resultado_dev = gr.Textbox(label="Resultado autonomo", lines=8)
+                        with gr.Accordion("Calibracao versionada", open=False):
+                            calibracao_candidato_dev = gr.Textbox(label="ID do candidato")
+                            calibracao_experimento_dev = gr.Textbox(label="ID do experimento")
+                            calibracao_confirmacao_dev = gr.Textbox(
+                                label="Confirmacao do experimento",
+                                placeholder="EXECUTAR EXPERIMENTO EXP-...",
+                            )
+                            with gr.Row(elem_classes="aya-compact"):
+                                calibracao_listar_dev = gr.Button("Listar experimentos")
+                                calibracao_criar_dev = gr.Button("Criar experimento")
+                                calibracao_executar_dev = gr.Button("Executar experimento")
+                            calibracao_lista_dev = gr.Textbox(label="Experimentos", lines=8)
+                            calibracao_resultados_dev = gr.Textbox(label="Resultados", lines=8)
+                            calibracao_saida_dev = gr.Textbox(label="Saida", lines=8)
 
                 with gr.Column(scale=8, min_width=520):
                     with gr.Tabs():
@@ -602,6 +616,20 @@ def create_app(
                 aya_dev_ui.run_safe_autonomy_cycle,
                 inputs=autonomia_confirmacao_dev,
                 outputs=autonomia_resultado_dev,
+            )
+            calibracao_listar_dev.click(
+                aya_dev_ui.calibration_overview,
+                outputs=[calibracao_lista_dev, calibracao_resultados_dev],
+            )
+            calibracao_criar_dev.click(
+                aya_dev_ui.create_calibration_experiment,
+                inputs=calibracao_candidato_dev,
+                outputs=calibracao_saida_dev,
+            )
+            calibracao_executar_dev.click(
+                aya_dev_ui.run_calibration_experiment,
+                inputs=[calibracao_experimento_dev, calibracao_confirmacao_dev],
+                outputs=calibracao_saida_dev,
             )
             proposta_dev.change(
                 aya_dev_ui.details,
