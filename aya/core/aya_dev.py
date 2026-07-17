@@ -13,7 +13,14 @@ from pathlib import Path
 
 from aya.config import MODEL_CONFIG
 from aya.core.dev_index import TechnicalFile, TechnicalIndex
-from aya.core.dev_workspace import CheckResult, DevWorkspace
+from aya.core.dev_workspace import (
+    RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS,
+    RELATED_TEST_TIMEOUT_MINIMUM_SECONDS,
+    RELATED_TEST_TIMEOUT_POLICY_VERSION,
+    CheckResult,
+    DevWorkspace,
+    calculate_related_test_timeout,
+)
 from aya.core.llm import ChatClient
 from aya.core.project_tools import ProjectTools
 from aya.core.structured_patch import PATCH_DECISION_SCHEMA, StructuredPatchApplier, StructuredPatchError
@@ -882,8 +889,17 @@ class AyaDevService:
             return "Nao existe patch isolado para testar."
         previous = proposal.state
         proposal.state = "EM_TESTE"
-        results = self.workspace.validate(proposal.workspace, self._related_tests(proposal))
-        proposal.validation.extend(asdict(result) | {"passed": result.passed, "phase": "patch"} for result in results)
+        related_tests = self._related_tests(proposal)
+        timeout_metadata = self._related_test_timeout_metadata(proposal, related_tests)
+        results = self.workspace.validate(
+            proposal.workspace,
+            related_tests,
+            related_test_timeout=timeout_metadata["calculated_timeout_seconds"],
+        )
+        proposal.validation.extend(
+            self._validation_record(result, "patch", timeout_metadata)
+            for result in results
+        )
         proposal.tests_executed = True
         passed = all(result.passed for result in results)
         proposal.state = "AGUARDANDO_APROVACAO" if passed else "FALHOU"
@@ -1909,7 +1925,11 @@ class AyaDevService:
         active = [
             item.experiment_id
             for item in self.experiments.values()
-            if item.candidate_id == candidate.candidate_id and item.state not in {"CANCELADO", "FALHOU", "BLOQUEADO", "CONCLUIDO"}
+            if (
+                item.candidate_id == candidate.candidate_id
+                and item.project_head == candidate.project_head
+                and item.state not in {"CANCELADO", "FALHOU", "BLOQUEADO", "CONCLUIDO"}
+            )
         ]
         if active:
             return f"Experimento ja existe para este candidato: {', '.join(active[:3])}"
@@ -2432,6 +2452,37 @@ class AyaDevService:
                 status = "REPROVADO"
             lines.append(f"- {result.name}: {status} (codigo={result.exit_code}, {result.duration_ms}ms)")
         return "\n".join(lines)
+
+    def _validation_record(self, result: CheckResult, phase: str, timeout_metadata: dict | None = None) -> dict:
+        record = asdict(result) | {"passed": result.passed, "phase": phase}
+        if result.name == "testes relacionados" and timeout_metadata:
+            record.update(timeout_metadata)
+        return record
+
+    def _related_test_timeout_metadata(self, proposal: EngineeringProposal, related_tests: list[str]) -> dict:
+        duration = self._related_baseline_duration_seconds(proposal, related_tests)
+        return {
+            "baseline_duration_seconds": duration,
+            "calculated_timeout_seconds": calculate_related_test_timeout(duration),
+            "timeout_policy_version": RELATED_TEST_TIMEOUT_POLICY_VERSION,
+            "timeout_calculation_source": "baseline_relacionada_da_proposta" if duration is not None else "fallback_sem_baseline_compativel",
+            "timeout_minimum": RELATED_TEST_TIMEOUT_MINIMUM_SECONDS,
+            "timeout_maximum": RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS,
+        }
+
+    def _related_baseline_duration_seconds(self, proposal: EngineeringProposal, related_tests: list[str]) -> float | None:
+        if not related_tests:
+            return None
+        expected_command = "python -m pytest " + " ".join(related_tests)
+        for item in proposal.validation:
+            if item.get("phase") != "baseline" or item.get("name") != "testes relacionados":
+                continue
+            if item.get("command") != expected_command or not item.get("passed"):
+                continue
+            duration_ms = item.get("duration_ms")
+            if isinstance(duration_ms, int | float) and duration_ms > 0:
+                return duration_ms / 1000
+        return None
 
     def _get(self, proposal_id: str) -> EngineeringProposal:
         proposal = self.proposals.get(proposal_id.upper())

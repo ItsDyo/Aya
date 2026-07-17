@@ -405,6 +405,34 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
         self.assertIn("AGUARDANDO_CONFIRMACAO", {item.state for item in self.service.experiments.values()})
 
+    def test_calculo_de_timeout_nao_executa_experimento_nem_cria_worktree(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        proposal = self.service._get(experiment.proposal_id)
+
+        metadata = self.service._related_test_timeout_metadata(proposal, ["tests/test_sample.py"])
+
+        self.assertEqual(1200, metadata["calculated_timeout_seconds"])
+        self.assertEqual("AGUARDANDO_CONFIRMACAO", self.service.experiments[experiment.experiment_id].state)
+        self.assertEqual([], self.service.llm.calls)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+
+    def test_experimento_ativo_de_head_antigo_nao_bloqueia_novo_head(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        previous = next(iter(self.service.experiments.values()))
+        previous.project_head = "HEAD-ANTIGO"
+        previous.record_sha256 = self.service._experiment_record_sha(previous)
+        self.service._save_experiments()
+
+        response = self.service.create_calibration_experiment(candidate.candidate_id)
+
+        self.assertIn("Experimento de calibracao criado", response)
+        self.assertEqual(2, len(self.service.experiments))
+        self.assertEqual([], self.service.llm.calls)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+
     def test_experimento_exige_confirmacao_explicitamente(self):
         candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
         self.service.create_calibration_experiment(candidate.candidate_id)
@@ -625,7 +653,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.service.set_autonomy_mode("preparar-supervisionado")
         self.assertIn("alteracao", self.service.execute_candidate(candidate.candidate_id))
 
-    def _fast_validation(self, workspace, related_tests=None):
+    def _fast_validation(self, workspace, related_tests=None, *, related_test_timeout=None):
         return [
             CheckResult("pytest", "python -m pytest", 0, 1, "ok"),
             CheckResult("ruff", "python -m ruff check .", 0, 1, "ok"),

@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import time
+from math import ceil
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -15,7 +16,10 @@ VALIDATION_COMMANDS = (
     ("pip check", ("python", "-m", "pip", "check"), 180),
     ("smoke", ("python", "scripts/smoke_test.py"), 180),
 )
-RELATED_TEST_TIMEOUT_SECONDS = 900
+RELATED_TEST_TIMEOUT_POLICY_VERSION = "related_tests_timeout_v1"
+RELATED_TEST_TIMEOUT_MINIMUM_SECONDS = 900
+RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS = 1800
+RELATED_TEST_TIMEOUT_FALLBACK_SECONDS = 1200
 PROTECTED_NAMES = {".env", ".env.local", ".env.example"}
 PROTECTED_PARTS = {"data_local", "logs", "backups", ".git", "voices"}
 PROTECTED_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".key", ".pem", ".onnx"}
@@ -186,17 +190,24 @@ class DevWorkspace:
         path = self._workspace_path(workspace)
         return self._check("git diff --check", ("git", "diff", "--check"), 30, path)
 
-    def validate(self, workspace: str | Path, related_tests: list[str] | None = None) -> list[CheckResult]:
+    def validate(
+        self,
+        workspace: str | Path,
+        related_tests: list[str] | None = None,
+        *,
+        related_test_timeout: int | None = None,
+    ) -> list[CheckResult]:
         path = self._workspace_path(workspace)
         results: list[CheckResult] = []
         if related_tests:
             safe_tests = [test for test in related_tests if not self._path_error(test) and test.endswith(".py")]
             if safe_tests:
+                timeout = related_test_timeout or calculate_related_test_timeout(None)
                 results.append(
                     self._check(
                         "testes relacionados",
                         ("python", "-m", "pytest", *safe_tests),
-                        RELATED_TEST_TIMEOUT_SECONDS,
+                        timeout,
                         path,
                     )
                 )
@@ -286,3 +297,10 @@ class DevWorkspace:
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
             raise ValueError("Identificador de proposta invalido.")
         return value
+
+
+def calculate_related_test_timeout(baseline_duration_seconds: float | None) -> int:
+    if baseline_duration_seconds is None:
+        return RELATED_TEST_TIMEOUT_FALLBACK_SECONDS
+    calculated = ceil((baseline_duration_seconds * 1.5) + 60)
+    return max(RELATED_TEST_TIMEOUT_MINIMUM_SECONDS, min(RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS, calculated))

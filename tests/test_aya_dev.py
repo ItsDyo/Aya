@@ -12,7 +12,15 @@ from unittest.mock import Mock, patch
 import pytest
 
 from aya.core.aya_dev import AyaDevService
-from aya.core.dev_workspace import CheckResult, DevWorkspace, GitState, RELATED_TEST_TIMEOUT_SECONDS
+from aya.core.dev_workspace import (
+    RELATED_TEST_TIMEOUT_FALLBACK_SECONDS,
+    RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS,
+    RELATED_TEST_TIMEOUT_MINIMUM_SECONDS,
+    CheckResult,
+    DevWorkspace,
+    GitState,
+    calculate_related_test_timeout,
+)
 from aya.core.llm import StaticClient
 from aya.core.permissions import AccessChannel, PermissionManager
 from aya.core.project_tools import ProjectTools
@@ -1312,7 +1320,56 @@ class AyaDevTestCase(unittest.TestCase):
         dev_workspace.validate(workspace, ["tests/test_sample.py"])
 
         self.assertEqual("testes relacionados", captured[0][0])
-        self.assertEqual(RELATED_TEST_TIMEOUT_SECONDS, captured[0][2])
+        self.assertEqual(RELATED_TEST_TIMEOUT_FALLBACK_SECONDS, captured[0][2])
+
+    def test_timeout_adaptativo_usa_minimo_para_baseline_curta(self):
+        self.assertEqual(RELATED_TEST_TIMEOUT_MINIMUM_SECONDS, calculate_related_test_timeout(100))
+
+    def test_timeout_adaptativo_calcula_margem_para_baseline_real(self):
+        self.assertEqual(1411, calculate_related_test_timeout(900.27))
+
+    def test_timeout_adaptativo_respeita_maximo(self):
+        self.assertEqual(RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS, calculate_related_test_timeout(2000))
+
+    def test_timeout_adaptativo_usa_fallback_sem_baseline(self):
+        self.assertEqual(RELATED_TEST_TIMEOUT_FALLBACK_SECONDS, calculate_related_test_timeout(None))
+
+    def test_timeout_adaptativo_e_deterministico(self):
+        first = calculate_related_test_timeout(900.27)
+        second = calculate_related_test_timeout(900.27)
+        self.assertEqual(first, second)
+
+    def test_timeout_nao_reutiliza_baseline_incompativel(self):
+        proposal = self.proposal()
+        proposal.validation = [{
+            "phase": "baseline",
+            "name": "testes relacionados",
+            "command": "python -m pytest tests/outro.py",
+            "duration_ms": 900270,
+            "passed": True,
+        }]
+
+        metadata = self.service._related_test_timeout_metadata(proposal, ["tests/test_sample.py"])
+
+        self.assertIsNone(metadata["baseline_duration_seconds"])
+        self.assertEqual(RELATED_TEST_TIMEOUT_FALLBACK_SECONDS, metadata["calculated_timeout_seconds"])
+        self.assertEqual("fallback_sem_baseline_compativel", metadata["timeout_calculation_source"])
+
+    def test_timeout_usa_baseline_compativel_da_propria_proposta(self):
+        proposal = self.proposal()
+        proposal.validation = [{
+            "phase": "baseline",
+            "name": "testes relacionados",
+            "command": "python -m pytest tests/test_sample.py",
+            "duration_ms": 900270,
+            "passed": True,
+        }]
+
+        metadata = self.service._related_test_timeout_metadata(proposal, ["tests/test_sample.py"])
+
+        self.assertEqual(900.27, metadata["baseline_duration_seconds"])
+        self.assertEqual(1411, metadata["calculated_timeout_seconds"])
+        self.assertEqual("baseline_relacionada_da_proposta", metadata["timeout_calculation_source"])
 
     def test_timeout_em_validacao_e_inconclusivo_nao_falha_funcional(self):
         proposal = self.proposal()
@@ -1438,7 +1495,7 @@ class AyaDevTestCase(unittest.TestCase):
     def _passed_validation(self):
         return [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
 
-    def _fast_validation(self, workspace, related_tests=None):
+    def _fast_validation(self, workspace, related_tests=None, *, related_test_timeout=None):
         results = []
         if related_tests:
             results.append(CheckResult("testes relacionados", "python -m pytest " + " ".join(related_tests), 0, 1, "ok"))
