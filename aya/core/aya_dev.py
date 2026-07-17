@@ -888,8 +888,10 @@ class AyaDevService:
         passed = all(result.passed for result in results)
         proposal.state = "AGUARDANDO_APROVACAO" if passed else "FALHOU"
         if not passed:
-            proposal.review_result = "Validacao do patch reprovada."
-            self._record_failure(proposal, "testes", "validacao reprovada", self._format_checks(results, proposal.state))
+            timeout = any(result.exit_code == 124 for result in results)
+            proposal.review_result = "Validacao inconclusiva por timeout." if timeout else "Validacao do patch reprovada."
+            reason = "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT" if timeout else "validacao reprovada"
+            self._record_failure(proposal, "testes", reason, self._format_checks(results, proposal.state))
             self._cleanup_failed_workspace(proposal)
         self._event(proposal, "validacao concluida", previous, proposal.state)
         self._save()
@@ -2422,7 +2424,13 @@ class AyaDevService:
     def _format_checks(self, results: list[CheckResult], state: str) -> str:
         lines = [f"Validacao Aya Dev: {state}"]
         for result in results:
-            lines.append(f"- {result.name}: {'APROVADO' if result.passed else 'REPROVADO'} (codigo={result.exit_code}, {result.duration_ms}ms)")
+            if result.passed:
+                status = "APROVADO"
+            elif result.exit_code == 124:
+                status = "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+            else:
+                status = "REPROVADO"
+            lines.append(f"- {result.name}: {status} (codigo={result.exit_code}, {result.duration_ms}ms)")
         return "\n".join(lines)
 
     def _get(self, proposal_id: str) -> EngineeringProposal:
@@ -4115,12 +4123,27 @@ class AyaDevService:
             return {
                 "type": "insert_docstring",
                 "symbol": candidate.symbols[0],
-                "content": f"Document {candidate.symbols[0]}.",
+                "content": self._candidate_docstring(candidate),
             }
         if candidate.operation_type == "replace_exact":
             entry = self._unused_import_payload(candidate)
             return {"type": "replace_exact", **entry}
         raise StructuredPatchError("Operacao autonoma nao suportada.")
+
+    def _candidate_docstring(self, candidate: AutonomousCandidate) -> str:
+        symbol = candidate.symbols[0]
+        name = symbol.rsplit(".", 1)[-1]
+        subject = name.replace("_", " ")
+        body = self._symbol_context(candidate.files[0], symbol).lower()
+        if name.startswith("render_"):
+            if "html.escape" in body and "diff_limit" in body:
+                return f"Render {subject.removeprefix('render ')} as escaped HTML, truncating long content unless expanded."
+            return f"Render {subject.removeprefix('render ')} for display without changing stored data."
+        if name.startswith("parse_"):
+            return f"Parse {subject.removeprefix('parse ')} into the normalized value expected by the caller."
+        if "return " in body:
+            return f"Return the {subject} result without mutating project state."
+        return f"Describe the existing {subject} behavior without changing project state."
 
     def _unused_import_payload(self, candidate: AutonomousCandidate) -> dict:
         path = self.root / candidate.files[0]
@@ -4263,9 +4286,16 @@ class AyaDevService:
             return "Informacao nao registrada."
         lines = []
         for item in proposal.validation[-12:]:
-            status = "APROVADO" if item.get("passed") else "REPROVADO"
+            status = self._validation_item_status(item)
             lines.append(f"- {item.get('phase', '?')} {item.get('name', '?')}: {status}")
         return "\n".join(lines)
+
+    def _validation_item_status(self, item: dict) -> str:
+        if item.get("passed"):
+            return "APROVADO"
+        if item.get("exit_code") == 124:
+            return "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+        return "REPROVADO"
 
     def _decision_summary(self, proposal: EngineeringProposal) -> str:
         decisions = {

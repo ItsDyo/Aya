@@ -413,6 +413,14 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertIn("Confirmacao incorreta", response)
         self.assertEqual("AGUARDANDO_CONFIRMACAO", self.service.experiments[experiment.experiment_id].state)
 
+    def test_decisao_de_docstring_autonoma_nao_e_generica(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        decision = self.service._candidate_decision(candidate)
+
+        self.assertEqual("insert_docstring", decision["type"])
+        self.assertNotEqual(f"Document {candidate.symbols[0]}.", decision["content"])
+        self.assertIn("state", decision["content"])
+
     def test_executar_experimento_para_em_aguardando_aprovacao_sem_commit(self):
         self.init_git()
         candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")

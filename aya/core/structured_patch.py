@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -247,6 +248,7 @@ class StructuredPatchApplier:
             if missing:
                 raise StructuredPatchError("Campo obrigatorio ausente: " + ", ".join(missing) + ".")
             content = decision["content"]
+            self._validate_docstring_content(content, decision["symbol"])
             if "```" in content or content.strip().startswith(("#", "-", "*")):
                 raise StructuredPatchError("Conteudo de docstring nao pode conter Markdown.")
             if '"""' in content or "'''" in content:
@@ -257,6 +259,14 @@ class StructuredPatchApplier:
                 raise StructuredPatchError("Campo obrigatorio ausente: " + ", ".join(missing) + ".")
             if any(key in decision for key in ("file", "path", "line", "line_number", "regex")):
                 raise StructuredPatchError("replace_exact nao aceita caminho, linha ou regex.")
+
+    def _validate_docstring_content(self, content: str, symbol: str) -> None:
+        normalized = " ".join(content.split())
+        bare_symbol = symbol.rsplit(".", 1)[-1]
+        if re.fullmatch(r"(?i)document[a-z]*\s+" + re.escape(bare_symbol) + r"\.?", normalized):
+            raise StructuredPatchError("Docstring generica recusada.")
+        if normalized.lower() in {bare_symbol.lower(), f"{bare_symbol.lower()}."}:
+            raise StructuredPatchError("Docstring deve descrever comportamento, nao repetir o nome.")
 
     def _insert_docstring(self, text: str, symbol: str, content: str) -> str:
         tree = ast.parse(text)

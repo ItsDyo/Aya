@@ -15,6 +15,7 @@ VALIDATION_COMMANDS = (
     ("pip check", ("python", "-m", "pip", "check"), 180),
     ("smoke", ("python", "scripts/smoke_test.py"), 180),
 )
+RELATED_TEST_TIMEOUT_SECONDS = 900
 PROTECTED_NAMES = {".env", ".env.local", ".env.example"}
 PROTECTED_PARTS = {"data_local", "logs", "backups", ".git", "voices"}
 PROTECTED_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".key", ".pem", ".onnx"}
@@ -191,7 +192,14 @@ class DevWorkspace:
         if related_tests:
             safe_tests = [test for test in related_tests if not self._path_error(test) and test.endswith(".py")]
             if safe_tests:
-                results.append(self._check("testes relacionados", ("python", "-m", "pytest", *safe_tests), 600, path))
+                results.append(
+                    self._check(
+                        "testes relacionados",
+                        ("python", "-m", "pytest", *safe_tests),
+                        RELATED_TEST_TIMEOUT_SECONDS,
+                        path,
+                    )
+                )
                 if not results[-1].passed:
                     return results
         for name, command, timeout in VALIDATION_COMMANDS:

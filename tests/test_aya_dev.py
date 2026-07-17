@@ -12,7 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from aya.core.aya_dev import AyaDevService
-from aya.core.dev_workspace import CheckResult, GitState
+from aya.core.dev_workspace import CheckResult, DevWorkspace, GitState, RELATED_TEST_TIMEOUT_SECONDS
 from aya.core.llm import StaticClient
 from aya.core.permissions import AccessChannel, PermissionManager
 from aya.core.project_tools import ProjectTools
@@ -182,6 +182,14 @@ class AyaDevTestCase(unittest.TestCase):
             "content": "Executa sample.",
         })
         self.assertEqual("insert_docstring", decision["type"])
+
+    def test_patch_decision_recusa_docstring_generica(self):
+        with self.assertRaisesRegex(StructuredPatchError, "generica"):
+            self.service.structured_patch.parse_decision({
+                "type": "insert_docstring",
+                "symbol": "render_diff",
+                "content": "Document render_diff.",
+            })
 
     def test_patch_decision_insert_docstring_sem_symbol(self):
         with self.assertRaisesRegex(StructuredPatchError, "symbol"):
@@ -1287,6 +1295,43 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertEqual(5, len(commands))
         self.assertTrue(all(command[0] == "python" for command in commands))
         self.assertFalse(any("del" in command or "powershell" in command for command in commands))
+
+    def test_testes_relacionados_usam_timeout_maior_de_calibracao(self):
+        workspace = self.workspaces / "safe-timeout"
+        workspace.mkdir(parents=True)
+        (workspace / "tests").mkdir()
+        (workspace / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+        dev_workspace = DevWorkspace(self.root, self.workspaces)
+        captured = []
+
+        def fake_check(name, command, timeout, cwd):
+            captured.append((name, command, timeout, cwd))
+            return CheckResult(name, " ".join(command), 0, 1, "ok")
+
+        dev_workspace._check = fake_check
+        dev_workspace.validate(workspace, ["tests/test_sample.py"])
+
+        self.assertEqual("testes relacionados", captured[0][0])
+        self.assertEqual(RELATED_TEST_TIMEOUT_SECONDS, captured[0][2])
+
+    def test_timeout_em_validacao_e_inconclusivo_nao_falha_funcional(self):
+        proposal = self.proposal()
+        workspace = self.workspaces / proposal.id
+        workspace.mkdir(parents=True)
+        proposal.workspace = str(workspace)
+        proposal.workspace_path = str(workspace)
+        proposal.patch = "diff --git a/aya/core/sample.py b/aya/core/sample.py\n"
+        self.service.workspace.validate = Mock(return_value=[
+            CheckResult("testes relacionados", "python -m pytest tests/test_sample.py", 124, 900001, "Tempo limite excedido.")
+        ])
+        self.service.workspace.git_state = Mock(return_value=GitState(True, True, "ok"))
+
+        response = self.service.testar(proposal.id)
+
+        self.assertIn("VALIDACAO_INCONCLUSIVA_POR_TIMEOUT", response)
+        self.assertEqual("VALIDACAO_INCONCLUSIVA_POR_TIMEOUT", proposal.failure_reason)
+        self.assertEqual("Validacao inconclusiva por timeout.", proposal.review_result)
+        self.assertIn("VALIDACAO_INCONCLUSIVA_POR_TIMEOUT", self.service._validation_summary(proposal))
 
     def test_comandos_basicos_e_aprovacao_apenas_registram(self):
         proposal = self.proposal()
