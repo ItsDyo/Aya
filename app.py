@@ -530,9 +530,13 @@ def create_app(
                                 placeholder="EXECUTAR EXPERIMENTO EXP-...",
                             )
                             with gr.Row(elem_classes="aya-compact"):
+                                calibracao_shortlist_dev = gr.Button("Shortlist segura")
+                                calibracao_explicar_dev = gr.Button("Explicar candidato")
                                 calibracao_listar_dev = gr.Button("Listar experimentos")
+                            with gr.Row(elem_classes="aya-compact"):
                                 calibracao_criar_dev = gr.Button("Criar experimento")
                                 calibracao_executar_dev = gr.Button("Executar experimento")
+                            calibracao_shortlist_saida_dev = gr.Textbox(label="Shortlist e auditoria", lines=10)
                             calibracao_lista_dev = gr.Textbox(label="Experimentos", lines=8)
                             calibracao_resultados_dev = gr.Textbox(label="Resultados", lines=8)
                             calibracao_saida_dev = gr.Textbox(label="Saida", lines=8)
@@ -620,6 +624,15 @@ def create_app(
             calibracao_listar_dev.click(
                 aya_dev_ui.calibration_overview,
                 outputs=[calibracao_lista_dev, calibracao_resultados_dev],
+            )
+            calibracao_shortlist_dev.click(
+                aya_dev_ui.calibration_shortlist,
+                outputs=calibracao_shortlist_saida_dev,
+            )
+            calibracao_explicar_dev.click(
+                aya_dev_ui.explain_calibration_candidate,
+                inputs=calibracao_candidato_dev,
+                outputs=calibracao_shortlist_saida_dev,
             )
             calibracao_criar_dev.click(
                 aya_dev_ui.create_calibration_experiment,

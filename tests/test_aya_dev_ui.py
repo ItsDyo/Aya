@@ -94,6 +94,12 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
             def experiment_results(self):
                 return "Resultados de calibracao"
 
+            def calibration_candidates(self):
+                return "Shortlist segura reason_codes=SAFE_PURE_UTILITY"
+
+            def explain_calibration_candidate(self, candidate_id):
+                return f"Explicacao {candidate_id} reason_codes=SAFE_PURE_UTILITY"
+
             def create_calibration_experiment(self, candidate_id):
                 return f"Experimento criado para {candidate_id}"
 
@@ -108,6 +114,8 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
         filtrados = panel.autonomy_candidates("informativos")
         rota, explicacao = panel.autonomy_route("AUTO-INEXISTENTE")
         experimentos, resultados = panel.calibration_overview()
+        shortlist = panel.calibration_shortlist()
+        explicacao_calibracao = panel.explain_calibration_candidate("AUTO-1")
         criado = panel.create_calibration_experiment("AUTO-1")
         executado = panel.run_calibration_experiment("EXP-1", "EXECUTAR EXPERIMENTO EXP-1")
         self.assertIn("Autonomia supervisionada", status)
@@ -120,6 +128,8 @@ class AssistantAyaDevInitializationTest(unittest.TestCase):
         self.assertIn("nao encontrado", explicacao)
         self.assertIn("Experimentos de calibracao", experimentos)
         self.assertIn("Resultados de calibracao", resultados)
+        self.assertIn("reason_codes", shortlist)
+        self.assertIn("reason_codes", explicacao_calibracao)
         self.assertIn("AUTO-1", criado)
         self.assertIn("EXP-1", executado)
 

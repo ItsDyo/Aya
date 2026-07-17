@@ -91,6 +91,15 @@ class AyaDevPanel:
     def calibration_overview(self) -> tuple[str, str]:
         return self.aya.aya_dev.list_experiments(), self.aya.aya_dev.experiment_results()
 
+    def calibration_shortlist(self) -> str:
+        return self.aya.aya_dev.calibration_candidates()
+
+    def explain_calibration_candidate(self, candidate_id: str) -> str:
+        candidate_id = (candidate_id or "").strip()
+        if not candidate_id:
+            return "Informe um candidato."
+        return self.aya.aya_dev.explain_calibration_candidate(candidate_id)
+
     def create_calibration_experiment(self, candidate_id: str) -> str:
         if not self._can_execute():
             return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)

@@ -445,6 +445,125 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertIn("pipeline_atual: casos=1", report)
         self.assertIn("sucessos=1", report)
 
+    def test_semantica_classifica_auth_launch_app_memoria_e_control_plane(self):
+        (self.root / "app.py").write_text(
+            "def create_app():\n"
+            "    return 'app'\n\n"
+            "def make_auth_checker(password):\n"
+            "    return password == 'ok'\n\n"
+            "def build_launch_kwargs(host):\n"
+            "    return {'server_name': host, 'auth': ('u', 'p')}\n",
+            encoding="utf-8",
+        )
+        (self.root / "aya" / "core" / "aya_dev.py").write_text(
+            "class AyaDevService:\n"
+            "    def status(self):\n"
+            "        return 'ok'\n"
+            "    def register_engineering_memory(self, entry):\n"
+            "        self.engineering_memory_path.write_text(entry)\n",
+            encoding="utf-8",
+        )
+        auth = self.service._semantic_safety("app.py", "make_auth_checker")
+        launch = self.service._semantic_safety("app.py", "build_launch_kwargs")
+        create_app = self.service._semantic_safety("app.py", "create_app")
+        memory = self.service._semantic_safety("aya/core/aya_dev.py", "AyaDevService.register_engineering_memory")
+        status = self.service._semantic_safety("aya/core/aya_dev.py", "AyaDevService.status")
+        self.assertEqual("AUTHENTICATION", auth.responsibility)
+        self.assertIn("AUTHENTICATION_SYMBOL", auth.reason_codes)
+        self.assertIn(launch.responsibility, {"REMOTE_ACCESS", "APPLICATION_BOOTSTRAP"})
+        self.assertIn("SERVER_LAUNCH_CONFIGURATION", launch.reason_codes)
+        self.assertEqual("APPLICATION_BOOTSTRAP", create_app.responsibility)
+        self.assertIn("CENTRAL_APPLICATION_FILE", create_app.reason_codes)
+        self.assertEqual("TECHNICAL_MEMORY", memory.responsibility)
+        self.assertIn("TECHNICAL_MEMORY_PERSISTENCE", memory.reason_codes)
+        self.assertEqual("AUTONOMY_CONTROL", status.responsibility)
+        self.assertIn("CALIBRATION_MODULE_BLOCKED", status.reason_codes)
+
+    def test_semantica_permite_utilitario_e_read_only_e_bloqueia_efeitos(self):
+        (self.root / "aya" / "core" / "safe_tools.py").write_text(
+            "def normalize_name(value):\n"
+            "    return value.strip().lower()\n\n"
+            "def describe_value(value):\n"
+            "    return f'value={value}'\n\n"
+            "def save_value(path, value):\n"
+            "    path.write_text(value)\n\n"
+            "def run_command():\n"
+            "    import subprocess\n"
+            "    return subprocess.run(['git', 'status'])\n\n"
+            "def query_database(db):\n"
+            "    return db.execute('select 1')\n",
+            encoding="utf-8",
+        )
+        pure = self.service._semantic_safety("aya/core/safe_tools.py", "normalize_name")
+        read_only = self.service._semantic_safety("aya/core/safe_tools.py", "describe_value")
+        write = self.service._semantic_safety("aya/core/safe_tools.py", "save_value")
+        command = self.service._semantic_safety("aya/core/safe_tools.py", "run_command")
+        database = self.service._semantic_safety("aya/core/safe_tools.py", "query_database")
+        self.assertEqual("LOW", pure.sensitivity)
+        self.assertIn(pure.responsibility, {"PURE_UTILITY", "READ_ONLY_QUERY", "DOCUMENTATION_ONLY"})
+        self.assertEqual("LOW", read_only.sensitivity)
+        self.assertNotEqual("LOW", write.sensitivity)
+        self.assertIn("UNKNOWN_SIDE_EFFECTS", write.reason_codes)
+        self.assertEqual("COMMAND_EXECUTION", command.responsibility)
+        self.assertIn("COMMAND_EXECUTION_PATH", command.reason_codes)
+        self.assertEqual("DATABASE", database.responsibility)
+        self.assertIn("TECHNICAL_MEMORY_PERSISTENCE", database.reason_codes)
+
+    def test_shortlist_calibracao_mostra_apenas_candidatos_low_e_limita_cinco(self):
+        response = self.service.calibration_candidates()
+        if "Nenhum candidato" not in response:
+            self.assertLessEqual(response.count("- AUTO-"), 5)
+            self.assertIn("sensibilidade=LOW", response)
+        self.assertEqual([], self.service.llm.calls)
+
+    def test_explicar_calibracao_e_somente_leitura_e_sem_modelo(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        response = self.service.explain_calibration_candidate(candidate.candidate_id)
+        self.assertIn("Execucao automatica: nao", response)
+        self.assertIn("Responsabilidade:", response)
+        self.assertIn("Sensibilidade:", response)
+        self.assertEqual([], self.service.llm.calls)
+
+    def test_criacao_de_experimento_bloqueia_arquivo_central(self):
+        (self.root / "app.py").write_text(
+            "def create_app(value):\n"
+            "    if value:\n"
+            "        return {'server_name': '127.0.0.1'}\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        candidate = self.service._build_candidate(
+            source="ast:missing_docstring",
+            title="Adicionar docstring em create_app",
+            problem="Sem docstring.",
+            evidence=["app.py:1 sem docstring"],
+            category="documentacao",
+            operation_type="insert_docstring",
+            files=["app.py"],
+            symbols=["create_app"],
+            estimated_changed_lines=1,
+            required_tests=[],
+            reason="docstring ausente",
+            expected_change="inserir docstring em create_app",
+            symbol_signature="create_app(value)",
+            stats=self.service._operation_stats(),
+            qualification={
+                "detection_valid": True,
+                "relevance_valid": True,
+                "actionable": True,
+                "qualification_status": "ACAO_RECOMENDADA",
+                "qualification_reasons": ["PUBLIC_SYMBOL", "PUBLIC_NONTRIVIAL_SYMBOL"],
+                "documentation_value_score": 70,
+                "documentation_value_reasons": ["teste"],
+                "reason_codes": ["PUBLIC_SYMBOL", "PUBLIC_NONTRIVIAL_SYMBOL"],
+            },
+            ruff_diagnostic={},
+            file_sha256=self.service._file_sha256("app.py"),
+        )
+        allowed, reasons = self.service._calibration_candidate_allowed(candidate)
+        self.assertFalse(allowed)
+        self.assertIn("modulo central bloqueado para primeira calibracao", reasons)
+
     def test_hash_alterado_e_docstring_adicionada_tornam_candidato_obsoleto(self):
         self.seed_successful_docstring_history(production_real=True)
         candidate = self.service._select_best_candidate()

@@ -51,7 +51,7 @@ AYA_DEV_CAPABILITY_POLICY_VERSION = 1
 PATCH_PIPELINE_VERSION = "structured_patch_discriminated_v1"
 STRUCTURED_PATCH_SCHEMA_VERSION = "operation_schema_v1"
 PATCH_PROMPT_VERSION = "patch_prompt_v1"
-CANDIDATE_ANALYZER_VERSION = AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v4"
+CANDIDATE_ANALYZER_VERSION = AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v5"
 RISK_POLICY_VERSION = "risk_policy_v1"
 AUTONOMY_QUALIFICATION_VERSION = 1
 AUTONOMY_CANDIDATE_SCHEMA_VERSION = 2
@@ -60,6 +60,21 @@ AUTONOMY_MIN_CASES = 3
 AUTONOMY_MIN_SUCCESSES = 2
 AUTONOMY_MIN_DOCSTRING_LINES = 4
 AUTONOMY_ALLOWED_OPERATIONS = {"insert_docstring", "replace_exact"}
+CALIBRATION_ALLOWED_RESPONSIBILITIES = {"PURE_FORMATTING", "PURE_UTILITY", "READ_ONLY_QUERY", "DOCUMENTATION_ONLY"}
+CALIBRATION_BLOCKED_FILES = {
+    "main.py",
+    "app.py",
+    "aya/core/dev_index.py",
+    "aya/core/aya_dev.py",
+    "aya/core/assistant.py",
+    "aya/core/permissions.py",
+    "aya/core/llm.py",
+    "aya/core/dev_workspace.py",
+    "aya/core/structured_patch.py",
+    "aya/core/release.py",
+    "aya/core/backup.py",
+    "aya/core/rag.py",
+}
 AUTONOMY_BLOCKED_TERMS = {
     ".env", "credencial", "autenticacao", "permissao", "seguranca", "security", "tailscale", "remoto",
     "banco", "database", "aya/data", "sqlite", "schema", "migracao", "memoria", "rag", "backup", "voz", "subprocess",
@@ -113,6 +128,23 @@ AUTONOMY_REASON_EXPLANATIONS = {
     "CANDIDATE_TOO_LARGE": "Candidato excede limite do experimento.",
     "CANDIDATE_STALE": "Candidato esta obsoleto.",
     "HUMAN_CONFIRMATION_REQUIRED": "Execucao exige confirmacao textual humana.",
+    "CENTRAL_APPLICATION_FILE": "Arquivo central bloqueado para a primeira calibracao real.",
+    "AUTHENTICATION_SYMBOL": "Simbolo participa de autenticacao.",
+    "AUTHORIZATION_SYMBOL": "Simbolo participa de autorizacao ou permissoes.",
+    "REMOTE_ACCESS_SYMBOL": "Simbolo participa de acesso remoto ou rede.",
+    "SERVER_LAUNCH_CONFIGURATION": "Simbolo configura inicializacao ou exposicao do servidor.",
+    "TECHNICAL_MEMORY_PERSISTENCE": "Simbolo participa de memoria tecnica ou persistencia.",
+    "PERSONAL_MEMORY_PERSISTENCE": "Simbolo participa de memoria pessoal.",
+    "AUTONOMY_CONTROL_PLANE": "Simbolo participa do plano de controle da autonomia.",
+    "GIT_CONTROL_PLANE": "Simbolo controla Git, worktree, commit, integracao ou reversao.",
+    "PATCH_PIPELINE_CONTROL": "Simbolo participa do pipeline de patch estruturado.",
+    "RELEASE_CONTROL_PLANE": "Simbolo participa de validacao ou release.",
+    "COMMAND_EXECUTION_PATH": "Simbolo pode executar comandos, shell ou subprocessos.",
+    "UNKNOWN_SIDE_EFFECTS": "Efeitos colaterais nao puderam ser classificados com seguranca.",
+    "SAFE_PURE_UTILITY": "Simbolo parece utilitario puro e de baixo risco.",
+    "SAFE_READ_ONLY_QUERY": "Simbolo parece consulta somente leitura.",
+    "SAFE_DOCUMENTATION_TARGET": "Alvo seguro para documentacao.",
+    "CALIBRATION_MODULE_BLOCKED": "Modulo bloqueado para a primeira geracao de calibracao real.",
 }
 
 
@@ -285,6 +317,15 @@ class CalibrationExperiment:
     record_sha256: str = ""
 
 
+@dataclass(frozen=True)
+class SemanticSafety:
+    responsibility: str
+    sensitivity: str
+    relevant_calls: list[str]
+    reason_codes: list[str]
+    block_reasons: list[str]
+
+
 @dataclass
 class EngineeringMemoryEntry:
     id: str
@@ -419,6 +460,7 @@ class AyaDevService:
             "renovar-candidatos": self.renew_candidates,
             "experimentos": self.list_experiments,
             "resultados-experimentos": self.experiment_results,
+            "candidatos-calibracao": self.calibration_candidates,
         }
         if action in handlers:
             return handlers[action]()
@@ -440,6 +482,8 @@ class AyaDevService:
             return self.execute_calibration_experiment(argument.strip())
         if action == "cancelar-experimento":
             return self.cancel_calibration_experiment(argument.strip())
+        if action == "explicar-calibracao":
+            return self.explain_calibration_candidate(argument.strip())
         if action == "autonomia":
             return self.set_autonomy_mode(argument.strip())
         if action == "selecionar-candidato":
@@ -1667,6 +1711,52 @@ class AyaDevService:
             f"- Licoes usadas: {' | '.join(candidate.related_lessons) or 'nenhuma'}",
             f"- Propostas similares: {' | '.join(candidate.similar_proposals) or 'nenhuma'}",
             f"- Registro: {candidate.record_sha256}",
+        ])
+
+    def calibration_candidates(self) -> str:
+        candidates = [candidate for candidate in self._autonomous_candidates() if self._calibration_candidate_allowed(candidate)[0]]
+        if not candidates:
+            return "Nenhum candidato suficientemente seguro para calibracao real no HEAD atual."
+        lines = [
+            "Shortlist segura para calibracao real:",
+            "- Nenhum candidato sera executado automaticamente.",
+            "- A criacao de experimento ainda exige escolha humana explicita.",
+        ]
+        for candidate in candidates[:5]:
+            semantic = self._semantic_safety(candidate.file, candidate.symbol)
+            lines.append(
+                f"- {candidate.candidate_id}: {candidate.file}::{candidate.symbol or 'n/a'} "
+                f"operacao={candidate.operation_type}; responsabilidade={semantic.responsibility}; "
+                f"sensibilidade={semantic.sensitivity}; linhas={candidate.estimated_changed_lines}"
+            )
+            lines.append(f"  reason_codes={', '.join(semantic.reason_codes + candidate.reason_codes[:4])}")
+            lines.append(f"  chamadas_relevantes={', '.join(semantic.relevant_calls) or 'nenhuma'}")
+        return "\n".join(lines)
+
+    def explain_calibration_candidate(self, candidate_id: str) -> str:
+        candidate = self._find_candidate(candidate_id.strip())
+        if not candidate:
+            return f"Candidato autonomo nao encontrado: {candidate_id}"
+        allowed, block_reasons = self._calibration_candidate_allowed(candidate)
+        semantic = self._semantic_safety(candidate.file, candidate.symbol)
+        operation_stats = self._empty_operation_stats() | self._operation_stats().get(candidate.operation_type, {})
+        return "\n".join([
+            f"Analise de calibracao {candidate.candidate_id}:",
+            f"- Arquivo: {candidate.file}",
+            f"- Simbolo: {candidate.symbol or 'nao aplicavel'}",
+            f"- Operacao: {candidate.operation_type}",
+            f"- Responsabilidade: {semantic.responsibility}",
+            f"- Sensibilidade: {semantic.sensitivity}",
+            f"- Motivo tecnico: {candidate.reason}",
+            f"- Tamanho estimado: {candidate.estimated_changed_lines} linha(s)",
+            f"- Testes relacionados: {', '.join(candidate.required_tests) or 'suite completa necessaria'}",
+            f"- Chamadas relevantes: {', '.join(semantic.relevant_calls) or 'nenhuma'}",
+            f"- Reason codes: {self._format_reason_codes(list(dict.fromkeys([*candidate.reason_codes, *semantic.reason_codes])))}",
+            f"- Bloqueios avaliados: {'; '.join(block_reasons) or 'nenhum'}",
+            f"- Capacidade atual: {self._capability_level(candidate.operation_type, operation_stats)}",
+            f"- Pipeline: {PATCH_PIPELINE_VERSION}",
+            f"- Decisao final: {'apto para shortlist' if allowed else 'bloqueado para primeira calibracao real'}",
+            "- Execucao automatica: nao. Este comando nao chama modelo, nao cria worktree e nao altera a main.",
         ])
 
     def observe_cycle(self) -> str:
@@ -3318,6 +3408,8 @@ class AyaDevService:
         operation_stats = self._empty_operation_stats() | stats.get(operation_type, {})
         policy = self._operation_policy_status(operation_type, operation_stats)
         reason_codes = list(dict.fromkeys(qualification.get("reason_codes", [])))
+        semantic = self._semantic_safety(files[0], symbol)
+        reason_codes.extend(semantic.reason_codes)
         if policy != "ELEGIVEL" and not blocked:
             blocked.append(policy)
         if policy == "DADOS_INSUFICIENTES":
@@ -3468,6 +3560,7 @@ class AyaDevService:
 
     def _calibration_candidate_allowed(self, candidate: AutonomousCandidate) -> tuple[bool, list[str]]:
         reasons: list[str] = []
+        semantic = self._semantic_safety(candidate.file, candidate.symbol)
         if candidate.stale:
             reasons.append("candidato obsoleto")
         if candidate.project_head != self._safe_head():
@@ -3482,6 +3575,8 @@ class AyaDevService:
             reasons.append("experimento aceita exatamente um arquivo")
         if candidate.estimated_changed_lines > 20:
             reasons.append("mudanca estimada acima de 20 linhas")
+        if candidate.estimated_changed_lines > 10:
+            reasons.append("primeira calibracao aceita no maximo 10 linhas")
         if candidate.operation_type not in AUTONOMY_ALLOWED_OPERATIONS:
             reasons.append("operacao nao suportada")
         if self._candidate_path_blocked(candidate.file):
@@ -3502,6 +3597,12 @@ class AyaDevService:
             reasons.append("bloqueio absoluto de politica")
         if "CURRENT_PIPELINE_FAILURE" in candidate.reason_codes or "BLOQUEADA_POR_FALHA_ATUAL" in candidate.blocked_reasons:
             reasons.append("falha registrada no pipeline atual")
+        if semantic.sensitivity != "LOW":
+            reasons.append(f"sensibilidade {semantic.sensitivity} bloqueada")
+        if semantic.responsibility not in CALIBRATION_ALLOWED_RESPONSIBILITIES:
+            reasons.append(f"responsabilidade {semantic.responsibility} bloqueada")
+        if semantic.block_reasons:
+            reasons.extend(semantic.block_reasons)
         if not any(
             code in candidate.reason_codes
             for code in {"CALIBRATION_REQUIRED", "CALIBRATION_ALLOWED", "CAPABILITY_INSUFFICIENT", "LEGACY_PIPELINE_FAILURE"}
@@ -3515,6 +3616,213 @@ class AyaDevService:
             if current.stale:
                 reasons.append(current.stale_reason or "candidato nao esta atual")
         return not reasons, list(dict.fromkeys(reasons))
+
+    def _semantic_safety(self, file: str, symbol: str) -> SemanticSafety:
+        text = self._semantic_text(file, symbol)
+        tokens = set(re.findall(r"[a-zA-Z_][\w]*", text.lower()))
+        relevant_calls = self._relevant_symbol_calls(file, symbol)
+        call_text = " ".join(relevant_calls).lower()
+        reason_codes: list[str] = []
+        block_reasons: list[str] = []
+        responsibility = "UNKNOWN_SENSITIVE"
+        sensitivity = "GUARDED"
+
+        if self._calibration_file_blocked(file):
+            reason_codes.append("CENTRAL_APPLICATION_FILE")
+            reason_codes.append("CALIBRATION_MODULE_BLOCKED")
+            block_reasons.append("modulo central bloqueado para primeira calibracao")
+            responsibility = "APPLICATION_BOOTSTRAP" if file == "app.py" else "AUTONOMY_CONTROL"
+            sensitivity = "CRITICAL"
+
+        if {"auth", "authentication", "login", "password", "token"} & tokens:
+            reason_codes.append("AUTHENTICATION_SYMBOL")
+            block_reasons.append("autenticacao ou credenciais")
+            responsibility = "AUTHENTICATION"
+            sensitivity = "CRITICAL"
+        if {"authorization", "permission", "permissions", "access", "allows", "capability"} & tokens:
+            reason_codes.append("AUTHORIZATION_SYMBOL")
+            block_reasons.append("autorizacao ou permissoes")
+            responsibility = "AUTHORIZATION"
+            sensitivity = "CRITICAL"
+        if {"remote", "tailscale", "network", "host", "bind", "server"} & tokens:
+            reason_codes.append("REMOTE_ACCESS_SYMBOL")
+            block_reasons.append("acesso remoto ou rede")
+            responsibility = "REMOTE_ACCESS"
+            sensitivity = "CRITICAL"
+        if {"launch", "server_name", "server_port", "gradio", "blocks", "create_app"} & tokens and file == "app.py":
+            reason_codes.append("SERVER_LAUNCH_CONFIGURATION")
+            block_reasons.append("bootstrap ou configuracao de servidor")
+            if responsibility not in {"AUTHENTICATION", "AUTHORIZATION", "REMOTE_ACCESS"}:
+                responsibility = "APPLICATION_BOOTSTRAP"
+            sensitivity = "CRITICAL"
+        if {"memory", "memoria", "engineering_memory", "register_engineering_memory", "persistence", "storage"} & tokens:
+            code = "TECHNICAL_MEMORY_PERSISTENCE" if "engineering" in text.lower() else "PERSONAL_MEMORY_PERSISTENCE"
+            reason_codes.append(code)
+            block_reasons.append("memoria ou persistencia")
+            responsibility = "TECHNICAL_MEMORY" if code == "TECHNICAL_MEMORY_PERSISTENCE" else "PERSONAL_MEMORY"
+            sensitivity = "CRITICAL"
+        if {"cache", "index", "read_bytes", "write_text", "read_text", "mkdir", "replace", "stat", "_save"} & tokens:
+            reason_codes.append("UNKNOWN_SIDE_EFFECTS")
+            block_reasons.append("indice, cache ou efeito de arquivo")
+            if responsibility not in {"AUTHENTICATION", "AUTHORIZATION", "REMOTE_ACCESS", "TECHNICAL_MEMORY", "PERSONAL_MEMORY"}:
+                responsibility = "PERSISTENCE"
+            sensitivity = max(sensitivity, "SENSITIVE", key=self._sensitivity_rank)
+        if {"database", "sqlite", "schema", "migration", "db"} & tokens:
+            reason_codes.append("TECHNICAL_MEMORY_PERSISTENCE")
+            block_reasons.append("banco de dados ou schema")
+            responsibility = "DATABASE"
+            sensitivity = "CRITICAL"
+        if {"autonomy", "autonomous", "candidate", "calibration", "experiment", "approval", "integration"} & tokens:
+            reason_codes.append("AUTONOMY_CONTROL_PLANE")
+            block_reasons.append("plano de controle da autonomia")
+            responsibility = "AUTONOMY_CONTROL"
+            sensitivity = "CRITICAL"
+        if {"git", "worktree", "commit", "merge", "revert", "branch"} & tokens or re.search(r"\bgit\b", call_text):
+            reason_codes.append("GIT_CONTROL_PLANE")
+            block_reasons.append("controle Git ou worktree")
+            responsibility = "GIT_CONTROL"
+            sensitivity = "CRITICAL"
+        if {"structured_patch", "patch", "manifest", "risk_policy"} & tokens:
+            reason_codes.append("PATCH_PIPELINE_CONTROL")
+            block_reasons.append("pipeline de patch")
+            responsibility = "PATCH_PIPELINE"
+            sensitivity = "CRITICAL"
+        if {"release", "validation", "validate", "smoke", "compileall", "ruff"} & tokens:
+            reason_codes.append("RELEASE_CONTROL_PLANE")
+            block_reasons.append("release ou validacao global")
+            responsibility = "RELEASE_CONTROL"
+            sensitivity = max(sensitivity, "SENSITIVE", key=self._sensitivity_rank)
+        if {"subprocess", "system", "popen", "shell", "command"} & tokens or any(call in call_text for call in ("subprocess", "os.system", "_run", "subprocess.run")):
+            reason_codes.append("COMMAND_EXECUTION_PATH")
+            block_reasons.append("execucao de comandos")
+            responsibility = "COMMAND_EXECUTION"
+            sensitivity = "CRITICAL"
+        if {"open", "write_text", "read_text", "replace", "unlink", "mkdir", "json", "dump"} & tokens and responsibility == "UNKNOWN_SENSITIVE":
+            reason_codes.append("UNKNOWN_SIDE_EFFECTS")
+            block_reasons.append("efeito colateral de arquivo ou serializacao")
+            responsibility = "PERSISTENCE"
+            sensitivity = "SENSITIVE"
+
+        if responsibility == "UNKNOWN_SENSITIVE":
+            if self._looks_read_only(file, symbol):
+                responsibility = "READ_ONLY_QUERY"
+                sensitivity = "LOW"
+                reason_codes.append("SAFE_READ_ONLY_QUERY")
+            elif self._looks_pure_utility(file, symbol):
+                responsibility = "PURE_UTILITY"
+                sensitivity = "LOW"
+                reason_codes.append("SAFE_PURE_UTILITY")
+            elif file.endswith(".py") and symbol:
+                responsibility = "DOCUMENTATION_ONLY"
+                sensitivity = "LOW"
+                reason_codes.append("SAFE_DOCUMENTATION_TARGET")
+            else:
+                reason_codes.append("UNKNOWN_SIDE_EFFECTS")
+                block_reasons.append("efeitos desconhecidos")
+
+        return SemanticSafety(
+            responsibility=responsibility,
+            sensitivity=sensitivity,
+            relevant_calls=relevant_calls,
+            reason_codes=list(dict.fromkeys(reason_codes)),
+            block_reasons=list(dict.fromkeys(block_reasons)),
+        )
+
+    def _sensitivity_rank(self, value: str) -> int:
+        return {"LOW": 0, "GUARDED": 1, "SENSITIVE": 2, "CRITICAL": 3}.get(value, 1)
+
+    def _calibration_file_blocked(self, file: str) -> bool:
+        normalized = file.replace("\\", "/")
+        return (
+            normalized in CALIBRATION_BLOCKED_FILES
+            or normalized.startswith("aya/data/")
+            or normalized.startswith("scripts/")
+            or normalized.endswith((".toml", ".yaml", ".yml", ".json", ".ps1", ".bat"))
+        )
+
+    def _semantic_text(self, file: str, symbol: str) -> str:
+        path = self.root / file
+        parts = [file, symbol]
+        try:
+            text = path.read_text(encoding="utf-8-sig", errors="replace")
+            tree = ast.parse(text)
+        except (OSError, SyntaxError):
+            return " ".join(parts)
+        node = self._node_for_symbol(tree, symbol)
+        if node is None:
+            parts.extend(self._imports_for_tree(tree))
+            return " ".join(parts + self._relevant_symbol_calls(file, symbol))
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name):
+                parts.append(child.id)
+            elif isinstance(child, ast.Attribute):
+                parts.append(child.attr)
+            elif isinstance(child, ast.Constant) and isinstance(child.value, str):
+                parts.append(child.value)
+            elif isinstance(child, ast.arg):
+                parts.append(child.arg)
+        decorators = getattr(node, "decorator_list", [])
+        parts.extend(self._call_name(item) for item in decorators)
+        return " ".join(part for part in parts if part)
+
+    def _imports_for_tree(self, tree: ast.AST) -> list[str]:
+        imports: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(node.module)
+        return imports
+
+    def _node_for_symbol(self, tree: ast.AST, symbol: str) -> ast.AST | None:
+        if not symbol:
+            return None
+        parents = self._ast_parents(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and self._qualified_symbol(tree, node, parents) == symbol:
+                return node
+        return None
+
+    def _relevant_symbol_calls(self, file: str, symbol: str) -> list[str]:
+        path = self.root / file
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, SyntaxError):
+            return []
+        node = self._node_for_symbol(tree, symbol)
+        if node is None:
+            return []
+        sensitive_terms = {
+            "subprocess", "system", "popen", "run", "_run", "git", "commit", "worktree", "revert",
+            "open", "write_text", "read_text", "replace", "unlink", "sqlite", "database", "execute",
+            "requests", "serve", "launch", "auth", "allows", "permission", "release", "validate",
+        }
+        calls = sorted({
+            self._call_name(child.func)
+            for child in ast.walk(node)
+            if isinstance(child, ast.Call) and self._call_name(child.func)
+        })
+        return [call for call in calls if any(term in call.lower() for term in sensitive_terms)]
+
+    def _call_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            owner = self._call_name(node.value)
+            return f"{owner}.{node.attr}" if owner else node.attr
+        return ""
+
+    def _looks_read_only(self, file: str, symbol: str) -> bool:
+        text = self._semantic_text(file, symbol).lower()
+        write_terms = {"write", "save", "append", "delete", "remove", "update", "commit", "execute", "run", "create", "set_"}
+        return bool(symbol) and not any(term in text for term in write_terms)
+
+    def _looks_pure_utility(self, file: str, symbol: str) -> bool:
+        text = self._semantic_text(file, symbol).lower()
+        return bool(symbol) and not any(
+            term in text
+            for term in ("self.", "write", "open", "subprocess", "git", "database", "sqlite", "auth", "permission", "network", "server")
+        )
 
     def _candidate_score(
         self,
