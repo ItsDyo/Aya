@@ -32,7 +32,13 @@ Ou pelo terminal:
 python main.py
 ```
 
-Para acessar de outro dispositivo na sua rede ou por VPN privada:
+Para acesso local estavel da v1.0:
+
+```powershell
+.\scripts\start_v1.ps1
+```
+
+Para acessar de outro dispositivo por VPN privada:
 
 ```powershell
 Copy-Item .env.example .env
@@ -41,11 +47,12 @@ notepad .env
 .\scripts\start_remote.ps1
 ```
 
-No modo recomendado, mantenha `AYA_HOST=127.0.0.1` e use `tailscale serve 7860` em outro terminal. Veja o guia: `docs/acesso_remoto_seguro.md`.
+No modo recomendado, mantenha `AYA_HOST=127.0.0.1` e use `tailscale serve 7860` em outro terminal. Veja os guias `docs/acesso_remoto_seguro.md` e `docs/aya_v1_operacao.md`.
 
-O acesso remoto usa permissoes reduzidas: conversa, estudo, memoria e RAG
-continuam disponiveis, mas arquivos, backups, diagnosticos e exports ficam
-bloqueados. Veja `docs/permissoes_por_canal.md`.
+O acesso remoto usa permissoes reduzidas: conversa, companhia, estudo, status,
+consulta de memoria, consulta de conhecimento e RAG continuam disponiveis, mas
+escrita/curadoria, arquivos, backups, diagnosticos administrativos, exports e
+Aya Dev ficam bloqueados. Veja `docs/permissoes_por_canal.md`.
 
 ## Testar
 
@@ -66,6 +73,12 @@ python main.py
 ```
 
 Ou pela interface web, na aba `Sistema` > `Backups`.
+
+Para o pacote local de congelamento da v1.0:
+
+```powershell
+.\scripts\backup_v1.ps1
+```
 
 Comandos disponiveis:
 

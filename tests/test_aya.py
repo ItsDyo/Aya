@@ -551,13 +551,16 @@ class AyaTestCase(unittest.TestCase):
             Capability.CHAT,
             Capability.COMPANION,
             Capability.STUDY,
+            Capability.STATUS,
             Capability.MEMORY_READ,
-            Capability.MEMORY_WRITE,
             Capability.KNOWLEDGE_READ,
-            Capability.KNOWLEDGE_WRITE,
             Capability.RAG_READ,
         }
         bloqueadas = {
+            Capability.MEMORY_WRITE,
+            Capability.MEMORY_AUTO_WRITE,
+            Capability.MEMORY_CURATE,
+            Capability.KNOWLEDGE_WRITE,
             Capability.FILE_INGEST,
             Capability.PROJECT_ACCESS,
             Capability.BACKUP_MANAGE,
@@ -582,6 +585,10 @@ class AyaTestCase(unittest.TestCase):
             "/autonomia off",
             "/reindexar rag",
             "/plano README.md | melhorar documentacao",
+            "/lembrar perfil | nome | Aya",
+            "/salvar Python | Listas guardam valores | estudo",
+            "/aprovar 1",
+            "/editar memoria 1 | teste",
             "audite o projeto",
             "fazer backup",
         )
@@ -591,7 +598,6 @@ class AyaTestCase(unittest.TestCase):
                 self.assertIn("bloqueada neste canal", resposta)
 
         self.assertIn("Status da Aya", self.aya.responder("/status", channel=channel))
-        self.assertIn("Memória salva", self.aya.responder("/lembrar perfil | nome | Aya", channel=channel))
         self.assertEqual("resposta revisada", self.aya.responder("Explique Python", channel=channel))
 
     def test_command_router_parseia_comandos_sem_efeitos_colaterais(self):
@@ -633,7 +639,7 @@ class AyaTestCase(unittest.TestCase):
         self.assertEqual(Capability.MEMORY_WRITE, escrita.capability)
         self.assertEqual(Capability.MEMORY_READ, revisar_memoria.capability)
         self.assertTrue(leitura.allowed)
-        self.assertTrue(escrita.allowed)
+        self.assertFalse(escrita.allowed)
         self.assertTrue(revisar_memoria.allowed)
 
     def test_executar_comando_preserva_espacos_caixa_alias_e_mensagens(self):
@@ -655,11 +661,11 @@ class AyaTestCase(unittest.TestCase):
         self.assertNotIn("Conselho tecnico da Aya", pessoal)
         self.assertEqual("resposta revisada", pessoal)
 
-    def test_controller_remoto_nao_contorna_permissao_de_ingestao_e_backup(self):
+    def test_controller_remoto_nao_contorna_permissoes_restritas(self):
         ui = UIController(self.aya, channel=AccessChannel.REMOTE_GRADIO)
         self.assertIn("bloqueada neste canal", ui.ingerir("README.md"))
         self.assertIn("bloqueada neste canal", ui.criar_backup())
-        self.assertIn("Salvei", ui.salvar_conhecimento("Python", "Listas", "python"))
+        self.assertIn("bloqueada neste canal", ui.salvar_conhecimento("Python", "Listas", "python"))
 
     def test_integracao_limitada_nao_recebe_memoria_historico_ou_autoaprendizado(self):
         segredo = "SEGREDO_INTERNO_AYA_9482"

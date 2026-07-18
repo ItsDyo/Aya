@@ -9,13 +9,15 @@ na interface nao e considerado uma protecao suficiente.
 | --- | --- | --- |
 | `local_terminal` | Terminal no computador da Aya | Acesso completo |
 | `local_gradio` | Gradio acessado apenas no computador | Acesso completo |
-| `remote_gradio` | Celular/computador via Tailscale Serve e login | Conversa, companhia, estudo, status, memoria, conhecimento e RAG |
+| `remote_gradio` | Celular/computador via Tailscale Serve e login | Conversa, companhia, estudo, status, consulta de memoria, consulta de conhecimento e RAG |
 | `limited_integration` | Base para conectores futuros | Conversa sem memoria/historico global, estudo, status e conhecimento sem RAG |
 
 No `remote_gradio`, ficam bloqueados:
 
 - leitura e auditoria dos arquivos do projeto;
 - ingestao de arquivos;
+- escrita, edicao ou curadoria de memoria;
+- escrita de conhecimento;
 - criacao, verificacao ou extracao de backups;
 - diagnosticos internos e alteracao da autonomia;
 - exportacao de dataset de fine-tuning.

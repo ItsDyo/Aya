@@ -44,11 +44,7 @@ REMOTE_CAPABILITIES = frozenset(
         Capability.STUDY,
         Capability.STATUS,
         Capability.MEMORY_READ,
-        Capability.MEMORY_WRITE,
-        Capability.MEMORY_AUTO_WRITE,
-        Capability.MEMORY_CURATE,
         Capability.KNOWLEDGE_READ,
-        Capability.KNOWLEDGE_WRITE,
         Capability.RAG_READ,
     }
 )
