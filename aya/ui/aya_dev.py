@@ -116,6 +116,12 @@ class AyaDevPanel:
             return "Informe um experimento."
         return self.aya.aya_dev.execute_calibration_experiment(f"{experiment_id} | {confirmation or ''}")
 
+    def prevalidate_calibration_experiment(self, experiment_id: str) -> str:
+        experiment_id = (experiment_id or "").strip()
+        if not experiment_id:
+            return "Informe um experimento."
+        return self.aya.aya_dev.prevalidate_calibration_experiment(experiment_id)
+
     def run_safe_autonomy_cycle(self, confirmation: str) -> str:
         if not self._can_execute():
             return self.aya.permissions.denial_message(self.channel, Capability.SYSTEM_ADMIN)

@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -14,16 +15,22 @@ from pathlib import Path
 from aya.config import MODEL_CONFIG
 from aya.core.dev_index import TechnicalFile, TechnicalIndex
 from aya.core.dev_workspace import (
+    FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS,
+    FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS,
+    FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS,
+    FULL_BASELINE_TIMEOUT_POLICY_VERSION,
     RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS,
     RELATED_TEST_TIMEOUT_MINIMUM_SECONDS,
     RELATED_TEST_TIMEOUT_POLICY_VERSION,
     CheckResult,
     DevWorkspace,
+    calculate_full_baseline_timeout,
     calculate_related_test_timeout,
 )
 from aya.core.llm import ChatClient
 from aya.core.project_tools import ProjectTools
 from aya.core.structured_patch import PATCH_DECISION_SCHEMA, StructuredPatchApplier, StructuredPatchError
+from aya.paths import LOGS_DIR
 
 
 PROPOSAL_STATES = {
@@ -58,7 +65,24 @@ AYA_DEV_CAPABILITY_POLICY_VERSION = 1
 PATCH_PIPELINE_VERSION = "structured_patch_discriminated_v1"
 STRUCTURED_PATCH_SCHEMA_VERSION = "operation_schema_v1"
 PATCH_PROMPT_VERSION = "patch_prompt_v1"
-CANDIDATE_ANALYZER_VERSION = AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v5"
+EXPERIMENT_PREFLIGHT_POLICY_VERSION = "experiment_preflight_v1"
+EXPERIMENT_TIME_BUDGET_SECONDS = 7200
+FAILURE_CATEGORIES = {
+    "BASELINE_RELATED_TEST_FAILURE",
+    "BASELINE_FULL_TEST_FAILURE",
+    "POST_PATCH_TEST_FAILURE",
+    "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT",
+    "INFRASTRUCTURE_ERROR",
+    "MODEL_ERROR",
+    "MANIFEST_INVALID",
+    "OPERATION_INVALID",
+    "PATCH_INVALID",
+    "SECURITY_POLICY_BLOCK",
+    "REVIEW_BLOCKED",
+    "PREFLIGHT_TIME_BUDGET_EXCEEDED",
+    "INTERNAL_ERROR",
+}
+CANDIDATE_ANALYZER_VERSION = AUTONOMY_ANALYZER_VERSION = "aya-dev-candidate-analyzer-v6"
 RISK_POLICY_VERSION = "risk_policy_v1"
 AUTONOMY_QUALIFICATION_VERSION = 1
 AUTONOMY_CANDIDATE_SCHEMA_VERSION = 2
@@ -321,6 +345,28 @@ class CalibrationExperiment:
     human_decision: str = ""
     evidence_strength: str = ""
     result: str = ""
+    failure_category: str = ""
+    preflight_result: str = ""
+    preflight_reasons: list[str] = field(default_factory=list)
+    estimated_total_seconds: int = 0
+    estimated_baseline_seconds: int = 0
+    estimated_post_patch_seconds: int = 0
+    time_budget_seconds: int = EXPERIMENT_TIME_BUDGET_SECONDS
+    estimation_sources: list[str] = field(default_factory=list)
+    estimation_policy_version: str = EXPERIMENT_PREFLIGHT_POLICY_VERSION
+    baseline_full_duration_seconds: float | None = None
+    baseline_full_timeout_seconds: int = FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS
+    baseline_full_timeout_policy_version: str = FULL_BASELINE_TIMEOUT_POLICY_VERSION
+    baseline_full_timeout_source: str = "fallback_sem_evidencia_compativel"
+    baseline_full_timeout_minimum: int = FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS
+    baseline_full_timeout_maximum: int = FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS
+    evidence_head: str = ""
+    evidence_command: str = ""
+    evidence_type: str = ""
+    reusable_baseline_evidence: str = ""
+    baseline_full_reused: bool = False
+    model_availability: str = ""
+    reviewer_model_availability: str = ""
     record_sha256: str = ""
 
 
@@ -485,6 +531,8 @@ class AyaDevService:
             return self.create_calibration_experiment(argument.strip())
         if action == "experimento":
             return self.show_experiment(argument.strip())
+        if action == "prevalidar-experimento":
+            return self.prevalidate_calibration_experiment(argument.strip())
         if action == "executar-experimento":
             return self.execute_calibration_experiment(argument.strip())
         if action == "cancelar-experimento":
@@ -2030,7 +2078,44 @@ class AyaDevService:
             f"- Revisao: {experiment.review_result or 'nao executada'}",
             f"- Decisao humana: {experiment.human_decision or 'pendente'}",
             f"- Resultado: {experiment.result or 'pendente'}",
+            f"- Prevalidacao: {experiment.preflight_result or 'nao executada'}",
+            f"- Timeout baseline completa: {experiment.baseline_full_timeout_seconds}s ({experiment.baseline_full_timeout_source})",
+            f"- Estimativa total: {experiment.estimated_total_seconds or 'nao calculada'}s",
+            f"- Orcamento: {experiment.time_budget_seconds}s",
             f"- Registro: {experiment.record_sha256}",
+        ])
+
+    def prevalidate_calibration_experiment(self, experiment_id: str) -> str:
+        experiment = self.experiments.get(experiment_id.strip())
+        if not experiment:
+            return f"Experimento nao encontrado: {experiment_id}"
+        candidate = self._find_candidate(experiment.candidate_id)
+        result, reasons = self._calibration_preflight(experiment, candidate)
+        experiment.preflight_result = result
+        experiment.preflight_reasons = reasons
+        experiment.record_sha256 = self._experiment_record_sha(experiment)
+        self._save_experiments()
+        return "\n".join([
+            "Prevalidacao de experimento Aya Dev:",
+            f"- Experimento: {experiment.experiment_id}",
+            f"- Candidato: {experiment.candidate_id}",
+            f"- HEAD: {experiment.project_head}",
+            f"- Politica: {EXPERIMENT_PREFLIGHT_POLICY_VERSION}",
+            "- Etapas previstas: baseline relacionada; baseline completa; manifesto; patch; validacao relacionada; suite rapida; suite completa; Ruff; compileall; pip check; smoke; revisao",
+            f"- Evidencia reutilizada: {experiment.reusable_baseline_evidence or 'nenhuma'}",
+            f"- Baseline reutilizada: {'sim' if experiment.baseline_full_reused else 'nao'}",
+            f"- Timeout baseline relacionada: {calculate_related_test_timeout(None)}s",
+            f"- Timeout baseline completa: {experiment.baseline_full_timeout_seconds}s",
+            f"- Duracao estimada: {experiment.estimated_total_seconds}s",
+            f"- Orcamento: {experiment.time_budget_seconds}s",
+            f"- Modelo principal: {experiment.model_availability or 'nao verificado'}",
+            f"- Modelo revisor: {experiment.reviewer_model_availability or 'nao verificado'}",
+            f"- Resultado: {result}",
+            f"- Motivos: {' | '.join(reasons) or 'nenhum'}",
+            "- Modelo chamado: nao",
+            "- Worktree criado: nao",
+            "- Patch preparado: nao",
+            "- Git modificado: nao",
         ])
 
     def execute_calibration_experiment(self, payload: str) -> str:
@@ -2062,12 +2147,30 @@ class AyaDevService:
         if not allowed:
             experiment.state = "BLOQUEADO"
             experiment.result = "CANDIDATO_INVALIDO"
+            experiment.failure_category = "SECURITY_POLICY_BLOCK"
             experiment.patch_result = "nao executado"
             experiment.validation_result = "nao executada"
             experiment.review_result = "nao executada"
             experiment.record_sha256 = self._experiment_record_sha(experiment)
             self._save_experiments()
             return "Experimento bloqueado: " + "; ".join(reasons)
+        preflight_result, preflight_reasons = self._calibration_preflight(experiment, candidate)
+        experiment.preflight_result = preflight_result
+        experiment.preflight_reasons = preflight_reasons
+        experiment.record_sha256 = self._experiment_record_sha(experiment)
+        self._save_experiments()
+        if preflight_result not in {"READY", "READY_WITH_REUSED_BASELINE"}:
+            experiment.state = "BLOQUEADO"
+            experiment.result = preflight_result
+            experiment.failure_category = (
+                "PREFLIGHT_TIME_BUDGET_EXCEEDED" if preflight_result == "TIME_BUDGET_EXCEEDED" else "SECURITY_POLICY_BLOCK"
+            )
+            experiment.patch_result = "nao executado"
+            experiment.validation_result = "nao executada"
+            experiment.review_result = "nao executada"
+            experiment.record_sha256 = self._experiment_record_sha(experiment)
+            self._save_experiments()
+            return "Experimento bloqueado na prevalidacao: " + "; ".join(preflight_reasons)
         proposal = self._get(experiment.proposal_id)
         self._experiment_locks.add(experiment.experiment_id)
         try:
@@ -2075,7 +2178,7 @@ class AyaDevService:
             experiment.attempt += 1
             experiment.record_sha256 = self._experiment_record_sha(experiment)
             self._save_experiments()
-            prepare_result = self._prepare_autonomous_proposal(proposal, candidate)
+            prepare_result = self._prepare_autonomous_proposal(proposal, candidate, experiment)
             experiment.manifest_result = "gerado" if proposal.patch_manifest else "nao gerado"
             experiment.patch_result = "preparado" if proposal.patch else self.workspace.sanitize(prepare_result, 400)
             if proposal.state == "EM_TESTE":
@@ -2444,20 +2547,199 @@ class AyaDevService:
     def _format_checks(self, results: list[CheckResult], state: str) -> str:
         lines = [f"Validacao Aya Dev: {state}"]
         for result in results:
-            if result.passed:
-                status = "APROVADO"
-            elif result.exit_code == 124:
-                status = "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
-            else:
-                status = "REPROVADO"
+            status = result.result or self._check_result_status(result)
+            category = result.failure_category or self._failure_category_for_check(result, "patch")
             lines.append(f"- {result.name}: {status} (codigo={result.exit_code}, {result.duration_ms}ms)")
+            if category:
+                lines.append(f"  categoria: {category}")
         return "\n".join(lines)
 
     def _validation_record(self, result: CheckResult, phase: str, timeout_metadata: dict | None = None) -> dict:
-        record = asdict(result) | {"passed": result.passed, "phase": phase}
+        record = asdict(result) | {
+            "passed": result.passed,
+            "phase": phase,
+            "stage": self._stage_for_check(result, phase),
+            "result": result.result or self._check_result_status(result),
+            "failure_category": result.failure_category or self._failure_category_for_check(result, phase),
+            "evidence_source": result.evidence_source or "executed",
+        }
         if result.name == "testes relacionados" and timeout_metadata:
             record.update(timeout_metadata)
         return record
+
+    def _check_result_status(self, result: CheckResult) -> str:
+        if result.passed:
+            return "APROVADO"
+        if result.exit_code == 124:
+            return "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+        return "REPROVADO"
+
+    def _stage_for_check(self, result: CheckResult, phase: str) -> str:
+        if phase == "baseline" and result.name == "testes relacionados":
+            return "baseline_relacionada"
+        if phase == "baseline" and result.name == "pytest":
+            return "baseline_completa"
+        if phase == "patch" and result.name == "testes relacionados":
+            return "validacao_relacionada_pos_patch"
+        if phase == "patch" and result.name == "pytest":
+            return "suite_completa_pos_patch"
+        return phase
+
+    def _failure_category_for_check(self, result: CheckResult, phase: str) -> str:
+        if result.passed:
+            return ""
+        if result.exit_code == 124:
+            return "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+        if phase == "baseline" and result.name == "testes relacionados":
+            return "BASELINE_RELATED_TEST_FAILURE"
+        if phase == "baseline" and result.name == "pytest":
+            return "BASELINE_FULL_TEST_FAILURE"
+        if phase == "patch":
+            return "POST_PATCH_TEST_FAILURE"
+        return "INFRASTRUCTURE_ERROR"
+
+    def _full_baseline_timeout_metadata(self, duration: float | None, source: str) -> dict:
+        return {
+            "baseline_full_duration_seconds": duration,
+            "baseline_full_timeout_seconds": calculate_full_baseline_timeout(duration),
+            "baseline_full_timeout_policy_version": FULL_BASELINE_TIMEOUT_POLICY_VERSION,
+            "baseline_full_timeout_source": source,
+            "baseline_full_timeout_minimum": FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS,
+            "baseline_full_timeout_maximum": FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS,
+        }
+
+    def _release_evidence_items(self) -> list[dict]:
+        evidence_dir = LOGS_DIR / "release_evidence"
+        if not evidence_dir.exists():
+            return []
+        items: list[dict] = []
+        for path in sorted(evidence_dir.glob("VAL-*.json"), key=lambda item: item.name, reverse=True):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            recorded = payload.get("result_sha256", "")
+            comparable = {key: value for key, value in payload.items() if key != "result_sha256"}
+            calculated = hashlib.sha256(json.dumps(comparable, sort_keys=True).encode("utf-8")).hexdigest()
+            if recorded != calculated:
+                continue
+            items.append(payload)
+        return items
+
+    def _reusable_full_baseline_evidence(self) -> dict | None:
+        expected_head = self._safe_head()
+        git = self.workspace.git_state()
+        if not git.safe:
+            return None
+        for evidence in self._release_evidence_items():
+            command = evidence.get("command", "")
+            if (
+                evidence.get("check_name") == "pytest"
+                and evidence.get("mode") == "completo"
+                and evidence.get("test_scope") in {"complete", "suite_completa"}
+                and evidence.get("status") == "APROVADO"
+                and evidence.get("exit_code") == 0
+                and evidence.get("project_head") == expected_head
+                and evidence.get("working_tree_clean") is True
+                and command.endswith("-m pytest")
+                and isinstance(evidence.get("duration_ms"), int)
+                and evidence["duration_ms"] > 0
+            ):
+                return evidence
+        return None
+
+    def _model_availability(self, model: str) -> str:
+        if not shutil.which("ollama"):
+            return "nao confirmado: ollama nao encontrado no PATH"
+        result = self.workspace._run(("ollama", "list"), self.root, 10)
+        if result.returncode != 0:
+            return "indisponivel: ollama list falhou"
+        return "disponivel" if model in result.stdout else f"indisponivel: modelo {model} nao listado"
+
+    def _python_available(self) -> bool:
+        result = self.workspace._run(("python", "--version"), self.root, 15)
+        return result.returncode == 0
+
+    def _calibration_preflight(
+        self,
+        experiment: CalibrationExperiment,
+        candidate: AutonomousCandidate | None,
+    ) -> tuple[str, list[str]]:
+        reasons: list[str] = []
+        git = self.workspace.git_state()
+        if not git.safe:
+            return "BLOCKED_BY_ENVIRONMENT", [git.message]
+        if experiment.state not in {"AGUARDANDO_CONFIRMACAO", "FALHOU"}:
+            return "INVALID_STATE", [f"estado atual={experiment.state}"]
+        if experiment.experiment_id in self._experiment_locks:
+            return "CONCURRENT_EXPERIMENT", ["experimento ja esta em execucao"]
+        if any(
+            item.experiment_id != experiment.experiment_id
+            and item.project_head == experiment.project_head
+            and item.state == "EXECUTANDO"
+            for item in self.experiments.values()
+        ):
+            return "CONCURRENT_EXPERIMENT", ["outro experimento em EXECUTANDO no mesmo HEAD"]
+        if not candidate:
+            return "STALE_CANDIDATE", ["candidato nao encontrado"]
+        stale = self._validate_current_candidate(candidate)
+        if stale.stale:
+            return "STALE_CANDIDATE", [stale.stale_reason or "candidato obsoleto"]
+        allowed, blocks = self._calibration_candidate_allowed(candidate)
+        if not allowed:
+            return "BLOCKED_BY_POLICY", blocks
+        if experiment.project_head != self._safe_head() or candidate.project_head != self._safe_head():
+            return "STALE_CANDIDATE", ["HEAD do experimento/candidato difere do HEAD atual"]
+        if not self._python_available():
+            return "BLOCKED_BY_ENVIRONMENT", ["python indisponivel"]
+        experiment.model_availability = self._model_availability(self.primary_model)
+        experiment.reviewer_model_availability = self._model_availability(self.reviewer_model)
+        if experiment.model_availability.startswith("indisponivel") or experiment.reviewer_model_availability.startswith("indisponivel"):
+            reasons.append("modelo local indisponivel ou nao confirmado")
+        release_evidence = self._reusable_full_baseline_evidence()
+        if release_evidence:
+            duration = release_evidence["duration_ms"] / 1000
+            experiment.baseline_full_reused = True
+            experiment.reusable_baseline_evidence = release_evidence["validation_id"]
+            experiment.evidence_head = release_evidence["project_head"]
+            experiment.evidence_command = release_evidence["command"]
+            experiment.evidence_type = "release_completo_aprovado"
+            experiment.baseline_full_timeout_source = "release_completo_aprovado_mesmo_head"
+        else:
+            duration = None
+            experiment.baseline_full_reused = False
+            experiment.reusable_baseline_evidence = ""
+            experiment.evidence_head = ""
+            experiment.evidence_command = "python -m pytest"
+            experiment.evidence_type = "fallback_sem_release_compativel"
+            experiment.baseline_full_timeout_source = "fallback_sem_evidencia_compativel"
+        metadata = self._full_baseline_timeout_metadata(duration, experiment.baseline_full_timeout_source)
+        experiment.baseline_full_duration_seconds = metadata["baseline_full_duration_seconds"]
+        experiment.baseline_full_timeout_seconds = metadata["baseline_full_timeout_seconds"]
+        experiment.baseline_full_timeout_policy_version = metadata["baseline_full_timeout_policy_version"]
+        experiment.baseline_full_timeout_minimum = metadata["baseline_full_timeout_minimum"]
+        experiment.baseline_full_timeout_maximum = metadata["baseline_full_timeout_maximum"]
+        related_timeout = calculate_related_test_timeout(None)
+        baseline_full_estimate = int(duration or experiment.baseline_full_timeout_seconds)
+        experiment.estimated_baseline_seconds = related_timeout + baseline_full_estimate
+        experiment.estimated_post_patch_seconds = related_timeout + 1200 + baseline_full_estimate + 600
+        experiment.estimated_total_seconds = experiment.estimated_baseline_seconds + experiment.estimated_post_patch_seconds + 180
+        experiment.estimation_sources = [
+            "timeout_relacionado_fallback",
+            experiment.evidence_type,
+            "margem_manifesto_patch_revisao",
+        ]
+        experiment.time_budget_seconds = EXPERIMENT_TIME_BUDGET_SECONDS
+        experiment.estimation_policy_version = EXPERIMENT_PREFLIGHT_POLICY_VERSION
+        if experiment.estimated_total_seconds > experiment.time_budget_seconds:
+            return "TIME_BUDGET_EXCEEDED", [
+                f"estimativa={experiment.estimated_total_seconds}s",
+                f"orcamento={experiment.time_budget_seconds}s",
+                *reasons,
+            ]
+        if reasons:
+            return "BLOCKED_BY_ENVIRONMENT", reasons
+        return ("READY_WITH_REUSED_BASELINE" if release_evidence else "READY"), []
 
     def _related_test_timeout_metadata(self, proposal: EngineeringProposal, related_tests: list[str]) -> dict:
         duration = self._related_baseline_duration_seconds(proposal, related_tests)
@@ -2483,6 +2765,57 @@ class AyaDevService:
             if isinstance(duration_ms, int | float) and duration_ms > 0:
                 return duration_ms / 1000
         return None
+
+    def _calibration_baseline(
+        self,
+        proposal: EngineeringProposal,
+        experiment: CalibrationExperiment | None,
+        worktree: Path,
+        related_tests: list[str],
+    ) -> list[CheckResult]:
+        results: list[CheckResult] = []
+        if related_tests:
+            safe_tests = [test for test in related_tests if test.endswith(".py")]
+            if safe_tests:
+                timeout = calculate_related_test_timeout(None)
+                results.append(
+                    self.workspace._check(
+                        "testes relacionados",
+                        ("python", "-m", "pytest", *safe_tests),
+                        timeout,
+                        worktree,
+                    )
+                )
+                if not results[-1].passed:
+                    return results
+        if experiment and experiment.baseline_full_reused:
+            duration_ms = int((experiment.baseline_full_duration_seconds or 0) * 1000)
+            results.append(
+                CheckResult(
+                    "pytest",
+                    "python -m pytest",
+                    0,
+                    duration_ms,
+                    f"BASELINE_FULL_REUSED de {experiment.reusable_baseline_evidence}",
+                    timeout_seconds=experiment.baseline_full_timeout_seconds,
+                    result="BASELINE_FULL_REUSED",
+                    evidence_source=experiment.reusable_baseline_evidence or "release_completo_aprovado",
+                )
+            )
+            return results
+        metadata = self._full_baseline_timeout_metadata(None, "fallback_sem_evidencia_compativel")
+        if experiment:
+            experiment.baseline_full_timeout_seconds = metadata["baseline_full_timeout_seconds"]
+            experiment.baseline_full_timeout_source = metadata["baseline_full_timeout_source"]
+        results.append(
+            self.workspace._check(
+                "pytest",
+                ("python", "-m", "pytest"),
+                metadata["baseline_full_timeout_seconds"],
+                worktree,
+            )
+        )
+        return results
 
     def _get(self, proposal_id: str) -> EngineeringProposal:
         proposal = self.proposals.get(proposal_id.upper())
@@ -2876,7 +3209,10 @@ class AyaDevService:
                     item["first_attempt_success"] += 1
             elif experiment.state in {"FALHOU", "BLOQUEADO"}:
                 item["total"] += 1
-                item["fail"] += 1
+                if self._experiment_inconclusive_by_timeout(experiment):
+                    item["inconclusive"] += 1
+                else:
+                    item["fail"] += 1
         return stats
 
     def _experiment_record_sha(self, experiment: CalibrationExperiment) -> str:
@@ -2895,6 +3231,15 @@ class AyaDevService:
             "attempt": experiment.attempt,
             "result": experiment.result,
             "evidence_strength": experiment.evidence_strength,
+            "failure_category": experiment.failure_category,
+            "preflight_result": experiment.preflight_result,
+            "preflight_reasons": experiment.preflight_reasons,
+            "estimated_total_seconds": experiment.estimated_total_seconds,
+            "time_budget_seconds": experiment.time_budget_seconds,
+            "baseline_full_timeout_seconds": experiment.baseline_full_timeout_seconds,
+            "baseline_full_timeout_policy_version": experiment.baseline_full_timeout_policy_version,
+            "reusable_baseline_evidence": experiment.reusable_baseline_evidence,
+            "baseline_full_reused": experiment.baseline_full_reused,
         })
 
     def _proposal_origin(self, proposal: EngineeringProposal) -> str:
@@ -2915,12 +3260,32 @@ class AyaDevService:
         if proposal.state in {"AGUARDANDO_APROVACAO", "APROVADA", "COMMIT_PRONTO", "INTEGRADA", "REVERTIDA"}:
             return "success"
         if proposal.state in {"FALHOU", "INTEGRACAO_BLOQUEADA", "REVERSAO_FALHOU", "REVERSAO_PARCIAL"}:
+            if self._proposal_inconclusive_by_timeout(proposal):
+                return "inconclusive"
             return "fail"
         if proposal.state == "REJEITADA":
             return "rejected"
         if any(event.get("action") == "workspace isolado descartado" for event in proposal.history):
             return "cancelled"
         return "inconclusive"
+
+    def _proposal_inconclusive_by_timeout(self, proposal: EngineeringProposal) -> bool:
+        if proposal.failure_reason == "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT":
+            return True
+        return any(
+            item.get("exit_code") == 124
+            or item.get("failure_category") == "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+            or item.get("result") == "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+            for item in self._all_validation_records(proposal)
+        )
+
+    def _experiment_inconclusive_by_timeout(self, experiment: CalibrationExperiment) -> bool:
+        if experiment.failure_category == "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT":
+            return True
+        if "124" in f"{experiment.validation_result} {experiment.patch_result}":
+            return True
+        proposal = self.proposals.get(experiment.proposal_id)
+        return bool(proposal and self._proposal_inconclusive_by_timeout(proposal))
 
     def _operation_category(self, operation_type: str) -> str:
         if operation_type == "insert_docstring":
@@ -4206,7 +4571,12 @@ class AyaDevService:
         line = text.splitlines()[int(match.group(1)) - 1]
         return {"old_text": line + "\n", "new_text": ""}
 
-    def _prepare_autonomous_proposal(self, proposal: EngineeringProposal, candidate: AutonomousCandidate) -> str:
+    def _prepare_autonomous_proposal(
+        self,
+        proposal: EngineeringProposal,
+        candidate: AutonomousCandidate,
+        experiment: CalibrationExperiment | None = None,
+    ) -> str:
         if proposal.attempts >= 2:
             return "Tentativa autonoma bloqueada: limite de duas tentativas."
         git = self.workspace.git_state()
@@ -4224,11 +4594,18 @@ class AyaDevService:
             proposal.workspace = str(worktree)
             proposal.workspace_path = str(worktree)
             proposal.workspace_created = True
-            baseline = self.workspace.baseline(worktree, self._related_tests(proposal))
-            proposal.validation = [asdict(result) | {"passed": result.passed, "phase": "baseline"} for result in baseline]
+            related_tests = self._related_tests(proposal)
+            baseline = (
+                self._calibration_baseline(proposal, experiment, worktree, related_tests)
+                if experiment
+                else self.workspace.baseline(worktree, related_tests)
+            )
+            proposal.validation = [self._validation_record(result, "baseline") for result in baseline]
             proposal.tests_executed = True
             if not all(result.passed for result in baseline):
-                raise RuntimeError("Baseline reprovou antes do patch autonomo.")
+                failed = next((result for result in baseline if not result.passed), baseline[-1])
+                category = self._failure_category_for_check(failed, "baseline")
+                raise RuntimeError(f"{category}: baseline reprovou antes do patch autonomo.")
             manifest = self.structured_patch.build_manifest(
                 decision,
                 proposal.id,
@@ -4265,12 +4642,31 @@ class AyaDevService:
             message = self.workspace.sanitize(str(exc), 1200)
             proposal.review_result = message
             proposal.diff_preserved = bool(proposal.patch)
-            self._record_failure(proposal, "autonomia", "tentativa autonoma falhou", message)
+            category = self._failure_category_from_message(message)
+            self._record_failure(proposal, "autonomia", category, message)
             self._cleanup_failed_workspace(proposal)
             self._event(proposal, "autonomous_attempt_failed", "PREPARANDO", "FALHOU")
             self._autonomy_event("autonomous_attempt_failed", {"proposal_id": proposal.id, "error": message})
             self._save()
             return f"Tentativa autonoma falhou: {message}"
+
+    def _failure_category_from_message(self, message: str) -> str:
+        text = (message or "").upper()
+        if "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT" in text or "TIMEOUT" in text:
+            return "VALIDACAO_INCONCLUSIVA_POR_TIMEOUT"
+        if "BASELINE_RELATED_TEST_FAILURE" in text:
+            return "BASELINE_RELATED_TEST_FAILURE"
+        if "BASELINE_FULL_TEST_FAILURE" in text:
+            return "BASELINE_FULL_TEST_FAILURE"
+        if "MANIFEST" in text or "MANIFESTO" in text:
+            return "MANIFEST_INVALID"
+        if "PATCH" in text or "DIFF" in text:
+            return "PATCH_INVALID"
+        if "MODELO" in text or "MODEL" in text:
+            return "MODEL_ERROR"
+        if "POLITICA" in text or "BLOQUE" in text:
+            return "SECURITY_POLICY_BLOCK"
+        return "INTERNAL_ERROR"
 
     def _record_autonomous_escalation(self, proposal: EngineeringProposal, candidate: AutonomousCandidate, package: str) -> None:
         proposal.failure_reason = "ESCALADA"

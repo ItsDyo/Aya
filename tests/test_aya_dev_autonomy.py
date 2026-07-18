@@ -8,7 +8,13 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from aya.core.aya_dev import AyaDevService
-from aya.core.dev_workspace import CheckResult
+from aya.core.dev_workspace import (
+    FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS,
+    FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS,
+    FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS,
+    calculate_full_baseline_timeout,
+    CheckResult,
+)
 from aya.core.llm import StaticClient
 from aya.core.project_tools import ProjectTools
 from aya.core.permissions import AccessChannel
@@ -47,6 +53,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         )
         self.service.workspace.validate = Mock(side_effect=self._fast_validation)
         self.service.workspace.baseline = Mock(side_effect=self._fast_validation)
+        self.service._model_availability = Mock(return_value="disponivel")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -454,6 +461,7 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
         self.service.create_calibration_experiment(candidate.candidate_id)
         experiment = next(iter(self.service.experiments.values()))
+        self.service._reusable_full_baseline_evidence = Mock(return_value=self._release_evidence(duration_ms=600_000))
         response = self.service.execute_calibration_experiment(
             f"{experiment.experiment_id} | EXECUTAR EXPERIMENTO {experiment.experiment_id}"
         )
@@ -467,6 +475,135 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
             "",
             subprocess.run(("git", "status", "--porcelain"), cwd=self.root, capture_output=True, text=True, check=True).stdout,
         )
+
+    def test_timeout_baseline_completa_sem_evidencia_usa_fallback(self):
+        self.assertEqual(FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS, calculate_full_baseline_timeout(None))
+
+    def test_timeout_baseline_completa_usa_minimo(self):
+        self.assertEqual(FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS, calculate_full_baseline_timeout(600))
+
+    def test_timeout_baseline_completa_calcula_margem(self):
+        self.assertEqual(1620, calculate_full_baseline_timeout(1000))
+
+    def test_timeout_baseline_completa_respeita_maximo(self):
+        self.assertEqual(FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS, calculate_full_baseline_timeout(3000))
+
+    def test_prevalidacao_rejeita_evidencia_relacionada_ou_rapida(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        self.service._release_evidence_items = Mock(return_value=[
+            self._release_evidence(mode="rapido", scope="fast"),
+            self._release_evidence(check_name="testes relacionados", scope="related"),
+        ])
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        updated = self.service.experiments[experiment.experiment_id]
+        self.assertIn("TIME_BUDGET_EXCEEDED", response)
+        self.assertFalse(updated.baseline_full_reused)
+        self.assertEqual("", updated.reusable_baseline_evidence)
+
+    def test_prevalidacao_rejeita_release_de_outro_head_ou_reprovado(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        self.service._release_evidence_items = Mock(return_value=[
+            self._release_evidence(head="outro-head"),
+            self._release_evidence(status="REPROVADO"),
+        ])
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        self.assertIn("TIME_BUDGET_EXCEEDED", response)
+        self.assertFalse(self.service.experiments[experiment.experiment_id].baseline_full_reused)
+
+    def test_prevalidacao_reusa_release_completo_aprovado_mesmo_head(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        self.service._reusable_full_baseline_evidence = Mock(return_value=self._release_evidence(duration_ms=1_000_000))
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        updated = self.service.experiments[experiment.experiment_id]
+        self.assertIn("READY_WITH_REUSED_BASELINE", response)
+        self.assertTrue(updated.baseline_full_reused)
+        self.assertEqual(1620, updated.baseline_full_timeout_seconds)
+        self.assertEqual("VAL-TESTE", updated.reusable_baseline_evidence)
+        self.assertEqual([], self.service.llm.calls)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+
+    def test_prevalidacao_bloqueia_orcamento_antes_de_modelo_e_worktree(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        self.service._reusable_full_baseline_evidence = Mock(return_value=None)
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        self.assertIn("TIME_BUDGET_EXCEEDED", response)
+        self.assertEqual([], self.service.llm.calls)
+        self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])
+
+    def test_categoria_codigo_124_e_timeout_inconclusivo(self):
+        result = CheckResult("pytest", "python -m pytest", 124, 1, "timeout")
+        self.assertEqual("VALIDACAO_INCONCLUSIVA_POR_TIMEOUT", self.service._failure_category_for_check(result, "baseline"))
+        self.assertEqual("VALIDACAO_INCONCLUSIVA_POR_TIMEOUT", self.service._check_result_status(result))
+
+    def test_categoria_falha_funcional_e_manifesto_modelo_separados(self):
+        failed = CheckResult("pytest", "python -m pytest", 1, 1, "assertion failed")
+        self.assertEqual("BASELINE_FULL_TEST_FAILURE", self.service._failure_category_for_check(failed, "baseline"))
+        self.assertEqual("POST_PATCH_TEST_FAILURE", self.service._failure_category_for_check(failed, "patch"))
+        self.assertEqual("MODEL_ERROR", self.service._failure_category_from_message("modelo principal indisponivel"))
+        self.assertEqual("MANIFEST_INVALID", self.service._failure_category_from_message("manifesto recusado"))
+        self.assertEqual("SECURITY_POLICY_BLOCK", self.service._failure_category_from_message("bloqueado por politica"))
+
+    def test_timeout_historico_conta_como_inconclusivo_na_capacidade(self):
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.operation_type == "insert_docstring")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        proposal = self.service._get(experiment.proposal_id)
+        proposal.state = "FALHOU"
+        proposal.patch_manifest = {"operations": [{"type": "insert_docstring"}]}
+        proposal.validation = [self.service._validation_record(CheckResult("pytest", "python -m pytest", 124, 1, "timeout"), "baseline")]
+        experiment.state = "FALHOU"
+        experiment.result = "FALHA_CONTROLADA"
+        experiment.record_sha256 = self.service._experiment_record_sha(experiment)
+
+        stats = self.service._versioned_operation_stats()["insert_docstring"]["current"]
+
+        self.assertEqual(0, stats["fail"])
+        self.assertGreaterEqual(stats["inconclusive"], 1)
+
+    def test_prevalidacao_bloqueia_experimento_concorrente(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        self.service._experiment_locks.add(experiment.experiment_id)
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        self.assertIn("CONCURRENT_EXPERIMENT", response)
+        self.service._experiment_locks.clear()
+
+    def test_prevalidacao_bloqueia_candidato_obsoleto(self):
+        self.init_git()
+        candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
+        self.service.create_calibration_experiment(candidate.candidate_id)
+        experiment = next(iter(self.service.experiments.values()))
+        (self.root / candidate.file).write_text("# mudou\n", encoding="utf-8")
+        subprocess.run(("git", "add", candidate.file), cwd=self.root, capture_output=True, check=True)
+        subprocess.run(("git", "commit", "-m", "muda candidato"), cwd=self.root, capture_output=True, check=True)
+
+        response = self.service.prevalidate_calibration_experiment(experiment.experiment_id)
+
+        self.assertIn("STALE_CANDIDATE", response)
 
     def test_resultado_de_experimento_validado_alimenta_capacidade_atual(self):
         candidate = next(item for item in self.service._autonomous_candidates(force=True) if item.qualification_status == "ACAO_RECOMENDADA")
@@ -652,6 +789,40 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         (self.root / candidate.file).write_text("# mudou\n", encoding="utf-8")
         self.service.set_autonomy_mode("preparar-supervisionado")
         self.assertIn("alteracao", self.service.execute_candidate(candidate.candidate_id))
+
+    def _release_evidence(
+        self,
+        *,
+        duration_ms: int = 600_000,
+        mode: str = "completo",
+        scope: str = "suite_completa",
+        check_name: str = "pytest",
+        status: str = "APROVADO",
+        head: str | None = None,
+    ) -> dict:
+        return {
+            "validation_id": "VAL-TESTE",
+            "mode": mode,
+            "check_name": check_name,
+            "command": "python -m pytest",
+            "exit_code": 0 if status == "APROVADO" else 1,
+            "status": status,
+            "started_at": "2026-07-18T00:00:00",
+            "finished_at": "2026-07-18T00:10:00",
+            "duration_ms": duration_ms,
+            "project_head": head or self.service._safe_head(),
+            "working_tree_clean": True,
+            "python_version": "3.14.6",
+            "executable_path": "python",
+            "environment_fingerprint": "teste",
+            "test_scope": scope,
+            "output_sha256": "abc",
+            "result_sha256": "def",
+            "created_by": "release_service",
+            "reused": False,
+            "timeout_seconds": 3600,
+            "timeout_source": "teste",
+        }
 
     def _fast_validation(self, workspace, related_tests=None, *, related_test_timeout=None):
         return [

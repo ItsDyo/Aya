@@ -20,6 +20,10 @@ RELATED_TEST_TIMEOUT_POLICY_VERSION = "related_tests_timeout_v1"
 RELATED_TEST_TIMEOUT_MINIMUM_SECONDS = 900
 RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS = 1800
 RELATED_TEST_TIMEOUT_FALLBACK_SECONDS = 1200
+FULL_BASELINE_TIMEOUT_POLICY_VERSION = "baseline_full_timeout_v1"
+FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS = 1200
+FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS = 3600
+FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS = 2400
 PROTECTED_NAMES = {".env", ".env.local", ".env.example"}
 PROTECTED_PARTS = {"data_local", "logs", "backups", ".git", "voices"}
 PROTECTED_SUFFIXES = {".db", ".sqlite", ".sqlite3", ".key", ".pem", ".onnx"}
@@ -47,6 +51,11 @@ class CheckResult:
     exit_code: int
     duration_ms: int
     output: str
+    started_at: str = ""
+    timeout_seconds: int | None = None
+    result: str = ""
+    failure_category: str = ""
+    evidence_source: str = "executed"
 
     @property
     def passed(self) -> bool:
@@ -225,6 +234,7 @@ class DevWorkspace:
         return redacted[:limit] + ("\n... [saida truncada]" if len(redacted) > limit else "")
 
     def _check(self, name: str, command: tuple[str, ...], timeout: int, cwd: Path) -> CheckResult:
+        started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         started = time.perf_counter()
         try:
             result = self._run(command, cwd, timeout)
@@ -233,7 +243,15 @@ class DevWorkspace:
         except subprocess.TimeoutExpired:
             code = 124
             output = "Tempo limite excedido."
-        return CheckResult(name, " ".join(command), code, int((time.perf_counter() - started) * 1000), output)
+        return CheckResult(
+            name,
+            " ".join(command),
+            code,
+            int((time.perf_counter() - started) * 1000),
+            output,
+            started_at=started_at,
+            timeout_seconds=timeout,
+        )
 
     def _run(
         self,
@@ -304,3 +322,10 @@ def calculate_related_test_timeout(baseline_duration_seconds: float | None) -> i
         return RELATED_TEST_TIMEOUT_FALLBACK_SECONDS
     calculated = ceil((baseline_duration_seconds * 1.5) + 60)
     return max(RELATED_TEST_TIMEOUT_MINIMUM_SECONDS, min(RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS, calculated))
+
+
+def calculate_full_baseline_timeout(duration_seconds: float | None) -> int:
+    if duration_seconds is None:
+        return FULL_BASELINE_TIMEOUT_FALLBACK_SECONDS
+    calculated = ceil((duration_seconds * 1.5) + 120)
+    return max(FULL_BASELINE_TIMEOUT_MINIMUM_SECONDS, min(FULL_BASELINE_TIMEOUT_MAXIMUM_SECONDS, calculated))
