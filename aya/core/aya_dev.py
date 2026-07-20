@@ -2533,16 +2533,45 @@ class AyaDevService:
     def _related_tests(self, proposal: EngineeringProposal) -> list[str]:
         indexed = {item.path: item for item in self.index.build()}
         indexed_paths = set(indexed)
-        tests = [path for path in proposal.related_files if self._is_valid_test_path(path, indexed_paths)]
+        tests = [path for path in proposal.required_tests if self._is_valid_test_path(path, indexed_paths)]
+        tests.extend(path for path in proposal.related_files if self._is_valid_test_path(path, indexed_paths))
         for path in proposal.related_files:
             entry = indexed.get(path)
             if entry:
                 tests.extend(test for test in entry.related_tests if self._is_valid_test_path(test, indexed_paths))
-        return list(dict.fromkeys(tests))[:4]
+        tests = list(dict.fromkeys(tests))
+        ranked = self._rank_tests_by_symbol_reference(tests, proposal.related_symbols)
+        if ranked:
+            return ranked[:4]
+        return tests[:4]
 
     def _is_valid_test_path(self, path: str, indexed_paths: set[str]) -> bool:
         name = Path(path).name
         return path in indexed_paths and path.startswith("tests/") and name.startswith("test_") and path.endswith(".py")
+
+    def _rank_tests_by_symbol_reference(self, tests: list[str], symbols: list[str]) -> list[str]:
+        needles = self._related_test_symbol_needles(symbols)
+        if not needles:
+            return []
+        ranked: list[tuple[int, str]] = []
+        for test in tests:
+            try:
+                text = (self.root / test).read_text(encoding="utf-8-sig", errors="replace")
+            except OSError:
+                continue
+            score = sum(1 for needle in needles if re.search(rf"\b{re.escape(needle)}\b", text))
+            if score:
+                ranked.append((-score, test))
+        return [test for _, test in sorted(ranked)]
+
+    def _related_test_symbol_needles(self, symbols: list[str]) -> set[str]:
+        needles: set[str] = set()
+        for symbol in symbols:
+            parts = [part for part in symbol.split(".") if len(part) >= 4]
+            needles.update(parts)
+            if len(symbol) >= 4:
+                needles.add(symbol)
+        return needles
 
     def _format_checks(self, results: list[CheckResult], state: str) -> str:
         lines = [f"Validacao Aya Dev: {state}"]

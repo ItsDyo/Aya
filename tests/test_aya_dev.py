@@ -609,6 +609,32 @@ class AyaDevTestCase(unittest.TestCase):
         proposal = self.proposal(related_files=["aya/core/sample.py"], required_tests=[])
         self.assertEqual(["tests/test_sample.py"], self.service._related_tests(proposal))
 
+    def test_testes_relacionados_priorizam_mencao_direta_ao_simbolo(self):
+        (self.root / "aya" / "ui").mkdir()
+        (self.root / "aya" / "ui" / "aya_dev.py").write_text(
+            "def render_diff(diff, expand=False):\n    return diff\n\n"
+            "def render_panel():\n    return render_diff('ok')\n",
+            encoding="utf-8",
+        )
+        (self.root / "tests" / "test_aya_dev_broad.py").write_text(
+            "from aya.ui import aya_dev\n\n"
+            "def test_panel_module():\n    assert aya_dev\n",
+            encoding="utf-8",
+        )
+        (self.root / "tests" / "test_aya_dev_render_diff.py").write_text(
+            "from aya.ui.aya_dev import render_diff\n\n"
+            "def test_render_diff():\n    assert render_diff('x') == 'x'\n",
+            encoding="utf-8",
+        )
+        self.service.index = type(self.service.index)(self.root, self.cache)
+        proposal = self.proposal(
+            related_files=["aya/ui/aya_dev.py"],
+            related_symbols=["render_diff"],
+            required_tests=[],
+        )
+
+        self.assertEqual(["tests/test_aya_dev_render_diff.py"], self.service._related_tests(proposal))
+
     def test_arquivo_de_codigo_recusado_como_teste_relacionado(self):
         proposal = self.proposal(related_files=["aya/core/sample.py"], required_tests=["aya/core/sample.py"])
         self.assertNotIn("aya/core/sample.py", self.service._related_tests(proposal))
