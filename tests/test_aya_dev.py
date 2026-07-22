@@ -13,6 +13,7 @@ import pytest
 
 from aya.core.aya_dev import AyaDevService
 from aya.core.dev_workspace import (
+    FULL_VALIDATION_PYTEST_TIMEOUT_SECONDS,
     RELATED_TEST_TIMEOUT_FALLBACK_SECONDS,
     RELATED_TEST_TIMEOUT_MAXIMUM_SECONDS,
     RELATED_TEST_TIMEOUT_MINIMUM_SECONDS,
@@ -1329,6 +1330,7 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertEqual(5, len(commands))
         self.assertTrue(all(command[0] == "python" for command in commands))
         self.assertFalse(any("del" in command or "powershell" in command for command in commands))
+        self.assertEqual(FULL_VALIDATION_PYTEST_TIMEOUT_SECONDS, runner.call_args_list[0].args[2])
 
     def test_testes_relacionados_usam_timeout_maior_de_calibracao(self):
         workspace = self.workspaces / "safe-timeout"

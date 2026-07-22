@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 
+FULL_VALIDATION_PYTEST_TIMEOUT_SECONDS = 1200
 VALIDATION_COMMANDS = (
-    ("pytest", ("python", "-m", "pytest"), 600),
+    ("pytest", ("python", "-m", "pytest"), FULL_VALIDATION_PYTEST_TIMEOUT_SECONDS),
     ("ruff", ("python", "-m", "ruff", "check", "."), 180),
     ("compileall", ("python", "-m", "compileall", "."), 180),
     ("pip check", ("python", "-m", "pip", "check"), 180),
