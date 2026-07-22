@@ -533,6 +533,8 @@ class AyaDevAutonomyTestCase(unittest.TestCase):
         self.assertIn("READY_WITH_REUSED_BASELINE", response)
         self.assertTrue(updated.baseline_full_reused)
         self.assertEqual(1620, updated.baseline_full_timeout_seconds)
+        self.assertEqual(1200, updated.estimated_baseline_seconds)
+        self.assertEqual(4000, updated.estimated_post_patch_seconds)
         self.assertEqual("VAL-TESTE", updated.reusable_baseline_evidence)
         self.assertEqual([], self.service.llm.calls)
         self.assertEqual([], list((self.root.parent / "workspaces").glob("*")) if (self.root.parent / "workspaces").exists() else [])

@@ -2749,9 +2749,10 @@ class AyaDevService:
         experiment.baseline_full_timeout_minimum = metadata["baseline_full_timeout_minimum"]
         experiment.baseline_full_timeout_maximum = metadata["baseline_full_timeout_maximum"]
         related_timeout = calculate_related_test_timeout(None)
-        baseline_full_estimate = int(duration or experiment.baseline_full_timeout_seconds)
+        full_suite_estimate = int(duration or experiment.baseline_full_timeout_seconds)
+        baseline_full_estimate = 0 if experiment.baseline_full_reused else full_suite_estimate
         experiment.estimated_baseline_seconds = related_timeout + baseline_full_estimate
-        experiment.estimated_post_patch_seconds = related_timeout + 1200 + baseline_full_estimate + 600
+        experiment.estimated_post_patch_seconds = related_timeout + 1200 + full_suite_estimate + 600
         experiment.estimated_total_seconds = experiment.estimated_baseline_seconds + experiment.estimated_post_patch_seconds + 180
         experiment.estimation_sources = [
             "timeout_relacionado_fallback",
