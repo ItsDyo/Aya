@@ -331,6 +331,7 @@ def parse_choice_id(value: str) -> str:
 
 
 def render_diff(diff: str, *, expand: bool = False) -> str:
+    """Render diff as escaped HTML, truncating long content unless expanded."""
     escaped = html.escape(diff or "Informacao nao registrada.")
     if expand or len(escaped) <= DIFF_LIMIT:
         return escaped
