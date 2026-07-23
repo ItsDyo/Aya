@@ -1101,6 +1101,7 @@ class AyaDevService:
                 proposal.worktree_cleanup_pending = True
             proposal.integration_success = True
             proposal.state = "INTEGRADA"
+            self._sync_completed_calibration_experiments(proposal)
             self._event(proposal, "commit integrado por fast-forward", "INTEGRANDO", proposal.state)
             self._save()
             return "\n".join([
@@ -1921,6 +1922,7 @@ class AyaDevService:
         return "\n".join(lines)
 
     def list_experiments(self) -> str:
+        self._sync_completed_calibration_experiments()
         if not self.experiments:
             return "Experimentos de calibracao do Aya Dev: nenhum registrado."
         lines = [
@@ -1939,6 +1941,7 @@ class AyaDevService:
         return "\n".join(lines)
 
     def experiment_results(self) -> str:
+        self._sync_completed_calibration_experiments()
         if not self.experiments:
             return "Resultados de experimentos: nenhum dado disponivel."
         counts = self._count_values(experiment.result or experiment.state for experiment in self.experiments.values())
@@ -2053,6 +2056,7 @@ class AyaDevService:
         ])
 
     def show_experiment(self, experiment_id: str) -> str:
+        self._sync_completed_calibration_experiments()
         experiment = self.experiments.get(experiment_id.strip())
         if not experiment:
             return f"Experimento nao encontrado: {experiment_id}"
@@ -3271,6 +3275,25 @@ class AyaDevService:
             "reusable_baseline_evidence": experiment.reusable_baseline_evidence,
             "baseline_full_reused": experiment.baseline_full_reused,
         })
+
+    def _sync_completed_calibration_experiments(self, proposal: EngineeringProposal | None = None) -> bool:
+        proposals = [proposal] if proposal else list(self.proposals.values())
+        changed = False
+        for item in proposals:
+            if not item or item.state != "INTEGRADA":
+                continue
+            for experiment in self.experiments.values():
+                if experiment.proposal_id != item.id or experiment.state != "AGUARDANDO_APROVACAO":
+                    continue
+                experiment.state = "CONCLUIDO"
+                experiment.result = "PROPOSTA_INTEGRADA"
+                experiment.human_decision = "proposta aprovada e integrada"
+                experiment.evidence_strength = "APROVADA_PELO_USUARIO"
+                experiment.record_sha256 = self._experiment_record_sha(experiment)
+                changed = True
+        if changed:
+            self._save_experiments()
+        return changed
 
     def _proposal_origin(self, proposal: EngineeringProposal) -> str:
         text = " ".join([proposal.title, proposal.problem, " ".join(proposal.evidence), proposal.model]).lower()

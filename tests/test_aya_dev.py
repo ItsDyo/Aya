@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from aya.core.aya_dev import AyaDevService
+from aya.core.aya_dev import AyaDevService, CalibrationExperiment
 from aya.core.dev_workspace import (
     FULL_VALIDATION_PYTEST_TIMEOUT_SECONDS,
     RELATED_TEST_TIMEOUT_FALLBACK_SECONDS,
@@ -912,6 +912,45 @@ class AyaDevTestCase(unittest.TestCase):
         self.assertFalse(proposal.remote_used)
         self.assertFalse(Path(proposal.workspace_path).exists())
         self.assertIn("ja integrada", self.service.integrar(proposal.id))
+
+    def test_integracao_conclui_experimento_de_calibracao_vinculado(self):
+        proposal = self._prepare_commit_ready_for_integration()
+        experiment = CalibrationExperiment(
+            experiment_id="EXP-TESTE",
+            candidate_id="AUTO-TESTE",
+            proposal_id=proposal.id,
+            created_at="2026-01-01T00:00:00",
+            selected_by="local_user",
+            project_head=proposal.project_head,
+            file="aya/core/sample.py",
+            file_sha256="sha",
+            symbol="Sample.run",
+            operation_type="insert_docstring",
+            category="documentacao",
+            pipeline_version=proposal.patch_pipeline_version,
+            schema_version=proposal.schema_version,
+            prompt_version=proposal.prompt_version,
+            model=self.service.primary_model,
+            reviewer_model=self.service.reviewer_model,
+            reason="docstring ausente",
+            expected_change="inserir docstring",
+            allowed_files=["aya/core/sample.py"],
+            related_tests=["tests/test_sample.py"],
+            risk="baixo",
+            estimated_changed_lines=1,
+            state="AGUARDANDO_APROVACAO",
+            result="PATCH_VALIDADO_SEM_COMMIT",
+        )
+        self.service.experiments[experiment.experiment_id] = experiment
+        validation = [CheckResult("pytest", "python -m pytest", 0, 0, "ok").__dict__ | {"passed": True}]
+
+        with patch.object(self.service, "_validate_commit_in_clean_worktree", return_value=validation):
+            self.service.integrar(proposal.id)
+
+        self.assertEqual("INTEGRADA", proposal.state)
+        self.assertEqual("CONCLUIDO", experiment.state)
+        self.assertEqual("PROPOSTA_INTEGRADA", experiment.result)
+        self.assertEqual("APROVADA_PELO_USUARIO", experiment.evidence_strength)
 
     def test_integrar_falha_pos_fast_forward_registra_parcial(self):
         proposal = self._prepare_commit_ready_for_integration()
