@@ -22,6 +22,9 @@ main.py        Interface de terminal
 
 ## Rodar
 
+Para instalar a Aya do zero em outro computador, comece por
+`docs/instalacao_limpa.md`.
+
 ```powershell
 python app.py
 ```
@@ -54,11 +57,22 @@ consulta de memoria, consulta de conhecimento e RAG continuam disponiveis, mas
 escrita/curadoria, arquivos, backups, diagnosticos administrativos, exports e
 Aya Dev ficam bloqueados. Veja `docs/permissoes_por_canal.md`.
 
+## Documentacao essencial
+
+- `docs/instalacao_limpa.md`: instalacao limpa em outro computador.
+- `docs/configuracao.md`: variaveis do `.env` e modos local/remoto.
+- `docs/modelos_usados.md`: modelos Ollama e voz Piper esperados.
+- `docs/seguranca.md`: o que nunca deve ir para o GitHub.
+- `docs/recuperacao.md`: como recuperar codigo, ambiente e dados.
+- `docs/uso_rapido_v1.md`: uso diario por atalhos.
+
 ## Testar
 
 ```powershell
-python -m unittest discover -v
-python -m compileall -q .
+python -m pytest
+python -m ruff check .
+python -m compileall .
+python -m pip check
 python scripts/smoke_test.py
 ```
 
