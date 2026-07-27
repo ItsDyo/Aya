@@ -92,6 +92,30 @@ class AyaTestCase(unittest.TestCase):
         self.assertNotIn("Nao reconheci", resposta)
         self.assertTrue("Alertas da Aya - detalhes" in resposta or "Tudo em ordem" in resposta)
 
+    def test_alertas_categoria_funciona_como_comando_real(self):
+        resposta = self.aya.responder("/alertas aya-dev")
+
+        self.assertNotIn("Nao reconheci", resposta)
+        self.assertTrue("Aya Dev" in resposta or "Tudo em ordem" in resposta)
+
+    def test_alertas_detalhes_categoria_funciona_como_comando_real(self):
+        resposta = self.aya.responder("/alertas detalhes aya-dev")
+
+        self.assertNotIn("Nao reconheci", resposta)
+        self.assertTrue("Alertas da Aya - detalhes" in resposta or "Tudo em ordem" in resposta)
+
+    def test_alertas_categoria_invalida_mostra_uso(self):
+        resposta = self.aya.responder("/alertas banana")
+
+        self.assertIn("Use assim", resposta)
+        self.assertIn("Categorias:", resposta)
+
+    def test_alertas_detalhes_categoria_invalida_mostra_uso(self):
+        resposta = self.aya.responder("/alertas detalhes banana")
+
+        self.assertIn("Use assim", resposta)
+        self.assertIn("Categorias:", resposta)
+
     def test_release_report_e_honesto_sobre_testes_nao_executados(self):
         resposta = self.aya.responder("/release")
 

@@ -7,7 +7,7 @@ import re
 
 from aya.config import MODEL_CONFIG, RUNTIME_CONFIG
 from aya.core.advice import TechnicalAdviceService
-from aya.core.alerts import AlertService, formatar_alertas
+from aya.core.alerts import ALERT_CATEGORIES, AlertService, formatar_alertas
 from aya.core.aya_dev import AyaDevService
 from aya.core.backup import BackupService
 from aya.core.change_plan import ChangePlanService
@@ -333,6 +333,7 @@ Memoria e conhecimento:
 /higiene
 /alertas
 /alertas detalhes
+/alertas revisao|memoria|curadoria|meta|aya-dev|critico
 /conflitos
 /resolver conflito id | aceitar ou rejeitar
 /fundir memoria id_principal | id_duplicada
@@ -919,8 +920,41 @@ Sistema:
         return self.exercise_coach.listar_revisoes()
 
     def _comando_alertas(self, resto: str = "") -> str:
-        detailed = resto.strip().lower() == "detalhes"
-        return formatar_alertas(self.alert_service.collect(detailed=detailed), detailed=detailed)
+        parts = resto.strip().lower().split()
+        detailed = False
+        category = None
+
+        if parts:
+            if parts[0] == "detalhes":
+                detailed = True
+                category = parts[1] if len(parts) > 1 else None
+                if len(parts) > 2:
+                    return self._uso_alertas()
+            elif parts[0] in ALERT_CATEGORIES:
+                category = parts[0]
+                if len(parts) > 1:
+                    if parts[1] != "detalhes" or len(parts) > 2:
+                        return self._uso_alertas()
+                    detailed = True
+            else:
+                return self._uso_alertas()
+
+        if category and category not in ALERT_CATEGORIES:
+            return self._uso_alertas()
+
+        return formatar_alertas(
+            self.alert_service.collect(detailed=detailed, category=category),
+            detailed=detailed,
+        )
+
+    @staticmethod
+    def _uso_alertas() -> str:
+        categories = ", ".join(sorted(ALERT_CATEGORIES))
+        return (
+            "Use assim: `/alertas`, `/alertas detalhes`, `/alertas categoria` "
+            "ou `/alertas detalhes categoria`.\n"
+            f"Categorias: {categories}."
+        )
 
     def _comando_codigo(
         self,

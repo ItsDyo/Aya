@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 logger = logging.getLogger("aya.alerts")
 
+ALERT_CATEGORIES = frozenset({"aya-dev", "critico", "curadoria", "memoria", "meta", "revisao"})
+
 
 @dataclass(frozen=True)
 class Alert:
@@ -38,14 +40,39 @@ class AlertService:
         self.aya_dev = aya_dev
         self.curation = curation
 
-    def collect(self, detailed: bool = False) -> list[Alert]:
+    def collect(self, detailed: bool = False, category: str | None = None) -> list[Alert]:
         alerts: list[Alert] = []
-        alerts.extend(self._check_revisoes(detailed))
-        alerts.extend(self._check_conflitos_memoria(detailed))
-        alerts.extend(self._check_metas(detailed))
-        alerts.extend(self._check_curadoria(detailed))
-        alerts.extend(self._check_aya_dev(detailed))
+        normalized = self.normalize_category(category)
+        collectors = {
+            "revisao": self._check_revisoes,
+            "memoria": self._check_conflitos_memoria,
+            "meta": self._check_metas,
+            "curadoria": self._check_curadoria,
+            "aya-dev": self._check_aya_dev,
+        }
+
+        if normalized == "":
+            return []
+        if normalized == "critico":
+            alerts.extend(item for item in self._check_aya_dev(detailed) if item.kind == "critico")
+        elif normalized:
+            collector = collectors.get(normalized)
+            if collector:
+                alerts.extend(collector(detailed))
+        else:
+            alerts.extend(self._check_revisoes(detailed))
+            alerts.extend(self._check_conflitos_memoria(detailed))
+            alerts.extend(self._check_metas(detailed))
+            alerts.extend(self._check_curadoria(detailed))
+            alerts.extend(self._check_aya_dev(detailed))
         return sorted(alerts, key=lambda item: (item.priority, item.kind, item.title))
+
+    @staticmethod
+    def normalize_category(category: str | None) -> str | None:
+        normalized = (category or "").strip().lower()
+        if not normalized:
+            return None
+        return normalized if normalized in ALERT_CATEGORIES else ""
 
     def _has_connection(self) -> bool:
         return getattr(self.db, "connection", None) is not None

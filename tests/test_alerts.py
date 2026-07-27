@@ -151,6 +151,79 @@ def test_meta_ativa_aparece():
     assert any(item.kind == "meta" for item in alerts)
 
 
+def test_filtro_categoria_revisao():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1, "topico": "Python"}]
+    db.listar_conflitos_memoria = lambda: [{"id": 2}]
+
+    alerts = AlertService(db).collect(category="revisao")
+
+    assert len(alerts) == 1
+    assert alerts[0].kind == "revisao"
+
+
+def test_filtro_categoria_memoria():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1}]
+    db.listar_conflitos_memoria = lambda: [{"id": 2}]
+
+    alerts = AlertService(db).collect(category="memoria")
+
+    assert len(alerts) == 1
+    assert alerts[0].kind == "memoria"
+
+
+def test_filtro_categoria_invalida_retorna_vazio():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1}]
+
+    alerts = AlertService(db).collect(category="inexistente")
+
+    assert alerts == []
+
+
+def test_filtro_categoria_detalhado():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1, "topico": "Python"}]
+
+    alerts = AlertService(db).collect(detailed=True, category="revisao")
+
+    assert len(alerts) == 1
+    assert alerts[0].items[0]["id"] == "1"
+
+
+def test_sem_filtro_coleta_tudo():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1}]
+    db.listar_conflitos_memoria = lambda: [{"id": 2}]
+    db.buscar_metas_ativas = lambda: [{"id": 3}]
+
+    alerts = AlertService(db).collect()
+    kinds = [item.kind for item in alerts]
+
+    assert "revisao" in kinds
+    assert "memoria" in kinds
+    assert "meta" in kinds
+
+
+def test_filtro_categoria_aya_dev():
+    dev = FakeAyaDev({"p1": FakeProposal("AGUARDANDO_APROVACAO")})
+
+    alerts = AlertService(FakeDBWithConnection(), aya_dev=dev).collect(category="aya-dev")
+
+    assert len(alerts) == 1
+    assert "Aya Dev" in alerts[0].title
+
+
+def test_filtro_categoria_critico():
+    dev = FakeAyaDev({"p1": FakeProposal("REVERSAO_PARCIAL"), "p2": FakeProposal("AGUARDANDO_APROVACAO")})
+
+    alerts = AlertService(FakeDBWithConnection(), aya_dev=dev).collect(category="critico")
+
+    assert len(alerts) == 1
+    assert alerts[0].kind == "critico"
+
+
 def test_conflito_pendente_aparece():
     db = FakeDBWithConnection()
     db.listar_conflitos_memoria = lambda: [{"id": 1}]
@@ -261,6 +334,13 @@ def test_fake_db_sem_connection_com_metodos():
     alerts = AlertService(FakeDBNoConnection()).collect()
 
     assert any(item.kind == "revisao" for item in alerts)
+
+
+def test_categoria_normaliza_espacos_e_caixa():
+    assert AlertService.normalize_category(" Revisao ") == "revisao"
+    assert AlertService.normalize_category("AYA-DEV") == "aya-dev"
+    assert AlertService.normalize_category("invalida") == ""
+    assert AlertService.normalize_category("") is None
 
 
 def test_formatar_alertas_vazio():
