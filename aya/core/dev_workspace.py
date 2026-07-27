@@ -231,6 +231,7 @@ class DevWorkspace:
         return self.validate(workspace, related_tests)
 
     def sanitize(self, text: str, limit: int = 5000) -> str:
+        """Redact sensitive values and truncate technical command output."""
         redacted = SECRET_PATTERN.sub(lambda match: f"{match.group(1)}=[PROTEGIDO]", text or "")
         return redacted[:limit] + ("\n... [saida truncada]" if len(redacted) > limit else "")
 
