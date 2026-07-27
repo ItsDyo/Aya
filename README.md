@@ -206,6 +206,7 @@ Os comandos abaixo continuam disponiveis para controle manual:
 /rejeitar id
 /curadoria
 /alertas
+/alertas detalhes
 /conflitos
 /resolver conflito id | aceitar ou rejeitar
 /fundir memoria id_principal | id_duplicada
@@ -253,18 +254,19 @@ Os comandos abaixo continuam disponiveis para controle manual:
 19. Use `/confirmar memoria id` para fortalecer uma memoria correta.
 20. Use `/esquecer memoria id` para arquivar uma memoria ruim ou antiga.
 21. Use `/alertas` para ver revisoes, metas, conflitos, curadoria e propostas do Aya Dev que merecem atencao.
-22. Use `/conflitos` para revisar mudancas que a Aya se recusou a sobrescrever.
-23. Use `/resolver conflito id aceitar|rejeitar` para escolher o valor canonico.
-24. Use `/fundir memoria principal duplicada` para unir duplicatas identicas sem apagar historico.
-25. Use `/exercicio tema | nivel` para a Aya testar se voce aprendeu.
-26. Use `/responder id | resposta` para receber correcao e gerar revisao futura.
-27. Use `/revisoes` para ver exercicios que precisam voltar.
-28. Use `/companhia` quando quiser conversar sobre o dia, desabafar ou pedir incentivo.
-29. Use `/diario` para ver registros leves das conversas de companhia.
-30. Use `/continuidade` para ver onde voces pararam e quais proximos passos fazem sentido.
-31. Use `/diagnostico` para checar banco, dependencias, voz, Gradio e Tailscale.
-32. Use `/backup criar` para proteger memoria, conhecimento, historico, exports e logs.
-33. Use `/finetune` para exportar um dataset JSONL inicial.
+22. Use `/alertas detalhes` para ver IDs e dados resumidos sem expor conteudo sensivel completo.
+23. Use `/conflitos` para revisar mudancas que a Aya se recusou a sobrescrever.
+24. Use `/resolver conflito id aceitar|rejeitar` para escolher o valor canonico.
+25. Use `/fundir memoria principal duplicada` para unir duplicatas identicas sem apagar historico.
+26. Use `/exercicio tema | nivel` para a Aya testar se voce aprendeu.
+27. Use `/responder id | resposta` para receber correcao e gerar revisao futura.
+28. Use `/revisoes` para ver exercicios que precisam voltar.
+29. Use `/companhia` quando quiser conversar sobre o dia, desabafar ou pedir incentivo.
+30. Use `/diario` para ver registros leves das conversas de companhia.
+31. Use `/continuidade` para ver onde voces pararam e quais proximos passos fazem sentido.
+32. Use `/diagnostico` para checar banco, dependencias, voz, Gradio e Tailscale.
+33. Use `/backup criar` para proteger memoria, conhecimento, historico, exports e logs.
+34. Use `/finetune` para exportar um dataset JSONL inicial.
 
 Detalhes do comportamento de conflitos, fusoes e envelhecimento estao em
 `docs/memoria_avancada.md`.

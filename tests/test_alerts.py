@@ -96,6 +96,52 @@ def test_revisao_pendente_aparece():
     assert "2" in alerts[0].detail
 
 
+def test_modo_detalhado_retorna_itens_de_revisao():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [
+        {"id": 12, "topico": "Python/listas"},
+        {"id": 15, "topico": "SQL/joins"},
+    ]
+
+    alerts = AlertService(db).collect(detailed=True)
+    revisao = [item for item in alerts if item.kind == "revisao"][0]
+
+    assert len(revisao.items) == 2
+    assert revisao.items[0]["id"] == "12"
+    assert revisao.items[0]["topico"] == "Python/listas"
+
+
+def test_modo_resumido_nao_retorna_itens():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1, "topico": "teste"}]
+
+    alerts = AlertService(db).collect(detailed=False)
+    revisao = [item for item in alerts if item.kind == "revisao"][0]
+
+    assert revisao.items == ()
+
+
+def test_limite_10_itens_no_detalhado():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": item, "topico": f"topico{item}"} for item in range(20)]
+
+    alerts = AlertService(db).collect(detailed=True)
+    revisao = [item for item in alerts if item.kind == "revisao"][0]
+
+    assert len(revisao.items) == 10
+
+
+def test_nao_expoe_campo_sensivel_no_detalhado():
+    db = FakeDBWithConnection()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 1, "topico": "Python", "conteudo_secreto": "nao_mostrar"}]
+
+    alerts = AlertService(db).collect(detailed=True)
+    revisao = [item for item in alerts if item.kind == "revisao"][0]
+
+    assert "conteudo_secreto" not in str(revisao.items)
+    assert "nao_mostrar" not in str(revisao.items)
+
+
 def test_meta_ativa_aparece():
     db = FakeDBWithConnection()
     db.buscar_metas_ativas = lambda: [{"id": 1}]
@@ -125,6 +171,21 @@ def test_curadoria_com_curation_respeita_adiadas_ignoradas():
     assert "5" in curadoria.detail
     assert "adiadas" not in curadoria.detail.lower()
     assert "ignoradas" not in curadoria.detail.lower()
+    assert curadoria.items == ()
+
+
+def test_curadoria_detalhada_mostra_apenas_contagens_seguras():
+    db = FakeDBWithConnection()
+    db.contar_aprendizados_pendentes = lambda: 2
+    curation = FakeCuration(fracas=3, adiadas=5, ignoradas=2)
+
+    alerts = AlertService(db, curation=curation).collect(detailed=True)
+    curadoria = [item for item in alerts if item.kind == "curadoria"][0]
+
+    assert {"tipo": "aprendizados_pendentes", "quantidade": "2"} in curadoria.items
+    assert {"tipo": "memorias_fracas", "quantidade": "3"} in curadoria.items
+    assert "adiadas" not in str(curadoria.items)
+    assert "ignoradas" not in str(curadoria.items)
 
 
 def test_curadoria_sem_curation_usa_aprendizados():
@@ -212,3 +273,20 @@ def test_formatar_alertas_com_conteudo():
     assert "Revisoes" in message
     assert "/revisoes" in message
     assert "Sugestao" in message
+
+
+def test_formatar_alertas_detalhados_com_itens():
+    message = formatar_alertas(
+        [Alert("revisao", "Revisoes", "1 pendente", "/revisoes", 2, ({"id": "1", "topico": "Python"},))],
+        detailed=True,
+    )
+
+    assert "detalhes" in message
+    assert "#1" in message
+    assert "topico=Python" in message
+
+
+def test_formatar_alertas_detalhados_sem_itens():
+    message = formatar_alertas([Alert("meta", "Metas", "1 ativa", "/metas", 5)], detailed=True)
+
+    assert "sem detalhes disponiveis" in message

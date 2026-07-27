@@ -274,7 +274,7 @@ class Assistant:
             "/arquivo": lambda: self._comando_arquivo(resto),
             "/revisar": lambda: self._comando_revisar(resto, channel),
             "/plano": lambda: self._comando_plano_alteracao(resto, channel),
-            "/alertas": lambda: self._comando_alertas(),
+            "/alertas": lambda: self._comando_alertas(resto),
             "/aya-dev": lambda: self.aya_dev.execute(resto),
         }
 
@@ -332,6 +332,7 @@ Memoria e conhecimento:
 /curadoria
 /higiene
 /alertas
+/alertas detalhes
 /conflitos
 /resolver conflito id | aceitar ou rejeitar
 /fundir memoria id_principal | id_duplicada
@@ -917,8 +918,9 @@ Sistema:
     def _comando_revisoes(self) -> str:
         return self.exercise_coach.listar_revisoes()
 
-    def _comando_alertas(self) -> str:
-        return formatar_alertas(self.alert_service.collect())
+    def _comando_alertas(self, resto: str = "") -> str:
+        detailed = resto.strip().lower() == "detalhes"
+        return formatar_alertas(self.alert_service.collect(detailed=detailed), detailed=detailed)
 
     def _comando_codigo(
         self,
