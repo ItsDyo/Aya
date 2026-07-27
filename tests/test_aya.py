@@ -80,6 +80,12 @@ class AyaTestCase(unittest.TestCase):
         self.assertIn("Roadmap Aya 1.0", resposta)
         self.assertIn("Fora da 1.0", resposta)
 
+    def test_alertas_funciona_como_comando_real(self):
+        resposta = self.aya.responder("/alertas")
+
+        self.assertNotIn("Nao reconheci", resposta)
+        self.assertTrue("Alertas da Aya" in resposta or "Tudo em ordem" in resposta)
+
     def test_release_report_e_honesto_sobre_testes_nao_executados(self):
         resposta = self.aya.responder("/release")
 

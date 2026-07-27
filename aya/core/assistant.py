@@ -7,6 +7,7 @@ import re
 
 from aya.config import MODEL_CONFIG, RUNTIME_CONFIG
 from aya.core.advice import TechnicalAdviceService
+from aya.core.alerts import AlertService, formatar_alertas
 from aya.core.aya_dev import AyaDevService
 from aya.core.backup import BackupService
 from aya.core.change_plan import ChangePlanService
@@ -61,7 +62,7 @@ class Assistant:
         "/arquivar", "/restaurar", "/editar", "/dominio", "/adiar", "/ignorar", "/retomar",
         "/exercicio", "/responder", "/revisoes", "/companhia", "/desabafo", "/conselho",
         "/incentivo", "/diario", "/continuidade", "/resumo", "/ondeparamos", "/projeto",
-        "/auditar", "/arquivo", "/revisar", "/plano", "/aya-dev",
+        "/auditar", "/arquivo", "/revisar", "/plano", "/alertas", "/aya-dev",
     )
 
     def __init__(
@@ -133,6 +134,7 @@ class Assistant:
             self.backups.resumo,
             self.curation.resumo_higiene,
         )
+        self.alert_service = AlertService(self.db, aya_dev=self.aya_dev, curation=self.curation)
         self.permissions = PermissionManager()
         self.command_router = CommandRouter(set(self.COMMAND_NAMES), self.permissions, self._command_capability)
         self.study = StudyPlanner(self.db)
@@ -272,6 +274,7 @@ class Assistant:
             "/arquivo": lambda: self._comando_arquivo(resto),
             "/revisar": lambda: self._comando_revisar(resto, channel),
             "/plano": lambda: self._comando_plano_alteracao(resto, channel),
+            "/alertas": lambda: self._comando_alertas(),
             "/aya-dev": lambda: self.aya_dev.execute(resto),
         }
 
@@ -328,6 +331,7 @@ Memoria e conhecimento:
 /rejeitar id
 /curadoria
 /higiene
+/alertas
 /conflitos
 /resolver conflito id | aceitar ou rejeitar
 /fundir memoria id_principal | id_duplicada
@@ -913,6 +917,9 @@ Sistema:
     def _comando_revisoes(self) -> str:
         return self.exercise_coach.listar_revisoes()
 
+    def _comando_alertas(self) -> str:
+        return formatar_alertas(self.alert_service.collect())
+
     def _comando_codigo(
         self,
         resto: str,
@@ -1061,6 +1068,7 @@ Sistema:
             "/arquivo": Capability.PROJECT_ACCESS,
             "/revisar": Capability.MEMORY_READ if payload.strip().lower().startswith("memoria") else Capability.PROJECT_ACCESS,
             "/plano": Capability.PROJECT_ACCESS,
+            "/alertas": Capability.MEMORY_READ,
             "/aya-dev": Capability.SYSTEM_ADMIN,
         }
         return mapping.get(name, Capability.SYSTEM_ADMIN)
