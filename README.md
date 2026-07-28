@@ -59,6 +59,11 @@ Aya Dev ficam bloqueados. Veja `docs/permissoes_por_canal.md`.
 
 ## Documentacao essencial
 
+- `docs/guia_rapido.md`: inicio, abertura, celular, status e encerramento no uso diario.
+- `docs/comandos.md`: comandos organizados por area, com exemplos de uso.
+- `docs/backup.md`: rotina de backup, verificacao e recuperacao segura.
+- `docs/github.md`: o que pode ou nao pode ir para o GitHub.
+- `docs/troubleshooting.md`: problemas comuns e primeiros diagnosticos.
 - `docs/instalacao_limpa.md`: instalacao limpa em outro computador.
 - `docs/configuracao.md`: variaveis do `.env` e modos local/remoto.
 - `docs/modelos_usados.md`: modelos Ollama e voz Piper esperados.
