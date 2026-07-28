@@ -1,328 +1,162 @@
 # Aya
 
-Aya e uma assistente local de estudos, codigo e produtividade usando Ollama, SQLite, Gradio e Rich.
+Aya e uma assistente pessoal local para estudos, codigo, memoria, conhecimento e companhia leve. Ela roda no seu computador com Ollama, Gradio, SQLite, Rich e Piper TTS, priorizando privacidade e controle local.
 
-## Estrutura
+Este README e a porta de entrada do projeto. O uso detalhado fica em `docs/`.
 
-```text
-aya/
-  core/        Orquestracao da assistente, LLM, RAG e ferramentas de projeto
-  data/        Banco SQLite, memoria e sessao de estudo
-  utils/       Funcoes auxiliares
-docs/          Planos tecnicos e fine-tuning
-scripts/       Testes manuais e utilitarios
-tests/         Testes automatizados
-data_local/    Banco, historico e arquivos locais persistentes
-exports/       Datasets exportados
-logs/          Logs da Aya
-backups/       Backups locais versionados
-app.py         Interface Gradio
-main.py        Interface de terminal
-```
+## Comece Aqui
+
+- [Guia rapido](docs/guia_rapido.md): iniciar, abrir, usar no celular, ver status e encerrar.
+- [Instalacao limpa](docs/instalacao_limpa.md): preparar a Aya em outro computador.
+- [Comandos](docs/comandos.md): lista organizada de comandos com exemplos.
+- [Backup](docs/backup.md): criar, listar, verificar e extrair backups.
+- [GitHub](docs/github.md): o que versionar e o que manter fora do repositorio.
+- [Problemas comuns](docs/troubleshooting.md): primeiros diagnosticos e solucoes seguras.
 
 ## Rodar
 
-Para instalar a Aya do zero em outro computador, comece por
-`docs/instalacao_limpa.md`.
-
-```powershell
-python app.py
-```
-
-Ou pelo terminal:
-
-```powershell
-python main.py
-```
-
-Para acesso local estavel da v1.0:
+Uso diario recomendado:
 
 ```powershell
 .\scripts\start_v1.ps1
 ```
 
-Para acessar de outro dispositivo por VPN privada:
+Abrir a interface:
 
 ```powershell
-Copy-Item .env.example .env
-notepad .env
-.\scripts\diagnose_remote.ps1
-.\scripts\start_remote.ps1
+.\scripts\open_v1.ps1
 ```
 
-No modo recomendado, mantenha `AYA_HOST=127.0.0.1` e use `tailscale serve 7860` em outro terminal. Veja os guias `docs/acesso_remoto_seguro.md` e `docs/aya_v1_operacao.md`.
+Ver status sem iniciar ou encerrar nada:
 
-O acesso remoto usa permissoes reduzidas: conversa, companhia, estudo, status,
-consulta de memoria, consulta de conhecimento e RAG continuam disponiveis, mas
-escrita/curadoria, arquivos, backups, diagnosticos administrativos, exports e
-Aya Dev ficam bloqueados. Veja `docs/permissoes_por_canal.md`.
+```powershell
+.\scripts\status_v1.ps1
+```
 
-## Documentacao essencial
+Tambem e possivel iniciar diretamente:
 
-- `docs/guia_rapido.md`: inicio, abertura, celular, status e encerramento no uso diario.
-- `docs/comandos.md`: comandos organizados por area, com exemplos de uso.
-- `docs/backup.md`: rotina de backup, verificacao e recuperacao segura.
-- `docs/github.md`: o que pode ou nao pode ir para o GitHub.
-- `docs/troubleshooting.md`: problemas comuns e primeiros diagnosticos.
-- `docs/instalacao_limpa.md`: instalacao limpa em outro computador.
-- `docs/configuracao.md`: variaveis do `.env` e modos local/remoto.
-- `docs/modelos_usados.md`: modelos Ollama e voz Piper esperados.
-- `docs/seguranca.md`: o que nunca deve ir para o GitHub.
-- `docs/recuperacao.md`: como recuperar codigo, ambiente e dados.
-- `docs/uso_rapido_v1.md`: uso diario por atalhos.
+```powershell
+python app.py
+```
 
-## Testar
+A interface local fica em:
+
+```text
+http://127.0.0.1:7860
+```
+
+## Acesso Pelo Celular
+
+O caminho recomendado e Tailscale privado com a Aya exposta somente dentro da sua tailnet.
+
+Leia:
+
+- [Acesso remoto seguro](docs/acesso_remoto_seguro.md)
+- [Operacao da Aya v1.0](docs/aya_v1_operacao.md)
+- [Permissoes por canal](docs/permissoes_por_canal.md)
+
+Nao use `share=True`, Tailscale Funnel ou porta aberta no roteador.
+
+## Arquitetura
+
+| Caminho | Responsabilidade |
+| --- | --- |
+| `aya/core/assistant.py` | Orquestracao principal da Aya |
+| `aya/core/alerts.py` | Alertas sob demanda |
+| `aya/core/memory.py` | Memoria persistente |
+| `aya/core/rag.py` | Busca local e conhecimento documentado |
+| `aya/core/learning.py` | Sessoes de estudo, metas e revisoes |
+| `aya/core/aya_dev.py` | Aya Dev supervisionado |
+| `aya/data/` | Codigo de persistencia SQLite |
+| `aya/ui/` | Interfaces Gradio |
+| `scripts/` | Scripts operacionais e diagnosticos |
+| `tests/` | Testes automatizados |
+| `docs/` | Documentacao de uso, manutencao e evolucao |
+
+## Tecnologias
+
+- Python
+- Ollama
+- SQLite
+- Gradio
+- Rich
+- Piper TTS
+- Tailscale para acesso remoto privado
+
+## Validar
 
 ```powershell
 python -m pytest
 python -m ruff check .
 python -m compileall .
 python -m pip check
-python scripts/smoke_test.py
+python scripts\smoke_test.py
 ```
 
-## Backups
+## Comandos Essenciais
 
-Crie um backup dos dados persistentes:
+```text
+/alertas
+/alertas detalhes
+/alertas revisao|memoria|curadoria|meta|aya-dev|critico
+/status
+/diagnostico
+/continuidade
+/estudar materia | minutos
+/encerrar notas
+/exercicio topico | nivel
+/revisoes
+/salvar topico | conteudo | tags
+/buscar termo
+/curadoria
+/backup criar
+/conselho
+```
 
-```powershell
-python main.py
-# dentro da Aya:
+Veja a lista completa em [docs/comandos.md](docs/comandos.md).
+
+## Dados Locais e Privacidade
+
+O repositorio deve conter codigo, testes, scripts, documentacao e configuracoes de exemplo.
+
+Nao envie para o GitHub:
+
+- `.env`;
+- bancos locais;
+- memorias e conversas reais;
+- backups;
+- logs privados;
+- modelos e vozes grandes;
+- credenciais, tokens ou chaves.
+
+Leia [docs/github.md](docs/github.md) e [docs/seguranca.md](docs/seguranca.md) antes de publicar mudancas.
+
+## Backup
+
+Dentro da Aya:
+
+```text
 /backup criar
 ```
 
-Ou pela interface web, na aba `Sistema` > `Backups`.
-
-Para o pacote local de congelamento da v1.0:
+Pelo PowerShell:
 
 ```powershell
 .\scripts\backup_v1.ps1
 ```
 
-Comandos disponiveis:
+Mais detalhes em [docs/backup.md](docs/backup.md) e [docs/recuperacao.md](docs/recuperacao.md).
 
-```text
-/backup criar
-/backup listar
-/backup verificar nome_do_backup.zip
-/backup extrair nome_do_backup.zip
-```
+## Modelos, Voz e Fine-Tuning
 
-Os backups ficam em `backups/` e incluem o banco SQLite, historico local, exports e logs. A extracao cria uma pasta separada e nao sobrescreve a Aya atual.
-
-## Modelos esperados no Ollama
-
-```powershell
-ollama pull llama3.2
-ollama pull gemma2:2b
-```
-
-## Configuracao
-
-A Aya centraliza configuracoes em `aya/config.py`. Voce pode mudar alguns valores por variaveis de ambiente sem editar codigo:
-
-```powershell
-$env:AYA_MODEL_PRIMARY="llama3.2"
-$env:AYA_MODEL_REVIEWER="gemma2:2b"
-$env:AYA_OLLAMA_BASE_URL="http://localhost:11434/v1"
-$env:AYA_AUTO_REFLECTION_INTERVAL="6"
-$env:AYA_PIPER_VOICE="pt_BR-faber-medium"
-$env:AYA_PIPER_MAX_CHARS="3500"
-$env:AYA_REMOTE_MODE="false"
-$env:AYA_HOST="127.0.0.1"
-$env:AYA_PORT="7860"
-$env:AYA_AUTH_ENABLED="false"
-```
-
-Os defaults continuam prontos para uso local com Ollama e Piper.
-
-## Comandos da Aya
-
-Voce nao precisa decorar comandos para o uso comum. A Aya entende frases naturais como:
-
-```text
-vou estudar matematica por 25 minutos
-terminei de estudar, revisei fracoes
-lembre que eu prefiro exemplos curtos
-tenho dificuldade com classes em Python
-crie uma meta semanal estudar Python
-busque Python na memoria
-ingira README.md
-mostre fontes sobre Python
-crie um exercicio sobre listas em Python
-responder exercicio 1 | listas guardam valores em ordem
-o que revisar
-preciso conversar
-estou frustrado hoje
-me da um conselho
-onde paramos
-roadmap da Aya
-conselho tecnico da Aya
-release da Aya
-audite o projeto
-analise o projeto
-leia aya/core/assistant.py
-revise o arquivo aya/core/assistant.py
-crie um plano para alterar aya/core/assistant.py para separar responsabilidades
-me ajude com codigo: cole aqui o erro, traceback ou trecho quebrado
-```
-
-Se a mensagem for curta ou ambigua, a Aya decide sozinha:
-
-- assunto de estudo curto vira memoria de assunto atual;
-- frase com cara de definicao vira conhecimento;
-- mensagem casual ou pergunta clara segue a conversa normal.
-
-Os comandos abaixo continuam disponiveis para controle manual:
-
-```text
-/ajuda
-/painel
-/roadmap
-/release
-/release executar
-/release listar
-/release ultimo
-/release comparar
-/salvar topico | conteudo | tags
-/buscar termo
-/estudar materia | minutos
-/encerrar notas
-/meta tipo | descricao
-/metas
-/dificuldade materia | topico | descricao
-/perfil chave | valor
-/codigo descreva o problema, erro, traceback ou cole o codigo
-/memoria
-/rag consulta
-/ragstatus
-/reindexar rag
-/ingerir caminho
-/fontes termo
-/lembrar tipo | chave | valor
-/refletir
-/autonomia
-/backup criar
-/backup listar
-/backup verificar nome_do_backup.zip
-/backup extrair nome_do_backup.zip
-/aprendizados
-/aprovar id
-/rejeitar id
-/curadoria
-/alertas
-/alertas detalhes [categoria]
-/alertas revisao|memoria|curadoria|meta|aya-dev|critico
-/conflitos
-/resolver conflito id | aceitar ou rejeitar
-/fundir memoria id_principal | id_duplicada
-/historico memoria id
-/confirmar memoria id
-/esquecer memoria id
-/exercicio topico | nivel
-/responder id | sua resposta
-/revisoes
-/companhia mensagem opcional
-/desabafo mensagem opcional
-/incentivo mensagem opcional
-/diario
-/continuidade
-/conselho
-/projeto
-/auditar
-/arquivo aya/core/assistant.py
-/revisar aya/core/assistant.py
-/plano aya/core/assistant.py | objetivo da mudanca
-/diagnostico
-/finetune
-```
-
-## Caminho de evolucao
-
-1. Use `/roadmap` para ver a rota da Aya 1.0 e os criterios de estabilidade.
-2. Use `/painel` para ver status, pendencias, curadoria e proximos passos em uma tela.
-3. Use `/conselho` para receber uma recomendacao tecnica do proximo ciclo.
-4. Use `/release` para gerar um relatorio tecnico honesto de estabilidade.
-5. Use `/release executar` para rodar validacoes reais e salvar um relatorio completo.
-6. Use `/release listar`, `/release ultimo` e `/release comparar` para navegar no historico tecnico.
-7. Use `/lembrar` para salvar fatos permanentes, objetivos e preferencias.
-8. Use `/salvar` para registrar conhecimento estudado.
-9. Use `/rag` para ver o contexto local que a Aya recupera antes de responder.
-10. Use `/ingerir caminho` para indexar arquivos locais no RAG.
-11. Use `/fontes termo` para ver de onde uma resposta pode buscar contexto.
-12. Use `/codigo` para pedir ajuda de programacao com contexto local do RAG.
-13. Use `/revisar arquivo.py` para pedir uma revisao guiada antes de mudar codigo.
-14. Use `/plano arquivo.py | objetivo` para a Aya propor mudancas, riscos e testes sem editar nada.
-15. Use `/autonomia` para ver, ligar, desligar ou forcar a manutencao autonoma.
-16. Use `/aprendizados` para revisar o que a Aya capturou com menor confianca.
-17. Use `/aprovar id` ou `/rejeitar id` para curar a memoria permanente.
-18. Use `/curadoria` para revisar memorias fracas e aprendizados pendentes.
-19. Use `/confirmar memoria id` para fortalecer uma memoria correta.
-20. Use `/esquecer memoria id` para arquivar uma memoria ruim ou antiga.
-21. Use `/alertas` para ver revisoes, metas, conflitos, curadoria e propostas do Aya Dev que merecem atencao.
-22. Use `/alertas detalhes [categoria]` para ver IDs e dados resumidos sem expor conteudo sensivel completo.
-23. Use `/alertas revisao|memoria|curadoria|meta|aya-dev|critico` para filtrar uma categoria.
-24. Use `/conflitos` para revisar mudancas que a Aya se recusou a sobrescrever.
-25. Use `/resolver conflito id aceitar|rejeitar` para escolher o valor canonico.
-26. Use `/fundir memoria principal duplicada` para unir duplicatas identicas sem apagar historico.
-27. Use `/exercicio tema | nivel` para a Aya testar se voce aprendeu.
-28. Use `/responder id | resposta` para receber correcao e gerar revisao futura.
-29. Use `/revisoes` para ver exercicios que precisam voltar.
-30. Use `/companhia` quando quiser conversar sobre o dia, desabafar ou pedir incentivo.
-31. Use `/diario` para ver registros leves das conversas de companhia.
-32. Use `/continuidade` para ver onde voces pararam e quais proximos passos fazem sentido.
-33. Use `/diagnostico` para checar banco, dependencias, voz, Gradio e Tailscale.
-34. Use `/backup criar` para proteger memoria, conhecimento, historico, exports e logs.
-35. Use `/finetune` para exportar um dataset JSONL inicial.
-
-Detalhes do comportamento de conflitos, fusoes e envelhecimento estao em
-`docs/memoria_avancada.md`.
-
-O RAG usa ranking lexical local por padrao e aceita embeddings opcionais do
-Ollama. Instalacao, seguranca e configuracao: `docs/rag_avancado.md`.
-
-## Voz local com Piper
-
-A Aya usa Piper TTS para fala local, gratuita e sem nuvem.
-
-Instale as dependencias:
-
-```bash
-pip install piper-tts
-```
-
-Baixe a voz pt-BR padrao no PowerShell:
-
-```powershell
-New-Item -ItemType Directory -Force voices
-Invoke-WebRequest "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx" -OutFile "voices/pt_BR-faber-medium.onnx"
-Invoke-WebRequest "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json" -OutFile "voices/pt_BR-faber-medium.onnx.json"
-```
-
-Teste a voz:
-
-```bash
-python voz.py
-```
-
-Use em codigo:
-
-```python
-from voz import falar
-
-falar("Oi, eu sou a Aya.")
-```
-
-Para transcricao local por microfone na aba Voz, instale tambem:
-
-```bash
-pip install SpeechRecognition pocketsphinx
-```
-
-## Fine-tuning futuro
-
-Comece com LoRA/QLoRA em um modelo pequeno compativel com sua maquina. Antes de treinar, revise o dataset exportado: remova respostas ruins, duplicatas, erros factuais e dados sensiveis.
+- [Modelos usados](docs/modelos_usados.md)
+- [RAG avancado](docs/rag_avancado.md)
+- [Plano de fine-tuning](docs/fine_tuning_plan.md)
 
 Fine-tuning deve ensinar estilo e padroes de resposta. Memoria e conhecimento factual mutavel devem continuar no SQLite/RAG.
 
-Veja tambem: `docs/fine_tuning_plan.md`.
+## Roadmap
+
+Use `/roadmap`, `/conselho` e `/release` dentro da Aya para acompanhar a evolucao tecnica.
+
+Tambem veja [docs/roadmap_v1.md](docs/roadmap_v1.md).
