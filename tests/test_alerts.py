@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date, timedelta
+
 from aya.core.alerts import Alert, AlertService, formatar_alertas
 
 
@@ -303,6 +305,44 @@ def test_ordem_deterministica():
     assert alerts == service.collect()
     for left, right in zip(alerts, alerts[1:], strict=False):
         assert (left.priority, left.kind, left.title) <= (right.priority, right.kind, right.title)
+
+
+def test_conflito_antigo_sobe_sem_ultrapassar_critico():
+    db = FakeDBWithConnection()
+    antigo = (date.today() - timedelta(days=31)).isoformat()
+    db.buscar_revisoes_pendentes = lambda: [{"id": 10, "revisar_em": date.today().isoformat()}]
+    db.listar_conflitos_memoria = lambda: [{"id": 1, "criado_em": antigo}]
+    dev = FakeAyaDev({"p1": FakeProposal("REVERSAO_PARCIAL")})
+
+    alerts = AlertService(db, aya_dev=dev).collect()
+
+    assert alerts[0].kind == "critico"
+    assert [item.kind for item in alerts[1:3]] == ["memoria", "revisao"]
+    memoria = [item for item in alerts if item.kind == "memoria"][0]
+    assert memoria.priority == 2
+
+
+def test_meta_antiga_sobe_com_limite_conservador():
+    db = FakeDBWithConnection()
+    antiga = (date.today() - timedelta(days=40)).isoformat()
+    db.buscar_metas_ativas = lambda: [{"id": 1, "data_criacao": antiga}]
+
+    alerts = AlertService(db).collect(category="meta")
+
+    assert alerts[0].priority == 3
+
+
+def test_datas_ausentes_ou_invalidas_mantem_prioridade_base():
+    db = FakeDBWithConnection()
+    db.buscar_metas_ativas = lambda: [{"id": 1, "data_criacao": "sem-data"}]
+    db.listar_conflitos_memoria = lambda: [{"id": 2}]
+
+    alerts = AlertService(db).collect()
+
+    memoria = [item for item in alerts if item.kind == "memoria"][0]
+    meta = [item for item in alerts if item.kind == "meta"][0]
+    assert memoria.priority == AlertService.PRIORITIES["memoria"]
+    assert meta.priority == AlertService.PRIORITIES["meta"]
 
 
 def test_somente_leitura_nao_chama_sql_quando_metodos_reais_existem():

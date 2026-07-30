@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime
 
 
 logger = logging.getLogger("aya.alerts")
@@ -25,6 +26,8 @@ class AlertService:
     """Coleta alertas sob demanda, somente leitura e sem background."""
 
     DETAIL_LIMIT = 10
+    OLD_DAYS = 14
+    VERY_OLD_DAYS = 30
 
     PRIORITIES = {
         "critico": 1,
@@ -98,10 +101,56 @@ class AlertService:
             return text
         return f"{text[: max(0, limit - 3)]}..."
 
+    def _dynamic_priority(
+        self,
+        kind: str,
+        rows=(),
+        date_keys: tuple[str, ...] = (),
+    ) -> int:
+        base = self.PRIORITIES[kind]
+        if kind == "critico":
+            return 1
+
+        age_days = self._oldest_age_days(rows, date_keys)
+        if age_days is None:
+            return base
+
+        boost = 0
+        if age_days >= self.OLD_DAYS:
+            boost += 1
+        if age_days >= self.VERY_OLD_DAYS:
+            boost += 1
+        return max(2, base - boost)
+
+    def _oldest_age_days(self, rows, date_keys: tuple[str, ...]) -> int | None:
+        ages = []
+        today = date.today()
+        for row in rows or ():
+            for key in date_keys:
+                parsed = self._parse_date(self._row_value(row, key))
+                if parsed:
+                    ages.append(max(0, (today - parsed).days))
+                    break
+        return max(ages) if ages else None
+
+    @staticmethod
+    def _parse_date(value: str) -> date | None:
+        text = (value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text).date()
+        except ValueError:
+            try:
+                return date.fromisoformat(text[:10])
+            except ValueError:
+                return None
+
     def _check_revisoes(self, detailed: bool = False) -> list[Alert]:
         alerts: list[Alert] = []
         try:
             items: tuple[dict[str, str], ...] = ()
+            revisoes = []
             if hasattr(self.db, "buscar_revisoes_pendentes"):
                 revisoes = list(self.db.buscar_revisoes_pendentes())
                 count = len(revisoes)
@@ -130,7 +179,7 @@ class AlertService:
                         title="Revisoes pendentes",
                         detail=f"{count} exercicio(s) vencido(s) para revisar.",
                         action="/revisoes",
-                        priority=self.PRIORITIES["revisao"],
+                        priority=self._dynamic_priority("revisao", revisoes, ("revisar_em",)),
                         items=items,
                     )
                 )
@@ -142,6 +191,7 @@ class AlertService:
         alerts: list[Alert] = []
         try:
             items: tuple[dict[str, str], ...] = ()
+            conflitos = []
             if hasattr(self.db, "listar_conflitos_memoria"):
                 conflitos = list(self.db.listar_conflitos_memoria())
                 count = len(conflitos)
@@ -171,7 +221,7 @@ class AlertService:
                         title="Conflitos de memoria",
                         detail=f"{count} conflito(s) de memoria pendente(s).",
                         action="/conflitos",
-                        priority=self.PRIORITIES["memoria"],
+                        priority=self._dynamic_priority("memoria", conflitos, ("criado_em",)),
                         items=items,
                     )
                 )
@@ -183,6 +233,7 @@ class AlertService:
         alerts: list[Alert] = []
         try:
             items: tuple[dict[str, str], ...] = ()
+            metas = []
             if hasattr(self.db, "buscar_metas_ativas"):
                 metas = list(self.db.buscar_metas_ativas())
                 count = len(metas)
@@ -208,7 +259,7 @@ class AlertService:
                         title="Metas ativas",
                         detail=f"{count} meta(s) ativa(s).",
                         action="/metas",
-                        priority=self.PRIORITIES["meta"],
+                        priority=self._dynamic_priority("meta", metas, ("data_criacao", "criado_em")),
                         items=items,
                     )
                 )
