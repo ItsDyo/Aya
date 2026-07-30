@@ -12,6 +12,7 @@ from pathlib import Path
 from app import build_launch_kwargs, create_app, make_auth_checker
 from aya.config import ServerConfig
 from aya.core.advice import TechnicalAdviceService
+from aya.core.alerts import Alert
 from aya.core.backup import BackupService
 from aya.core.code_assistant import CodeAssistant
 from aya.core.command_router import CommandRouter
@@ -797,6 +798,33 @@ class AyaTestCase(unittest.TestCase):
         self.assertIn("Salvei", ui.salvar_conhecimento("Python", "Listas guardam valores", "python"))
         self.assertIn("Contexto recuperado", ui.consultar_rag("Python"))
         self.assertEqual("resposta revisada", ui.conselho())
+
+    def test_ui_controller_alertas_painel_sem_alertas(self):
+        class FakeAlertService:
+            def collect(self):
+                return []
+
+        fake_aya = type("FakeAya", (), {"alert_service": FakeAlertService()})()
+        ui = UIController(fake_aya)
+
+        painel = ui.alertas_painel()
+
+        self.assertIn("Alertas da Aya", painel)
+        self.assertIn("Tudo em ordem", painel)
+
+    def test_ui_controller_alertas_painel_com_alertas(self):
+        class FakeAlertService:
+            def collect(self):
+                return [Alert("revisao", "Revisoes pendentes", "1 revisao.", "/revisoes", 2)]
+
+        fake_aya = type("FakeAya", (), {"alert_service": FakeAlertService()})()
+        ui = UIController(fake_aya)
+
+        painel = ui.alertas_painel()
+
+        self.assertIn("Revisoes pendentes", painel)
+        self.assertIn("1 revisao.", painel)
+        self.assertIn("`/revisoes`", painel)
 
     def test_voice_io_sem_audio_falha_com_mensagem_clara(self):
         voice = VoiceIO()

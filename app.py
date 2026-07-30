@@ -214,6 +214,11 @@ def create_app(
 
         with gr.Tab("Conversar"):
             with gr.Column(elem_classes="aya-chat-shell"):
+                with gr.Accordion("Alertas da Aya", open=True, elem_classes="aya-tools"):
+                    alertas_painel = gr.Markdown(value=ui.alertas_painel())
+                    atualizar_alertas = gr.Button("Atualizar alertas")
+                    atualizar_alertas.click(ui.alertas_painel, outputs=alertas_painel)
+
                 chatbot = gr.Chatbot(label=None, height=640, elem_classes="aya-chatbox")
                 mensagem = gr.Textbox(
                     show_label=False,

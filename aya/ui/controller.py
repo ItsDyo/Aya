@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+
 from aya.core.assistant import Assistant
 from aya.core.permissions import AccessChannel
 from aya.core.voice import VoiceIO
+
+logger = logging.getLogger("aya.ui.controller")
 
 
 class UIController:
@@ -156,6 +160,22 @@ class UIController:
 
     def painel(self):
         return self.responder("/painel")
+
+    def alertas_painel(self):
+        try:
+            alerts = self.aya.alert_service.collect()
+        except Exception:
+            logger.exception("Erro ao carregar painel de alertas")
+            return "### Alertas da Aya\n\nNao foi possivel carregar os alertas agora."
+
+        if not alerts:
+            return "### Alertas da Aya\n\nTudo em ordem no momento."
+
+        lines = ["### Alertas da Aya", ""]
+        for alert in alerts:
+            lines.append(f"- **{alert.title}**: {alert.detail}")
+            lines.append(f"  Acao sugerida: `{alert.action}`")
+        return "\n".join(lines)
 
     def continuidade(self):
         return self.responder("/continuidade")
