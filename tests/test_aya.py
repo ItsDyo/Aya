@@ -479,6 +479,18 @@ class AyaTestCase(unittest.TestCase):
             labels = [getattr(block, "label", "") for block in getattr(app, "blocks", {}).values()]
             self.assertIn("Painel", labels)
             self.assertIn("Curadoria", labels)
+            typed_labels = [
+                (type(block).__name__, getattr(block, "label", ""))
+                for block in getattr(app, "blocks", {}).values()
+            ]
+            self.assertIn(("Tab", "Conversar"), typed_labels)
+            self.assertIn(("Tab", "Companhia"), typed_labels)
+            self.assertIn(("Tab", "Estudo"), typed_labels)
+            self.assertIn(("Tab", "Conhecimento"), typed_labels)
+            self.assertNotIn(("Tab", "Sistema"), typed_labels)
+            self.assertNotIn(("Tab", "Aya Dev"), typed_labels)
+            self.assertIn(("Accordion", "Sistema"), typed_labels)
+            self.assertIn(("Accordion", "Aya Dev"), typed_labels)
             if hasattr(app, "close"):
                 app.close()
             del app
@@ -497,6 +509,8 @@ class AyaTestCase(unittest.TestCase):
             app = create_app(self.aya, config=config)
             protegidos = {
                 "Ingestão de arquivos",
+                "Sistema",
+                "Aya Dev",
                 "Autonomia",
                 "Diagnóstico e exportação",
                 "Backups",

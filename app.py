@@ -263,6 +263,307 @@ def create_app(
                             outputs=[texto_transcrito, resposta_voz, audio_saida],
                         )
 
+            with gr.Accordion("Sistema", open=False, visible=admin_visible, elem_classes="aya-tools"):
+                with gr.Row(elem_classes=["aya-shell", "aya-workspace"]):
+                    with gr.Column(scale=4, min_width=320):
+                        saida_sistema = gr.Textbox(label="Curadoria", lines=24)
+                        atualizar_curadoria = gr.Button("Atualizar curadoria", variant="primary")
+                        atualizar_curadoria.click(ui.listar_curadoria, outputs=saida_sistema)
+
+                    with gr.Column(scale=4, min_width=300):
+                        with gr.Accordion("Memórias e aprendizados", open=True):
+                            memoria_curadoria_id = gr.Number(label="ID da memória", precision=0)
+                            with gr.Row():
+                                confirmar_curadoria = gr.Button("Confirmar")
+                                arquivar_curadoria = gr.Button("Arquivar")
+                            aprendizado_curadoria_id = gr.Number(label="ID do aprendizado", precision=0)
+                            with gr.Row():
+                                aprovar_curadoria = gr.Button("Aprovar")
+                                rejeitar_curadoria = gr.Button("Rejeitar")
+                            listar_aprendizados = gr.Button("Listar aprendizados")
+
+                        with gr.Accordion("Conflitos e fusões", open=False):
+                            conflito_id = gr.Number(label="ID do conflito", precision=0)
+                            decisao_conflito = gr.Radio(
+                                label="Decisão",
+                                choices=["aceitar", "rejeitar"],
+                                value="rejeitar",
+                            )
+                            with gr.Row():
+                                listar_conflitos = gr.Button("Listar conflitos")
+                                resolver_conflito = gr.Button("Resolver")
+                            memoria_principal_id = gr.Number(label="Memória principal", precision=0)
+                            memoria_duplicada_id = gr.Number(label="Memória duplicada", precision=0)
+                            fundir_memorias = gr.Button("Fundir memórias")
+                            historico_memoria_id = gr.Number(label="Memória para histórico", precision=0)
+                            ver_historico_memoria = gr.Button("Ver histórico")
+
+                        with gr.Accordion("Autonomia", open=False, visible=admin_visible):
+                            refletir = gr.Button("Gerar reflexão")
+                            autonomia = gr.Button("Ver autonomia")
+                            with gr.Row():
+                                autonomia_on = gr.Button("Ligar")
+                                autonomia_off = gr.Button("Desligar")
+
+                    with gr.Column(scale=4, min_width=320):
+                        with gr.Accordion(
+                            "Diagnóstico e exportação",
+                            open=True,
+                            visible=admin_visible,
+                        ):
+                            saida_diag = gr.Textbox(label="Diagnóstico", lines=14)
+                            diagnostico_sistema = gr.Button("Rodar diagnóstico", variant="primary")
+                            finetune = gr.Button("Exportar dataset")
+                            modelos = gr.Button("Modelos")
+
+                        with gr.Accordion("Backups", open=False, visible=admin_visible):
+                            caminho_backup = gr.Textbox(label="Backup para verificar", placeholder="Ex: aya_backup_20260710_120000.zip")
+                            criar_backup = gr.Button("Criar backup", variant="primary")
+                            listar_backups = gr.Button("Listar backups")
+                            verificar_backup = gr.Button("Verificar backup")
+                            extrair_backup = gr.Button("Extrair backup")
+
+                        diagnostico_sistema.click(ui.diagnostico, outputs=saida_diag)
+                        finetune.click(ui.exportar_fine_tuning, outputs=saida_diag)
+                        modelos.click(ui.modelos, outputs=saida_diag)
+                        criar_backup.click(ui.criar_backup, outputs=saida_diag)
+                        listar_backups.click(ui.listar_backups, outputs=saida_diag)
+                        verificar_backup.click(ui.verificar_backup, inputs=caminho_backup, outputs=saida_diag)
+                        extrair_backup.click(ui.extrair_backup, inputs=caminho_backup, outputs=saida_diag)
+
+                    confirmar_curadoria.click(ui.confirmar_memoria, inputs=memoria_curadoria_id, outputs=saida_sistema)
+                    arquivar_curadoria.click(ui.esquecer_memoria, inputs=memoria_curadoria_id, outputs=saida_sistema)
+                    aprovar_curadoria.click(ui.aprovar_aprendizado, inputs=aprendizado_curadoria_id, outputs=saida_sistema)
+                    rejeitar_curadoria.click(ui.rejeitar_aprendizado, inputs=aprendizado_curadoria_id, outputs=saida_sistema)
+                    listar_aprendizados.click(ui.listar_aprendizados, outputs=saida_sistema)
+                    listar_conflitos.click(ui.listar_conflitos, outputs=saida_sistema)
+                    resolver_conflito.click(
+                        ui.resolver_conflito,
+                        inputs=[conflito_id, decisao_conflito],
+                        outputs=saida_sistema,
+                    )
+                    fundir_memorias.click(
+                        ui.fundir_memorias,
+                        inputs=[memoria_principal_id, memoria_duplicada_id],
+                        outputs=saida_sistema,
+                    )
+                    ver_historico_memoria.click(
+                        ui.historico_memoria,
+                        inputs=historico_memoria_id,
+                        outputs=saida_sistema,
+                    )
+                    refletir.click(ui.refletir, outputs=saida_sistema)
+                    autonomia.click(ui.autonomia, outputs=saida_sistema)
+                    autonomia_on.click(lambda: ui.autonomia("on"), outputs=saida_sistema)
+                    autonomia_off.click(lambda: ui.autonomia("off"), outputs=saida_sistema)
+
+            with gr.Accordion("Aya Dev", open=False, visible=admin_visible, elem_classes="aya-tools"):
+                with gr.Row(elem_classes=["aya-shell", "aya-workspace"]):
+                    with gr.Column(scale=4, min_width=320):
+                        filtro_dev = gr.Dropdown(
+                            label="Filtro",
+                            choices=list(FILTERS),
+                            value="todas",
+                        )
+                        atualizar_dev = gr.Button("Atualizar lista", variant="primary")
+                        proposta_dev = gr.Dropdown(label="Propostas", choices=aya_dev_ui.list_choices(), value=None)
+                        resumo_dev = gr.Textbox(label="Resumo", lines=4)
+                        saida_dev = gr.Textbox(label="Resultado da acao", lines=8)
+
+                        with gr.Accordion("Confirmacoes", open=True):
+                            confirmacao_dev = gr.Textbox(
+                                label="Confirmacao",
+                                placeholder="APROVAR ID, INTEGRAR ID, REV-xxxxxxxx ou REVERTER ID",
+                            )
+                            motivo_reversao_dev = gr.Textbox(label="Motivo da reversao", lines=3)
+                            expandir_diff_dev = gr.Checkbox(label="Expandir diff completo", value=False)
+
+                        with gr.Accordion("Autonomia supervisionada", open=False):
+                            autonomia_confirmacao_dev = gr.Textbox(
+                                label="Confirmacao de ciclo seguro",
+                                placeholder="EXECUTAR CICLO SEGURO",
+                            )
+                            with gr.Row(elem_classes="aya-compact"):
+                                autonomia_detectar_dev = gr.Button("Detectar candidatos")
+                                autonomia_executar_dev = gr.Button("Executar ciclo seguro")
+                            autonomia_status_dev = gr.Textbox(label="Modo e estado", lines=7)
+                            autonomia_avaliacao_dev = gr.Textbox(label="Elegibilidade", lines=10)
+                            autonomia_candidatos_dev = gr.Textbox(label="Candidatos", lines=12)
+                            autonomia_escopo_dev = gr.Dropdown(
+                                label="Filtro de candidatos",
+                                choices=["resumo", "top", "informativos", "manutencao", "bloqueados", "obsoletos", "todos"],
+                                value="resumo",
+                            )
+                            autonomia_observar_dev = gr.Textbox(label="Observacao somente leitura", lines=8)
+                            autonomia_capacidade_filtro_dev = gr.Textbox(
+                                label="Filtro de capacidade",
+                                placeholder="operacao insert_docstring, categoria documentacao ou modelo llama3.2",
+                            )
+                            autonomia_capacidade_dev = gr.Textbox(label="Capacidade historica", lines=8)
+                            autonomia_candidato_id_dev = gr.Textbox(label="ID do candidato para rota")
+                            with gr.Row(elem_classes="aya-compact"):
+                                autonomia_filtrar_btn_dev = gr.Button("Filtrar candidatos")
+                                autonomia_capacidade_btn_dev = gr.Button("Ver capacidade")
+                                autonomia_rota_btn_dev = gr.Button("Explicar rota")
+                            autonomia_rota_dev = gr.Textbox(label="Rota", lines=2)
+                            autonomia_rota_explicacao_dev = gr.Textbox(label="Explicacao da rota", lines=8)
+                            autonomia_resultado_dev = gr.Textbox(label="Resultado autonomo", lines=8)
+                            with gr.Accordion("Calibracao versionada", open=False):
+                                calibracao_candidato_dev = gr.Textbox(label="ID do candidato")
+                                calibracao_experimento_dev = gr.Textbox(label="ID do experimento")
+                                calibracao_confirmacao_dev = gr.Textbox(
+                                    label="Confirmacao do experimento",
+                                    placeholder="EXECUTAR EXPERIMENTO EXP-...",
+                                )
+                                with gr.Row(elem_classes="aya-compact"):
+                                    calibracao_shortlist_dev = gr.Button("Shortlist segura")
+                                    calibracao_explicar_dev = gr.Button("Explicar candidato")
+                                    calibracao_listar_dev = gr.Button("Listar experimentos")
+                                with gr.Row(elem_classes="aya-compact"):
+                                    calibracao_criar_dev = gr.Button("Criar experimento")
+                                    calibracao_executar_dev = gr.Button("Executar experimento")
+                                calibracao_shortlist_saida_dev = gr.Textbox(label="Shortlist e auditoria", lines=10)
+                                calibracao_lista_dev = gr.Textbox(label="Experimentos", lines=8)
+                                calibracao_resultados_dev = gr.Textbox(label="Resultados", lines=8)
+                                calibracao_saida_dev = gr.Textbox(label="Saida", lines=8)
+
+                    with gr.Column(scale=8, min_width=520):
+                        with gr.Tabs():
+                            with gr.Tab("Visao geral"):
+                                dev_overview = gr.Textbox(label="Visao geral", lines=18)
+                            with gr.Tab("Plano e manifesto"):
+                                dev_plan = gr.Textbox(label="Plano e manifesto", lines=22)
+                            with gr.Tab("Diff"):
+                                dev_diff = gr.Textbox(label="Diff somente leitura", lines=24)
+                            with gr.Tab("Testes e revisao"):
+                                dev_tests = gr.Textbox(label="Testes e revisao", lines=22)
+                            with gr.Tab("Aprovacao e commit"):
+                                dev_approval = gr.Textbox(label="Aprovacao e commit", lines=22)
+                            with gr.Tab("Integracao"):
+                                dev_integration = gr.Textbox(label="Integracao", lines=22)
+                            with gr.Tab("Reversao"):
+                                dev_reversal = gr.Textbox(label="Reversao", lines=24)
+
+                        with gr.Accordion("Acoes supervisionadas", open=False):
+                            with gr.Row(elem_classes="aya-compact"):
+                                dev_planejar = gr.Button("Planejar")
+                                dev_preparar = gr.Button("Preparar")
+                                dev_revisar = gr.Button("Revisar")
+                                dev_testar = gr.Button("Testar")
+                            with gr.Row(elem_classes="aya-compact"):
+                                dev_aprovar = gr.Button("Aprovar alteracao", variant="primary")
+                                dev_rejeitar = gr.Button("Rejeitar")
+                                dev_aplicar = gr.Button("Criar commit isolado")
+                                dev_integrar = gr.Button("Integrar")
+                            with gr.Row(elem_classes="aya-compact"):
+                                dev_solicitar_rev = gr.Button("Solicitar reversao")
+                                dev_prever_rev = gr.Button("Gerar pre-visualizacao")
+                                dev_aprovar_rev = gr.Button("Aprovar reversao")
+                                dev_reverter = gr.Button("Executar reversao")
+                            dev_descartar = gr.Button("Descartar worktree")
+
+                detail_outputs = [
+                    dev_overview,
+                    dev_plan,
+                    dev_diff,
+                    dev_tests,
+                    dev_approval,
+                    dev_integration,
+                    dev_reversal,
+                    resumo_dev,
+                ]
+                action_outputs = [saida_dev, *detail_outputs]
+
+                def refresh_dev_choices(state_filter):
+                    choices, selected = aya_dev_ui.refresh(state_filter)
+                    return gr.update(choices=choices, value=selected)
+
+                atualizar_dev.click(
+                    refresh_dev_choices,
+                    inputs=filtro_dev,
+                    outputs=proposta_dev,
+                )
+                autonomia_detectar_dev.click(
+                    aya_dev_ui.autonomy_overview,
+                    outputs=[autonomia_status_dev, autonomia_avaliacao_dev, autonomia_candidatos_dev, autonomia_observar_dev],
+                )
+                autonomia_capacidade_btn_dev.click(
+                    aya_dev_ui.autonomy_capability,
+                    inputs=autonomia_capacidade_filtro_dev,
+                    outputs=autonomia_capacidade_dev,
+                )
+                autonomia_filtrar_btn_dev.click(
+                    aya_dev_ui.autonomy_candidates,
+                    inputs=autonomia_escopo_dev,
+                    outputs=autonomia_candidatos_dev,
+                )
+                autonomia_rota_btn_dev.click(
+                    aya_dev_ui.autonomy_route,
+                    inputs=autonomia_candidato_id_dev,
+                    outputs=[autonomia_rota_dev, autonomia_rota_explicacao_dev],
+                )
+                autonomia_executar_dev.click(
+                    aya_dev_ui.run_safe_autonomy_cycle,
+                    inputs=autonomia_confirmacao_dev,
+                    outputs=autonomia_resultado_dev,
+                )
+                calibracao_listar_dev.click(
+                    aya_dev_ui.calibration_overview,
+                    outputs=[calibracao_lista_dev, calibracao_resultados_dev],
+                )
+                calibracao_shortlist_dev.click(
+                    aya_dev_ui.calibration_shortlist,
+                    outputs=calibracao_shortlist_saida_dev,
+                )
+                calibracao_explicar_dev.click(
+                    aya_dev_ui.explain_calibration_candidate,
+                    inputs=calibracao_candidato_dev,
+                    outputs=calibracao_shortlist_saida_dev,
+                )
+                calibracao_criar_dev.click(
+                    aya_dev_ui.create_calibration_experiment,
+                    inputs=calibracao_candidato_dev,
+                    outputs=calibracao_saida_dev,
+                )
+                calibracao_executar_dev.click(
+                    aya_dev_ui.run_calibration_experiment,
+                    inputs=[calibracao_experimento_dev, calibracao_confirmacao_dev],
+                    outputs=calibracao_saida_dev,
+                )
+                proposta_dev.change(
+                    aya_dev_ui.details,
+                    inputs=[proposta_dev, expandir_diff_dev],
+                    outputs=detail_outputs,
+                )
+                expandir_diff_dev.change(
+                    aya_dev_ui.details,
+                    inputs=[proposta_dev, expandir_diff_dev],
+                    outputs=detail_outputs,
+                )
+
+                def dev_action(action_name):
+                    return lambda selected, confirmation, reason: aya_dev_ui.run_action(
+                        selected,
+                        action_name,
+                        confirmation,
+                        reason,
+                    )
+
+                dev_planejar.click(dev_action("planejar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_preparar.click(dev_action("preparar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_revisar.click(dev_action("revisar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_testar.click(dev_action("testar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_aprovar.click(dev_action("aprovar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_rejeitar.click(dev_action("rejeitar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_aplicar.click(dev_action("aplicar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_integrar.click(dev_action("integrar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_solicitar_rev.click(dev_action("solicitar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_prever_rev.click(dev_action("prever_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_aprovar_rev.click(dev_action("aprovar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_reverter.click(dev_action("reverter"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+                dev_descartar.click(dev_action("descartar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
+
+
         with gr.Tab("Companhia"):
             with gr.Column(elem_classes="aya-chat-shell"):
                 chat_companhia = gr.Chatbot(label=None, height=600)
@@ -382,305 +683,6 @@ def create_app(
                     status_rag.click(ui.status_rag, outputs=saida_conhecimento)
                     reindexar_rag.click(ui.reindexar_rag, outputs=saida_conhecimento)
 
-        with gr.Tab("Sistema"):
-            with gr.Row(elem_classes=["aya-shell", "aya-workspace"]):
-                with gr.Column(scale=4, min_width=320):
-                    saida_sistema = gr.Textbox(label="Curadoria", lines=24)
-                    atualizar_curadoria = gr.Button("Atualizar curadoria", variant="primary")
-                    atualizar_curadoria.click(ui.listar_curadoria, outputs=saida_sistema)
-
-                with gr.Column(scale=4, min_width=300):
-                    with gr.Accordion("Memórias e aprendizados", open=True):
-                        memoria_curadoria_id = gr.Number(label="ID da memória", precision=0)
-                        with gr.Row():
-                            confirmar_curadoria = gr.Button("Confirmar")
-                            arquivar_curadoria = gr.Button("Arquivar")
-                        aprendizado_curadoria_id = gr.Number(label="ID do aprendizado", precision=0)
-                        with gr.Row():
-                            aprovar_curadoria = gr.Button("Aprovar")
-                            rejeitar_curadoria = gr.Button("Rejeitar")
-                        listar_aprendizados = gr.Button("Listar aprendizados")
-
-                    with gr.Accordion("Conflitos e fusões", open=False):
-                        conflito_id = gr.Number(label="ID do conflito", precision=0)
-                        decisao_conflito = gr.Radio(
-                            label="Decisão",
-                            choices=["aceitar", "rejeitar"],
-                            value="rejeitar",
-                        )
-                        with gr.Row():
-                            listar_conflitos = gr.Button("Listar conflitos")
-                            resolver_conflito = gr.Button("Resolver")
-                        memoria_principal_id = gr.Number(label="Memória principal", precision=0)
-                        memoria_duplicada_id = gr.Number(label="Memória duplicada", precision=0)
-                        fundir_memorias = gr.Button("Fundir memórias")
-                        historico_memoria_id = gr.Number(label="Memória para histórico", precision=0)
-                        ver_historico_memoria = gr.Button("Ver histórico")
-
-                    with gr.Accordion("Autonomia", open=False, visible=admin_visible):
-                        refletir = gr.Button("Gerar reflexão")
-                        autonomia = gr.Button("Ver autonomia")
-                        with gr.Row():
-                            autonomia_on = gr.Button("Ligar")
-                            autonomia_off = gr.Button("Desligar")
-
-                with gr.Column(scale=4, min_width=320):
-                    with gr.Accordion(
-                        "Diagnóstico e exportação",
-                        open=True,
-                        visible=admin_visible,
-                    ):
-                        saida_diag = gr.Textbox(label="Diagnóstico", lines=14)
-                        diagnostico_sistema = gr.Button("Rodar diagnóstico", variant="primary")
-                        finetune = gr.Button("Exportar dataset")
-                        modelos = gr.Button("Modelos")
-
-                    with gr.Accordion("Backups", open=False, visible=admin_visible):
-                        caminho_backup = gr.Textbox(label="Backup para verificar", placeholder="Ex: aya_backup_20260710_120000.zip")
-                        criar_backup = gr.Button("Criar backup", variant="primary")
-                        listar_backups = gr.Button("Listar backups")
-                        verificar_backup = gr.Button("Verificar backup")
-                        extrair_backup = gr.Button("Extrair backup")
-
-                    diagnostico_sistema.click(ui.diagnostico, outputs=saida_diag)
-                    finetune.click(ui.exportar_fine_tuning, outputs=saida_diag)
-                    modelos.click(ui.modelos, outputs=saida_diag)
-                    criar_backup.click(ui.criar_backup, outputs=saida_diag)
-                    listar_backups.click(ui.listar_backups, outputs=saida_diag)
-                    verificar_backup.click(ui.verificar_backup, inputs=caminho_backup, outputs=saida_diag)
-                    extrair_backup.click(ui.extrair_backup, inputs=caminho_backup, outputs=saida_diag)
-
-                confirmar_curadoria.click(ui.confirmar_memoria, inputs=memoria_curadoria_id, outputs=saida_sistema)
-                arquivar_curadoria.click(ui.esquecer_memoria, inputs=memoria_curadoria_id, outputs=saida_sistema)
-                aprovar_curadoria.click(ui.aprovar_aprendizado, inputs=aprendizado_curadoria_id, outputs=saida_sistema)
-                rejeitar_curadoria.click(ui.rejeitar_aprendizado, inputs=aprendizado_curadoria_id, outputs=saida_sistema)
-                listar_aprendizados.click(ui.listar_aprendizados, outputs=saida_sistema)
-                listar_conflitos.click(ui.listar_conflitos, outputs=saida_sistema)
-                resolver_conflito.click(
-                    ui.resolver_conflito,
-                    inputs=[conflito_id, decisao_conflito],
-                    outputs=saida_sistema,
-                )
-                fundir_memorias.click(
-                    ui.fundir_memorias,
-                    inputs=[memoria_principal_id, memoria_duplicada_id],
-                    outputs=saida_sistema,
-                )
-                ver_historico_memoria.click(
-                    ui.historico_memoria,
-                    inputs=historico_memoria_id,
-                    outputs=saida_sistema,
-                )
-                refletir.click(ui.refletir, outputs=saida_sistema)
-                autonomia.click(ui.autonomia, outputs=saida_sistema)
-                autonomia_on.click(lambda: ui.autonomia("on"), outputs=saida_sistema)
-                autonomia_off.click(lambda: ui.autonomia("off"), outputs=saida_sistema)
-
-        with gr.Tab("Aya Dev", visible=admin_visible):
-            with gr.Row(elem_classes=["aya-shell", "aya-workspace"]):
-                with gr.Column(scale=4, min_width=320):
-                    filtro_dev = gr.Dropdown(
-                        label="Filtro",
-                        choices=list(FILTERS),
-                        value="todas",
-                    )
-                    atualizar_dev = gr.Button("Atualizar lista", variant="primary")
-                    proposta_dev = gr.Dropdown(label="Propostas", choices=aya_dev_ui.list_choices(), value=None)
-                    resumo_dev = gr.Textbox(label="Resumo", lines=4)
-                    saida_dev = gr.Textbox(label="Resultado da acao", lines=8)
-
-                    with gr.Accordion("Confirmacoes", open=True):
-                        confirmacao_dev = gr.Textbox(
-                            label="Confirmacao",
-                            placeholder="APROVAR ID, INTEGRAR ID, REV-xxxxxxxx ou REVERTER ID",
-                        )
-                        motivo_reversao_dev = gr.Textbox(label="Motivo da reversao", lines=3)
-                        expandir_diff_dev = gr.Checkbox(label="Expandir diff completo", value=False)
-
-                    with gr.Accordion("Autonomia supervisionada", open=False):
-                        autonomia_confirmacao_dev = gr.Textbox(
-                            label="Confirmacao de ciclo seguro",
-                            placeholder="EXECUTAR CICLO SEGURO",
-                        )
-                        with gr.Row(elem_classes="aya-compact"):
-                            autonomia_detectar_dev = gr.Button("Detectar candidatos")
-                            autonomia_executar_dev = gr.Button("Executar ciclo seguro")
-                        autonomia_status_dev = gr.Textbox(label="Modo e estado", lines=7)
-                        autonomia_avaliacao_dev = gr.Textbox(label="Elegibilidade", lines=10)
-                        autonomia_candidatos_dev = gr.Textbox(label="Candidatos", lines=12)
-                        autonomia_escopo_dev = gr.Dropdown(
-                            label="Filtro de candidatos",
-                            choices=["resumo", "top", "informativos", "manutencao", "bloqueados", "obsoletos", "todos"],
-                            value="resumo",
-                        )
-                        autonomia_observar_dev = gr.Textbox(label="Observacao somente leitura", lines=8)
-                        autonomia_capacidade_filtro_dev = gr.Textbox(
-                            label="Filtro de capacidade",
-                            placeholder="operacao insert_docstring, categoria documentacao ou modelo llama3.2",
-                        )
-                        autonomia_capacidade_dev = gr.Textbox(label="Capacidade historica", lines=8)
-                        autonomia_candidato_id_dev = gr.Textbox(label="ID do candidato para rota")
-                        with gr.Row(elem_classes="aya-compact"):
-                            autonomia_filtrar_btn_dev = gr.Button("Filtrar candidatos")
-                            autonomia_capacidade_btn_dev = gr.Button("Ver capacidade")
-                            autonomia_rota_btn_dev = gr.Button("Explicar rota")
-                        autonomia_rota_dev = gr.Textbox(label="Rota", lines=2)
-                        autonomia_rota_explicacao_dev = gr.Textbox(label="Explicacao da rota", lines=8)
-                        autonomia_resultado_dev = gr.Textbox(label="Resultado autonomo", lines=8)
-                        with gr.Accordion("Calibracao versionada", open=False):
-                            calibracao_candidato_dev = gr.Textbox(label="ID do candidato")
-                            calibracao_experimento_dev = gr.Textbox(label="ID do experimento")
-                            calibracao_confirmacao_dev = gr.Textbox(
-                                label="Confirmacao do experimento",
-                                placeholder="EXECUTAR EXPERIMENTO EXP-...",
-                            )
-                            with gr.Row(elem_classes="aya-compact"):
-                                calibracao_shortlist_dev = gr.Button("Shortlist segura")
-                                calibracao_explicar_dev = gr.Button("Explicar candidato")
-                                calibracao_listar_dev = gr.Button("Listar experimentos")
-                            with gr.Row(elem_classes="aya-compact"):
-                                calibracao_criar_dev = gr.Button("Criar experimento")
-                                calibracao_executar_dev = gr.Button("Executar experimento")
-                            calibracao_shortlist_saida_dev = gr.Textbox(label="Shortlist e auditoria", lines=10)
-                            calibracao_lista_dev = gr.Textbox(label="Experimentos", lines=8)
-                            calibracao_resultados_dev = gr.Textbox(label="Resultados", lines=8)
-                            calibracao_saida_dev = gr.Textbox(label="Saida", lines=8)
-
-                with gr.Column(scale=8, min_width=520):
-                    with gr.Tabs():
-                        with gr.Tab("Visao geral"):
-                            dev_overview = gr.Textbox(label="Visao geral", lines=18)
-                        with gr.Tab("Plano e manifesto"):
-                            dev_plan = gr.Textbox(label="Plano e manifesto", lines=22)
-                        with gr.Tab("Diff"):
-                            dev_diff = gr.Textbox(label="Diff somente leitura", lines=24)
-                        with gr.Tab("Testes e revisao"):
-                            dev_tests = gr.Textbox(label="Testes e revisao", lines=22)
-                        with gr.Tab("Aprovacao e commit"):
-                            dev_approval = gr.Textbox(label="Aprovacao e commit", lines=22)
-                        with gr.Tab("Integracao"):
-                            dev_integration = gr.Textbox(label="Integracao", lines=22)
-                        with gr.Tab("Reversao"):
-                            dev_reversal = gr.Textbox(label="Reversao", lines=24)
-
-                    with gr.Accordion("Acoes supervisionadas", open=False):
-                        with gr.Row(elem_classes="aya-compact"):
-                            dev_planejar = gr.Button("Planejar")
-                            dev_preparar = gr.Button("Preparar")
-                            dev_revisar = gr.Button("Revisar")
-                            dev_testar = gr.Button("Testar")
-                        with gr.Row(elem_classes="aya-compact"):
-                            dev_aprovar = gr.Button("Aprovar alteracao", variant="primary")
-                            dev_rejeitar = gr.Button("Rejeitar")
-                            dev_aplicar = gr.Button("Criar commit isolado")
-                            dev_integrar = gr.Button("Integrar")
-                        with gr.Row(elem_classes="aya-compact"):
-                            dev_solicitar_rev = gr.Button("Solicitar reversao")
-                            dev_prever_rev = gr.Button("Gerar pre-visualizacao")
-                            dev_aprovar_rev = gr.Button("Aprovar reversao")
-                            dev_reverter = gr.Button("Executar reversao")
-                        dev_descartar = gr.Button("Descartar worktree")
-
-            detail_outputs = [
-                dev_overview,
-                dev_plan,
-                dev_diff,
-                dev_tests,
-                dev_approval,
-                dev_integration,
-                dev_reversal,
-                resumo_dev,
-            ]
-            action_outputs = [saida_dev, *detail_outputs]
-
-            def refresh_dev_choices(state_filter):
-                choices, selected = aya_dev_ui.refresh(state_filter)
-                return gr.update(choices=choices, value=selected)
-
-            atualizar_dev.click(
-                refresh_dev_choices,
-                inputs=filtro_dev,
-                outputs=proposta_dev,
-            )
-            autonomia_detectar_dev.click(
-                aya_dev_ui.autonomy_overview,
-                outputs=[autonomia_status_dev, autonomia_avaliacao_dev, autonomia_candidatos_dev, autonomia_observar_dev],
-            )
-            autonomia_capacidade_btn_dev.click(
-                aya_dev_ui.autonomy_capability,
-                inputs=autonomia_capacidade_filtro_dev,
-                outputs=autonomia_capacidade_dev,
-            )
-            autonomia_filtrar_btn_dev.click(
-                aya_dev_ui.autonomy_candidates,
-                inputs=autonomia_escopo_dev,
-                outputs=autonomia_candidatos_dev,
-            )
-            autonomia_rota_btn_dev.click(
-                aya_dev_ui.autonomy_route,
-                inputs=autonomia_candidato_id_dev,
-                outputs=[autonomia_rota_dev, autonomia_rota_explicacao_dev],
-            )
-            autonomia_executar_dev.click(
-                aya_dev_ui.run_safe_autonomy_cycle,
-                inputs=autonomia_confirmacao_dev,
-                outputs=autonomia_resultado_dev,
-            )
-            calibracao_listar_dev.click(
-                aya_dev_ui.calibration_overview,
-                outputs=[calibracao_lista_dev, calibracao_resultados_dev],
-            )
-            calibracao_shortlist_dev.click(
-                aya_dev_ui.calibration_shortlist,
-                outputs=calibracao_shortlist_saida_dev,
-            )
-            calibracao_explicar_dev.click(
-                aya_dev_ui.explain_calibration_candidate,
-                inputs=calibracao_candidato_dev,
-                outputs=calibracao_shortlist_saida_dev,
-            )
-            calibracao_criar_dev.click(
-                aya_dev_ui.create_calibration_experiment,
-                inputs=calibracao_candidato_dev,
-                outputs=calibracao_saida_dev,
-            )
-            calibracao_executar_dev.click(
-                aya_dev_ui.run_calibration_experiment,
-                inputs=[calibracao_experimento_dev, calibracao_confirmacao_dev],
-                outputs=calibracao_saida_dev,
-            )
-            proposta_dev.change(
-                aya_dev_ui.details,
-                inputs=[proposta_dev, expandir_diff_dev],
-                outputs=detail_outputs,
-            )
-            expandir_diff_dev.change(
-                aya_dev_ui.details,
-                inputs=[proposta_dev, expandir_diff_dev],
-                outputs=detail_outputs,
-            )
-
-            def dev_action(action_name):
-                return lambda selected, confirmation, reason: aya_dev_ui.run_action(
-                    selected,
-                    action_name,
-                    confirmation,
-                    reason,
-                )
-
-            dev_planejar.click(dev_action("planejar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_preparar.click(dev_action("preparar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_revisar.click(dev_action("revisar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_testar.click(dev_action("testar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_aprovar.click(dev_action("aprovar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_rejeitar.click(dev_action("rejeitar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_aplicar.click(dev_action("aplicar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_integrar.click(dev_action("integrar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_solicitar_rev.click(dev_action("solicitar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_prever_rev.click(dev_action("prever_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_aprovar_rev.click(dev_action("aprovar_reversao"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_reverter.click(dev_action("reverter"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
-            dev_descartar.click(dev_action("descartar"), inputs=[proposta_dev, confirmacao_dev, motivo_reversao_dev], outputs=action_outputs)
 
     return demo
 
